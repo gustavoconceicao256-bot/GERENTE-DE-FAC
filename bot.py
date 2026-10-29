@@ -562,19 +562,23 @@ class RegistrationApprovalView(View):
 
 
 def highest_configured_rank(member: discord.Member):
-    """Lê ranks do painel: rank_role_<role_id>=abreviação|prioridade."""
+    """Retorna o cargo configurado mais alto usando a posição real do Discord.
+
+    A ordem da hierarquia é: cargo de posição mais baixa = nº 1; posição mais alta = último.
+    Usar Role.position também corrige prioridades numéricas antigas que tenham sido salvas invertidas.
+    """
     candidates = []
     for role in member.roles:
         raw = setting(f"rank_role_{role.id}", "")
         if not raw:
             continue
         try:
-            abbreviation, priority = raw.split("|", 1)
-            candidates.append((int(priority), role, abbreviation.strip()))
+            abbreviation = raw.split("|", 1)[0].strip()
+            candidates.append((role.position, role, abbreviation))
         except (ValueError, TypeError):
             continue
     if candidates:
-        _, role, abbreviation = max(candidates, key=lambda item: item[0])
+        _, role, abbreviation = max(candidates, key=lambda item: (item[0], item[1].id))
         return role, abbreviation
     fallback = member.guild.get_role(MEMBER_ROLE_ID) if MEMBER_ROLE_ID else None
     return fallback, "M"
@@ -1061,9 +1065,11 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
 
 
 class ConfigHierarchySetupView(View):
-    def __init__(self, guild: discord.Guild):
+    """Configuração em lote: seleciona vários cargos por página, sem confirmar um a um."""
+    def __init__(self, guild: discord.Guild, required_count: Optional[int] = None):
         super().__init__(timeout=900)
         self.guild = guild
+        self.required_count = required_count
         raw_channel = panel_setting("hierarchy_panel_channel_id", "0")
         self.channel_id = int(raw_channel) if raw_channel.isdigit() else 0
         # @everyone não é patente. Todos os demais cargos são incluídos, inclusive cargos gerenciados.
@@ -1112,18 +1118,22 @@ class ConfigHierarchySetupView(View):
         embed = discord.Embed(
             title="🏛️ Configurar hierarquia",
             description=(
-                "Selecione o canal e escolha os cargos que devem aparecer. **A lista é paginada para incluir todos os cargos do servidor**, não apenas os primeiros 25.\n\n"
-                "A ordem é automática pela posição do Discord: **do cargo mais baixo ao mais alto**. Use ◀/▶ para percorrer todas as páginas."
+                "Selecione o canal e marque **vários cargos de uma só vez** no menu de cada página. "
+                "Use ◀/▶ para percorrer toda a lista: cada página contém até 25 cargos diferentes.\n\n"
+                "Para deixar a prioridade correta, a ordem segue a posição dos cargos no Discord: "
+                "**nº 1 = cargo mais baixo; último número = cargo mais alto**. Não precisa confirmar cargo por cargo."
             ),
             color=discord.Color.from_rgb(76, 86, 180),
         )
         embed.add_field(name="📣 Canal de publicação", value=channel.mention if channel else "`Ainda não selecionado`", inline=True)
         embed.add_field(name="📄 Página de cargos", value=f"**{self.page_index + 1}/{self.total_pages}** · {len(self.roles)} cargo(s) disponíveis", inline=True)
-        embed.add_field(name=f"✅ Cargos selecionados ({len(selected_roles)})", value=selected_text[:1024], inline=False)
+        target_count = f"/{self.required_count}" if self.required_count is not None else ""
+        embed.add_field(name="✅ Selecionados", value=f"**{len(selected_roles)}{target_count} cargo(s)**", inline=True)
+        embed.add_field(name="📋 Cargos selecionados (menor → maior)", value=selected_text[:1024], inline=False)
         if saved:
-            embed.set_footer(text="Configuração salva • A publicação mostrará os cargos do menor para o maior")
+            embed.set_footer(text="Configuração salva • nº 1 é o cargo mais baixo; último é o mais alto")
         else:
-            embed.set_footer(text="Marque cargos no menu • Navegue por todas as páginas • Clique em Salvar hierarquia")
+            embed.set_footer(text="Selecione vários cargos por página • Navegue • Salve uma única vez")
         return embed
 
     @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
@@ -1145,14 +1155,23 @@ class ConfigHierarchySetupView(View):
         if not self.channel_id:
             await interaction.response.send_message("Selecione primeiro o canal onde a hierarquia será publicada.", ephemeral=True)
             return
-        save_config_value("hierarchy_panel_channel_id", str(self.channel_id))
         selected_roles = sorted(
             (role for role in self.roles if role.id in self.selected_role_ids),
-            key=lambda role: (role.position, role.name.casefold()),
+            key=lambda role: (role.position, role.name.casefold(), role.id),
         )
+        if self.required_count is not None and len(selected_roles) != self.required_count:
+            await interaction.response.send_message(
+                f"Você informou **{self.required_count} cargo(s)**, mas selecionou **{len(selected_roles)}**. "
+                f"Selecione exatamente {self.required_count} cargos para salvar.", ephemeral=True,
+            )
+            return
+        if not selected_roles:
+            await interaction.response.send_message("Selecione pelo menos um cargo antes de salvar.", ephemeral=True)
+            return
+        save_config_value("hierarchy_panel_channel_id", str(self.channel_id))
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            # A prioridade é sequencial para garantir ordem crescente determinística do menor para o maior.
+            # Prioridade 1 = cargo mais baixo; o maior número = cargo mais alto.
             for priority, role in enumerate(selected_roles, start=1):
                 words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
                 abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
@@ -1161,9 +1180,10 @@ class ConfigHierarchySetupView(View):
                     "INSERT INTO settings(key,value) VALUES(?,?)",
                     (f"rank_role_{role.id}", f"{abbreviation}|{priority}"),
                 )
-        await interaction.response.edit_message(embed=self.build_embed(saved=True), view=self)
+        await interaction.response.edit_message(embed=self.build_embed(saved=True), view=None)
         await interaction.followup.send(
-            f"✅ Hierarquia salva com **{len(selected_roles)} cargo(s)** em ordem do mais baixo ao mais alto.",
+            f"✅ Hierarquia salva: **{len(selected_roles)} cargo(s)**. Ordem confirmada: **nº 1 é o mais baixo** e **nº {len(selected_roles)} é o mais alto**. "
+            "A lista usa a posição real dos cargos no Discord, então mova os cargos nas configurações do servidor se precisar alterar a ordem.",
             ephemeral=True,
         )
 
@@ -1223,212 +1243,11 @@ class ConfigHierarchyModal(Modal, title="Configurar hierarquia"):
         count = int(raw_count)
         save_config_value("hierarchy_panel_title", self.title_input.value.strip() or f"HIERARQUIA — {FACTION_NAME}")
         save_config_value("hierarchy_panel_description", self.description_input.value.strip())
-        wizard = ConfigHierarchyRoleWizardView(interaction.guild, count)
-        await interaction.response.send_message(embed=wizard.build_embed(), view=wizard, ephemeral=True)
+        setup_view = ConfigHierarchySetupView(interaction.guild, required_count=count)
+        await interaction.response.send_message(embed=setup_view.build_embed(), view=setup_view, ephemeral=True)
 
 
-HIERARCHY_WIZARD_ROLES_PER_PAGE = 25
-
-
-class HierarchyWizardRoleSelect(discord.ui.Select):
-    """Menu próprio com até 25 cargos por etapa/página, cobrindo a lista completa do servidor."""
-    def __init__(self, parent_view: "ConfigHierarchyRoleWizardView"):
-        self.parent_view = parent_view
-        start = parent_view.page_index * HIERARCHY_WIZARD_ROLES_PER_PAGE
-        self.page_roles = parent_view.roles[start:start + HIERARCHY_WIZARD_ROLES_PER_PAGE]
-        position = len(parent_view.ordered_role_ids) + 1
-        options = [
-            discord.SelectOption(
-                label=role.name[:100],
-                value=str(role.id),
-                description=f"Cargo do servidor • posição Discord {role.position}"[:100],
-                default=role.id == parent_view.current_role_id,
-            )
-            for role in self.page_roles
-        ]
-        if not options:
-            options = [discord.SelectOption(label="Nenhum cargo nesta página", value="none")]
-        super().__init__(
-            placeholder=f"Etapa {position}/{parent_view.count} • cargos {start + 1}–{start + len(self.page_roles)}",
-            min_values=1,
-            max_values=1,
-            options=options,
-            row=0,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        raw = self.values[0]
-        if raw == "none":
-            await interaction.response.send_message("Não há cargos nesta página. Use Anterior/Próxima.", ephemeral=True)
-            return
-        role_id = int(raw)
-        if role_id in self.parent_view.ordered_role_ids:
-            await interaction.response.send_message(
-                "Esse cargo já foi escolhido em outra posição. Selecione outro cargo.", ephemeral=True
-            )
-            return
-        self.parent_view.current_role_id = role_id
-        self.parent_view._sync_buttons()
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
-
-
-class ConfigHierarchyRoleWizardView(View):
-    """Wizard sequencial: cada posição usa páginas diferentes de até 25 cargos."""
-    def __init__(self, guild: discord.Guild, count: int):
-        super().__init__(timeout=900)
-        self.guild = guild
-        self.count = count
-        # Inclui todos os cargos do servidor exceto @everyone, ordenados para facilitar a busca.
-        self.roles = sorted(
-            (role for role in guild.roles if role != guild.default_role),
-            key=lambda role: (role.position, role.name.casefold(), role.id),
-        )
-        self.page_index = 0
-        self.ordered_role_ids: list[int] = []
-        self.current_role_id: Optional[int] = None
-        self.role_selector = HierarchyWizardRoleSelect(self)
-        self.add_item(self.role_selector)
-        self._sync_buttons()
-
-    @property
-    def total_pages(self) -> int:
-        return max(1, math.ceil(len(self.roles) / HIERARCHY_WIZARD_ROLES_PER_PAGE))
-
-    def _sync_buttons(self) -> None:
-        self.previous_page.disabled = self.page_index <= 0
-        self.next_page.disabled = self.page_index >= self.total_pages - 1
-        self.confirm_role.disabled = self.current_role_id is None
-
-    def _refresh_selector(self) -> None:
-        self.remove_item(self.role_selector)
-        self.role_selector = HierarchyWizardRoleSelect(self)
-        self.add_item(self.role_selector)
-        self._sync_buttons()
-
-    def build_embed(self) -> discord.Embed:
-        current_position = min(len(self.ordered_role_ids) + 1, self.count)
-        start = self.page_index * HIERARCHY_WIZARD_ROLES_PER_PAGE
-        end = min(start + HIERARCHY_WIZARD_ROLES_PER_PAGE, len(self.roles))
-        lines = []
-        for index in range(self.count):
-            if index < len(self.ordered_role_ids):
-                role = self.guild.get_role(self.ordered_role_ids[index])
-                text = role.mention if role else "Cargo removido do servidor"
-            else:
-                text = "`Aguardando seleção`"
-            lines.append(f"**{index + 1}.** {text}")
-        embed = discord.Embed(
-            title="🏛️ Montar hierarquia por ordem",
-            description=(
-                "Escolha **um cargo por vez**, começando pelo mais baixo e terminando no mais alto. "
-                "Cada página mostra um grupo diferente de até **25 cargos**; use os botões de navegação "
-                "para encontrar cargos em qualquer parte do servidor.\n\n" + "\n".join(lines)
-            )[:4000],
-            color=discord.Color.from_rgb(76, 86, 180),
-        )
-        embed.add_field(name="Etapa", value=f"**Cargo {current_position} de {self.count}**", inline=True)
-        embed.add_field(
-            name="Cargos encontrados",
-            value=f"Página **{self.page_index + 1}/{self.total_pages}** • exibindo **{start + 1}–{end}** de **{len(self.roles)}** cargos",
-            inline=True,
-        )
-        if self.current_role_id:
-            role = self.guild.get_role(self.current_role_id)
-            embed.add_field(name="Cargo selecionado nesta etapa", value=role.mention if role else "Cargo inválido", inline=False)
-            embed.set_footer(text="Confirme o cargo para passar à próxima posição")
-        else:
-            embed.set_footer(text="Escolha um cargo no menu desta página; navegue para procurar os restantes")
-        return embed
-
-    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
-    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.page_index > 0:
-            self.page_index -= 1
-        # Ao mudar de grupo, limpa a seleção não confirmada para não selecionar por engano outro conjunto.
-        self.current_role_id = None
-        self._refresh_selector()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Próxima", style=discord.ButtonStyle.secondary, emoji="➡️", row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.page_index < self.total_pages - 1:
-            self.page_index += 1
-        self.current_role_id = None
-        self._refresh_selector()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Confirmar cargo", style=discord.ButtonStyle.success, emoji="✅", row=2)
-    async def confirm_role(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administradores podem configurar a hierarquia.", ephemeral=True)
-            return
-        if self.current_role_id is None:
-            await interaction.response.send_message("Selecione um cargo nesta página primeiro.", ephemeral=True)
-            return
-        role = self.guild.get_role(self.current_role_id)
-        if role is None or role == self.guild.default_role or self.current_role_id in self.ordered_role_ids:
-            await interaction.response.send_message("Esse cargo não é válido ou já foi escolhido. Selecione outro.", ephemeral=True)
-            return
-        self.ordered_role_ids.append(self.current_role_id)
-        self.current_role_id = None
-        self.page_index = 0
-        if len(self.ordered_role_ids) >= self.count:
-            final_view = ConfigHierarchyFinalConfirmView(self.guild, self.ordered_role_ids)
-            await interaction.response.edit_message(embed=final_view.build_embed(), view=final_view)
-            return
-        self._refresh_selector()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="✖️", row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Configuração da hierarquia cancelada. Nenhuma alteração de cargos foi salva.", embed=None, view=None)
-
-
-class ConfigHierarchyFinalConfirmView(View):
-    def __init__(self, guild: discord.Guild, role_ids: list[int]):
-        super().__init__(timeout=600)
-        self.guild = guild
-        self.role_ids = list(role_ids)
-
-    def build_embed(self) -> discord.Embed:
-        lines = []
-        for position, role_id in enumerate(self.role_ids, start=1):
-            role = self.guild.get_role(role_id)
-            lines.append(f"**{position}.** {role.mention if role else '`Cargo não encontrado`'}")
-        embed = discord.Embed(
-            title="✅ Confirmar hierarquia",
-            description=("Revise a ordem: **nº 1 é o cargo mais baixo**, e o último é o mais alto. Cada membro aparecerá somente na seção do cargo mais alto desta lista que ele possuir.\n\n" + "\n".join(lines))[:4000],
-            color=discord.Color.green(),
-        )
-        embed.set_footer(text=f"{len(self.role_ids)} cargos • Confirme para salvar a nova ordem")
-        return embed
-
-    @discord.ui.button(label="Confirmar e salvar", style=discord.ButtonStyle.success, emoji="💾", row=0)
-    async def confirm_save(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administradores podem configurar a hierarquia.", ephemeral=True)
-            return
-        roles = [self.guild.get_role(role_id) for role_id in self.role_ids]
-        if any(role is None or role == self.guild.default_role for role in roles):
-            await interaction.response.send_message("Um ou mais cargos não existem mais. Refazer a configuração.", ephemeral=True)
-            return
-        with db() as con:
-            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            for priority, role in enumerate(roles, start=1):
-                words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
-                abbreviation = (("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12] or "RANK")
-                con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"rank_role_{role.id}", f"{abbreviation}|{priority}"))
-        embed = discord.Embed(
-            title="🏛️ Hierarquia salva",
-            description=f"Foram salvos **{len(roles)} cargos** em ordem crescente, do mais baixo ao mais alto.\n\nAgora clique em **Publicar hierarquia** e escolha o canal.",
-            color=discord.Color.green(),
-        )
-        await interaction.response.edit_message(embed=embed, view=None)
-
-    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary, emoji="✖️", row=0)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="Configuração cancelada. A hierarquia anterior foi mantida.", embed=None, view=None)
-
+# O fluxo antigo de seleção cargo-por-cargo foi removido: agora a hierarquia é configurada em lote por páginas.
 
 class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm"):
     title_input = TextInput(label="Título do painel farm", max_length=256, required=True)
@@ -1736,25 +1555,29 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                 await interaction.guild.chunk(cache=True)
             except Exception as exc:
                 log.warning("Não consegui atualizar o cache de membros ao publicar a hierarquia: %s", exc)
-            rank_rows = []
+
             with db() as con:
                 rank_rows = con.execute("SELECT key,value FROM settings WHERE key LIKE 'rank_role_%'").fetchall()
-            ranks = []
+            configured = []
             for row in rank_rows:
                 try:
                     role_id = int(row["key"].replace("rank_role_", "", 1))
-                    abbreviation, priority = row["value"].split("|", 1)
-                    ranks.append((int(priority), role_id, abbreviation))
-                except (ValueError, TypeError):
+                    abbreviation = row["value"].split("|", 1)[0].strip() or "RANK"
+                    role = interaction.guild.get_role(role_id)
+                    if role and role != interaction.guild.default_role:
+                        configured.append((role, abbreviation))
+                except (ValueError, TypeError, IndexError):
                     continue
-            ranks.sort(key=lambda item: item[0])
-            if not ranks:
-                await reply("Nenhum cargo está configurado para exibição. Configure-os em `/config` > Hierarquia.", ephemeral=True); return
+            # Use the Discord role position as the canonical ranking, so legacy inverted
+            # numeric priorities cannot accidentally make the lowest role the highest.
+            configured.sort(key=lambda item: (item[0].position, item[0].name.casefold(), item[0].id))
+            if not configured:
+                await reply("Nenhum cargo está configurado para exibição. Abra `/config` > Hierarquia e selecione os cargos.", ephemeral=True)
+                return
 
-            rank_fields = []
-            # Cada pessoa fica somente na seção do maior cargo configurado que realmente possui.
-            rank_priorities = {role_id: priority for priority, role_id, _ in ranks}
-            members_by_highest_rank: dict[int, list[discord.Member]] = {role_id: [] for _, role_id, _ in ranks}
+            ranks = [(priority, role.id, abbreviation, role) for priority, (role, abbreviation) in enumerate(configured, start=1)]
+            rank_priorities = {role_id: priority for priority, role_id, _, _ in ranks}
+            members_by_highest_rank: dict[int, list[discord.Member]] = {role_id: [] for _, role_id, _, _ in ranks}
             configured_role_ids = set(rank_priorities)
             for member in interaction.guild.members:
                 if member.bot:
@@ -1762,41 +1585,64 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                 owned_rank_ids = [role.id for role in member.roles if role.id in configured_role_ids]
                 if not owned_rank_ids:
                     continue
+                # Higher priority number means higher rank. The member is listed in only one rank.
                 highest_role_id = max(owned_rank_ids, key=lambda rid: rank_priorities[rid])
                 members_by_highest_rank[highest_role_id].append(member)
 
-            for _, role_id, abbreviation in ranks:
-                role = interaction.guild.get_role(role_id)
-                if not role:
-                    continue
+            # Normalize persisted priorities too, fixing any hierarchy saved with inverted values.
+            with db() as con:
+                con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+                for priority, role_id, abbreviation, _role in ranks:
+                    con.execute(
+                        "INSERT INTO settings(key,value) VALUES(?,?)",
+                        (f"rank_role_{role_id}", f"{abbreviation}|{priority}"),
+                    )
+
+            panel_title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
+            panel_description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização.")
+            total_ranks = len(ranks)
+            sent_messages = 0
+            # Publish highest rank first at the top of the channel; rank nº 1 (lowest) comes last.
+            for priority, role_id, abbreviation, role in reversed(ranks):
                 members = sorted(
                     members_by_highest_rank.get(role_id, []),
                     key=lambda m: m.display_name.casefold(),
                 )
-                lines = [m.mention for m in members[:25]]
-                value = "\n".join(lines) if lines else "Nenhum membro com este cargo."
-                if len(members) > 25:
-                    value += f"\n… e mais {len(members) - 25} membro(s)."
-                rank_fields.append((f"{abbreviation} · {role.name} ({len(members)})", value[:1024]))
-            if not rank_fields:
-                await reply("Os cargos configurados não existem mais no servidor. Abra `/config` > Hierarquia e selecione-os novamente.", ephemeral=True)
-                return
-
-            # Cada embed tem limites de campos e caracteres. Enviamos todos os cargos em páginas de 5 campos.
-            first_page = rank_fields[:5]
-            for field_name, field_value in first_page:
-                embed.add_field(name=field_name, value=field_value, inline=False)
-            await target.send(embed=embed)
-            for page_start in range(5, len(rank_fields), 5):
-                continuation = discord.Embed(
-                    title=f"{panel_setting('hierarchy_panel_title', f'🏛️ HIERARQUIA — {FACTION_NAME}')[:220]} · Continuação",
-                    description=f"Cargos {page_start + 1}–{min(page_start + 5, len(rank_fields))} de {len(rank_fields)} • ordem do mais baixo ao mais alto",
-                    color=discord.Color.from_rgb(76, 86, 180),
-                )
-                for field_name, field_value in rank_fields[page_start:page_start + 5]:
-                    continuation.add_field(name=field_name, value=field_value, inline=False)
-                continuation.set_footer(text="FAC-GERAL • Hierarquia completa")
-                await target.send(embed=continuation)
+                header = f"**{panel_title[:250]}**\n{panel_description[:900]}\n\n"
+                member_lines = [f"• {m.mention}" for m in members]
+                if not member_lines:
+                    member_lines = ["Nenhum membro possui este como maior cargo configurado."]
+                # Discord embed descriptions have a hard 4096-character limit. Long rank lists
+                # continue in separate messages under the same rank title.
+                chunks = []
+                buf = []
+                size = len(header) + 50
+                for line in member_lines:
+                    if buf and size + len(line) + 1 > 3000:
+                        chunks.append(buf)
+                        buf = []
+                        size = 100
+                    buf.append(line)
+                    size += len(line) + 1
+                if buf:
+                    chunks.append(buf)
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    suffix = f" · continuação {chunk_index}/{len(chunks)}" if len(chunks) > 1 else ""
+                    rank_title = f"🏛️ {priority}/{total_ranks} · {role.name}{suffix}"
+                    role_embed = discord.Embed(
+                        title=rank_title[:256],
+                        description=(header + f"**Cargo:** {role.mention}\n**Membros com este como maior cargo:** {len(members)}\n\n" + "\n".join(chunk))[:4096],
+                        color=discord.Color.from_rgb(76, 86, 180),
+                        timestamp=datetime.now(timezone.utc),
+                    )
+                    role_embed.set_footer(text=f"FAC-GERAL • Hierarquia • nº 1 = menor cargo • nº {total_ranks} = maior cargo")
+                    await target.send(embed=role_embed)
+                    sent_messages += 1
+            await reply(
+                f"✅ Hierarquia publicada em {target.mention}: **{total_ranks} cargos**, cada um em mensagem separada. "
+                f"O cargo mais alto aparece primeiro; o nº 1 (mais baixo) aparece por último. ({sent_messages} mensagem(ns)).",
+                ephemeral=True,
+            )
         elif kind == "members":
             with db() as con:
                 rows = con.execute("SELECT discord_id,character_name,game_id,rank_name,slot_number FROM members WHERE status='ACTIVE' ORDER BY rank_name,character_name LIMIT 50").fetchall()

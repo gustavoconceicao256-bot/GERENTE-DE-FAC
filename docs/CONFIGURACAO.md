@@ -10,7 +10,7 @@ No botão **WL**, configure título e descrição, além de foto/miniatura e ban
 
 ### Hierarquia
 
-Configure título e descrição. Em seguida, selecione o canal de publicação no menu de canais e selecione os cargos que devem aparecer na hierarquia usando o seletor nativo de cargos. Ao salvar, o bot gera uma sigla a partir do nome de cada cargo e usa a posição do cargo no Discord como prioridade; cargos mais altos aparecem primeiro e a sigla é usada para calcular o nickname.
+Configure título e descrição. Em seguida, selecione o canal de publicação no menu de canais e selecione os cargos que devem aparecer na hierarquia usando o seletor nativo de cargos. Selecione vários cargos por página (máximo 25 por menu) e navegue pelas páginas sem perder a seleção. Informe a quantidade exata de cargos antes, depois salve uma vez. A prioridade acompanha a posição nativa do Discord: nº 1 é o cargo mais baixo e o último número é o mais alto. O bot gera uma sigla do nome de cada cargo. Ao publicar, cada cargo recebe sua própria mensagem/embed, em ordem do maior para o menor, e cada membro aparece apenas no cargo mais alto configurado que possui.
 
 ### Farm
 
