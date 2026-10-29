@@ -14,7 +14,10 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Painel de comprovantes de farm; imagens são armazenadas no banco SQLite como dados binários.
 - Comando para recuperar um comprovante salvo.
 - Migrações aditivas para bancos existentes.
-- Comando `/config` com painel interativo para nome/convite, cargos, canais, opções de farm/punição e patentes hierárquicas.
+- Painel `/config` com configurações separadas para WL, hierarquia, farm, painel principal, membros, liderança, cargos, logs e canais de ADV/PD/blacklist.
+- Título, descrição e canal de publicação configuráveis para cada painel; destino informado pelo ID do canal.
+- Painel de hierarquia com lista explícita de cargos exibidos e prioridade para ordenar patentes.
+- Aprovação opcional dos comprovantes de farm; quando ativada, a liderança aprova ou recusa no canal definido, com motivo obrigatório para recusa.
 
 ## Requisitos
 
@@ -93,15 +96,17 @@ As variáveis iniciais estão documentadas em [`.env.example`](.env.example). En
 
 ### Painel `/config`
 
-Use `/config` no servidor do Discord. É necessário ter o cargo de liderança configurado ou a permissão de administrador. O painel é privado para quem abriu e tem estas áreas:
+Use `/config` no servidor. É necessário ter o cargo de liderança configurado ou a permissão de administrador. O painel é privado e tem áreas para configurar cada módulo e publicar os painéis nos canais escolhidos.
 
-- **Geral:** nome da facção e link de convite enviado ao candidato após o resultado da WL.
-- **Cargos:** membro, recrutador, liderança, ADV1 e ADV2.
-- **Canais:** canal para publicar o painel de WL, canal que recebe pedidos de WL e canais de logs.
-- **Farm / ADV3:** cargo ADV3, cooldown do farm, limite diário, fuso horário e PD automático na ADV3.
-- **Hierarquia:** sigla e prioridade de cada cargo hierárquico.
+- **WL:** título, descrição, canal em que o painel público será publicado e canal que recebe as solicitações para decisão do recrutador.
+- **Hierarquia:** título, descrição, canal de publicação e quais cargos aparecem na lista. Cada cargo usa o formato `ID_CARGO=SIGLA=PRIORIDADE`, separado por ponto e vírgula.
+- **Farm:** título, instruções, canal para publicar o painel, canal de revisão de comprovantes e escolha entre aprovação obrigatória ou automática.
+- **Painel principal, membros e liderança:** título, descrição e canal de publicação separados para cada painel.
+- **Cargos e regras:** cargo de membro, recrutador, liderança, ADV1/ADV2/ADV3, cooldown, limite diário, fuso e opção de PD automático na ADV3.
+- **Logs:** destinos separados para logs administrativos, públicos, farm, ADV, PD e blacklist.
+- **Publicação:** use os botões na parte inferior do `/config` para publicar WL, hierarquia, farm, painel principal, membros e liderança depois de salvar os campos.
 
-Nos campos de cargos e canais, informe o ID numérico do Discord; `0` desativa a configuração daquele campo quando permitido. As configurações são salvas na tabela `settings` do banco SQLite e reaplicadas na inicialização. Depois de salvar, execute `/config` novamente para ver o resumo atualizado.
+Nos campos de canal/cargo, informe o ID numérico do Discord; use `0` quando a tela permitir deixar um destino sem configurar. O bot precisa ter permissão para ver o canal, enviar mensagens e anexar arquivos. As configurações são salvas na tabela `settings` do SQLite e reaplicadas durante a execução.
 
 ### Patentes e apelidos
 
@@ -127,9 +132,8 @@ No botão **Hierarquia**, informe as entradas no formato `ID_CARGO=SIGLA=PRIORID
 
 ## Limitações conhecidas
 
-- A interface ainda usa componentes tradicionais do `discord.py` em partes do bot; não é uma implementação integral de Discord Components V2.
-- O `/config` cobre as principais configurações operacionais, mas nem todas as funcionalidades secundárias do bot possuem controles no painel.
-- O envio do comprovante salva a imagem e os dados informados, mas não converte automaticamente a imagem em itens, quantidades ou pontos de farm, nem inclui um fluxo completo de aprovação pela liderança.
+- A interface usa componentes tradicionais do `discord.py`; não é uma implementação integral de Discord Components V2.
+- O comprovante de farm é salvo como imagem e pode exigir aprovação da liderança. O sistema não interpreta automaticamente a imagem para calcular itens, quantidades ou pontos de farm; o registro de pontos continua sendo separado pelo comando `/farm`.
 - O comportamento real depende de IDs, permissões, intents e configurações válidas. Teste primeiro em um servidor de desenvolvimento.
 
 ## Resolver erro do Render: `403 Forbidden (50001): Missing Access`
