@@ -281,6 +281,28 @@ def has_leadership(interaction: discord.Interaction) -> bool:
     return member.guild_permissions.administrator or (LEADER_ROLE_ID != 0 and any(r.id == LEADER_ROLE_ID for r in member.roles))
 
 
+def member_has_configured_role(interaction: discord.Interaction, setting_key: str, default_role_id: int = 0) -> bool:
+    """Verifica um cargo salvo no painel; administradores sempre podem agir."""
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return False
+    member = interaction.user
+    if member.guild_permissions.administrator:
+        return True
+    try:
+        role_id = int(setting(setting_key, str(default_role_id)) or 0)
+    except (TypeError, ValueError):
+        role_id = 0
+    return bool(role_id and any(role.id == role_id for role in member.roles))
+
+
+def can_decide_wl(interaction: discord.Interaction) -> bool:
+    return member_has_configured_role(interaction, "wl_approver_role_id", RECRUIT_ROLE_ID)
+
+
+def can_decide_farm(interaction: discord.Interaction) -> bool:
+    return member_has_configured_role(interaction, "farm_approver_role_id", LEADER_ROLE_ID)
+
+
 def is_active_member(discord_id: int) -> bool:
     with db() as con:
         row = con.execute("SELECT status FROM members WHERE discord_id=?", (str(discord_id),)).fetchone()
@@ -406,7 +428,7 @@ class RegistrationModal(Modal, title="Whitelist da facção"):
             await interaction.response.send_message("O canal de WL não está configurado no painel/arquivo. Avise a administração.", ephemeral=True)
             return
         embed = discord.Embed(title=f"📋 Solicitação de WL #{request_id}", color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
-        embed.description = "O recrutador selecionado tem **5 minutos** para aprovar ou recusar. Ninguém mais pode decidir esta solicitação."
+        embed.description = "A solicitação poderá ser aprovada ou recusada por membros com o cargo autorizado configurado em **/config → WL**. Prazo: **5 minutos**."
         embed.add_field(name="Solicitante", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Nome no RP", value=name, inline=True)
         embed.add_field(name="ID FiveM", value=gid, inline=True)
@@ -418,6 +440,13 @@ class RegistrationModal(Modal, title="Whitelist da facção"):
             msg = await channel.send(content=recruiter.mention, embed=embed, view=RegistrationApprovalView())
             with db() as con:
                 con.execute("UPDATE registration_requests SET message_id=? WHERE id=?", (str(msg.id), request_id))
+            pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
+            pending_role = interaction.guild.get_role(pending_role_id) if pending_role_id else None
+            if pending_role:
+                try:
+                    await interaction.user.add_roles(pending_role, reason=f"WL #{request_id} enviada; cargo temporário")
+                except discord.Forbidden:
+                    log.warning("Sem permissão para aplicar o cargo temporário de WL ao membro %s", interaction.user.id)
             await interaction.response.send_message("Sua solicitação foi enviada. Você receberá o resultado no privado.", ephemeral=True)
         except discord.HTTPException:
             with db() as con:
@@ -453,7 +482,7 @@ class RegistrationPanelView(View):
     async def register(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Use este botão no servidor.", ephemeral=True); return
-        await interaction.response.send_message("Primeiro, selecione o recrutador que deseja escolher para sua WL. Somente ele poderá aprovar ou recusar.", view=RecruiterSelectView(interaction.guild), ephemeral=True)
+        await interaction.response.send_message("Primeiro, selecione um recrutador disponível e depois preencha seus dados. A aprovação ou recusa será feita por quem possuir o cargo autorizado em /config → WL.", view=RecruiterSelectView(interaction.guild), ephemeral=True)
 
 class RegistrationRejectModal(Modal, title="Motivo da recusa"):
     reason = TextInput(label="Motivo obrigatório", placeholder="Explique por que a WL foi recusada", style=discord.TextStyle.paragraph, min_length=3, max_length=500)
@@ -478,20 +507,29 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
             deadline = datetime.now(timezone.utc)
         if datetime.now(timezone.utc) > deadline:
             await interaction.response.send_message("O prazo de 5 minutos já expirou; a WL será reprovada automaticamente.", ephemeral=True); return
-        if str(interaction.user.id) != str(request["selected_recruiter_id"] or request["recruiter"]):
-            await interaction.response.send_message("Somente o recrutador selecionado nesta WL pode aprovar ou recusar.", ephemeral=True); return
+        if not can_decide_wl(interaction):
+            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar WL.", ephemeral=True); return
         # Atualização condicional impede que dois cliques processem a mesma WL.
         cur = con.execute("UPDATE registration_requests SET status=?,processed_by=?,processed_at=?,reason=? WHERE id=? AND status='PENDING'",
                           ("APPROVED" if approve else "REJECTED", str(interaction.user.id), now_iso(), reason, request_id))
         if cur.rowcount != 1:
             await interaction.response.send_message("Essa solicitação já foi processada.", ephemeral=True); return
     member = await fetch_member(interaction.guild, int(request["discord_id"]))
+    if member:
+        pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
+        pending_role = interaction.guild.get_role(pending_role_id) if pending_role_id else None
+        approved_role_id = int(setting("member_role_id", str(MEMBER_ROLE_ID)) or 0)
+        approved_role = interaction.guild.get_role(approved_role_id) if approved_role_id else None
+        try:
+            if approve and pending_role and pending_role in member.roles:
+                await member.remove_roles(pending_role, reason=f"WL #{request_id} aprovada")
+            if approve and approved_role:
+                await member.add_roles(approved_role, reason="WL aprovada")
+        except discord.Forbidden:
+            log.warning("Sem permissão para atualizar os cargos da WL do membro %s", member.id)
     if approve and member:
         try:
-            role_id = int(setting("member_role_id", str(MEMBER_ROLE_ID)) or 0)
-            role = interaction.guild.get_role(role_id) if role_id else None
-            if role:
-                await member.add_roles(role, reason="WL aprovada")
+            # Patente mais alta e abreviação configurável por cargo; fallback seguro para M.
             # Patente mais alta e abreviação configurável por cargo; fallback seguro para M.
             rank_role, abbreviation = highest_configured_rank(member)
             prefix = abbreviation or "M"
@@ -504,9 +542,9 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
                 VALUES(?,?,?,?,?,?,?,'ACTIVE') ON CONFLICT(discord_id) DO UPDATE SET discord_name=excluded.discord_name,
                 character_name=excluded.character_name,game_id=excluded.game_id,recruiter=excluded.recruiter,rank_name=excluded.rank_name,status='ACTIVE'""",
                 (request["discord_id"], request["discord_name"], request["character_name"], request["game_id"], str(request["selected_recruiter_id"]), rank_role.name if rank_role else "Membro", now_iso()))
-        log_action(interaction.user.id, "WL_APROVADA", int(request["discord_id"]), "Aprovada pelo recrutador selecionado", f"Solicitação #{request_id}")
+        log_action(interaction.user.id, "WL_APROVADA", int(request["discord_id"]), "Aprovada por usuário com cargo autorizado", f"Solicitação #{request_id}")
         result_title = "✅ WHITELIST APROVADA!"
-        result_text = f"Parabéns! Sua entrada em **{FACTION_NAME}** foi aprovada.\n**Nome:** {request['character_name']}\n**ID:** {request['game_id']}\n**Recrutador:** {interaction.user.mention}"
+        result_text = f"Parabéns! Sua entrada em **{FACTION_NAME}** foi aprovada.\n**Nome:** {request['character_name']}\n**ID:** {request['game_id']}\n**Recrutador:** <@{request['selected_recruiter_id'] or request['recruiter']}>\n**Decisão por:** {interaction.user.mention}"
         color = discord.Color.green()
     else:
         log_action(interaction.user.id, "WL_REJEITADA", int(request["discord_id"]), reason, f"Solicitação #{request_id}")
@@ -539,8 +577,9 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
             description=(
                 f"**Solicitante:** {request['discord_name'] or request['character_name']} (<@{request['discord_id']}>)\\n"
                 f"**Nome no RP:** {request['character_name']}\\n"
-                f"**Recrutador:** {interaction.user.display_name} (<@{interaction.user.id}>)\\n"
-                f"**Status:** **{'APROVADO' if approve else 'REPROVADO'}**"
+                f"**Recrutador escolhido:** <@{request['selected_recruiter_id'] or request['recruiter']}>\\n"
+                f"**Decisão por:** {interaction.user.mention}\\n"
+                f"**Status:** **{'APROVADA' if approve else 'REPROVADA'}**"
                 + (f"\\n**Motivo:** {reason[:500]}" if reason else "")
             ),
             color=color,
@@ -581,8 +620,8 @@ class RegistrationApprovalView(View):
             row = con.execute("SELECT status,selected_recruiter_id FROM registration_requests WHERE id=?", (request_id,)).fetchone()
         if not row or row["status"] != "PENDING":
             await interaction.response.send_message("Essa WL já foi encerrada.", ephemeral=True); return
-        if str(interaction.user.id) != str(row["selected_recruiter_id"]):
-            await interaction.response.send_message("Somente o recrutador selecionado pode recusar esta WL.", ephemeral=True); return
+        if not can_decide_wl(interaction):
+            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar WL.", ephemeral=True); return
         await interaction.response.send_modal(RegistrationRejectModal(request_id))
 
 
@@ -614,7 +653,7 @@ async def expire_pending_wls() -> None:
     while not bot.is_closed():
         try:
             with db() as con:
-                rows = con.execute("SELECT id,discord_id,character_name,game_id,deadline_at,message_id FROM registration_requests WHERE status='PENDING'").fetchall()
+                rows = con.execute("SELECT id,discord_id,character_name,game_id,recruiter,selected_recruiter_id,deadline_at,message_id FROM registration_requests WHERE status='PENDING'").fetchall()
                 for row in rows:
                     try: deadline = datetime.fromisoformat(row["deadline_at"])
                     except (ValueError, TypeError): deadline = datetime.now(timezone.utc)
@@ -623,25 +662,34 @@ async def expire_pending_wls() -> None:
                         if cur.rowcount:
                             try:
                                 user = await bot.fetch_user(int(row["discord_id"]))
-                                dm_embed = discord.Embed(title="⏱️ WHITELIST REPROVADA", description=f"Sua WL para **{FACTION_NAME}** foi reprovada automaticamente porque o recrutador selecionado não aprovou dentro de 5 minutos.\n**Nome:** {row['character_name']}\n**ID:** {row['game_id']}", color=discord.Color.red())
+                                dm_embed = discord.Embed(title="⏱️ WHITELIST REPROVADA", description=f"Sua WL para **{FACTION_NAME}** foi reprovada automaticamente porque ninguém com o cargo autorizado decidiu dentro de 5 minutos.\n**Nome:** {row['character_name']}\n**ID:** {row['game_id']}", color=discord.Color.red())
                                 view = View(timeout=None)
                                 view.add_item(discord.ui.Button(label="IR PARA O SERVIDOR", style=discord.ButtonStyle.link, url=invite_url()))
                                 await user.send(embed=dm_embed, view=view)
                             except discord.HTTPException:
                                 pass
                             guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
-                            if guild:
-                                await send_channel_log(guild, "⏱️ WL reprovada automaticamente", f"Solicitante: <@{row['discord_id']}>\nMotivo: prazo de 5 minutos expirado.", color=discord.Color.red())
                             channel_id = int(setting("wl_channel_id", str(APPROVAL_CHANNEL_ID)) or 0)
                             channel = guild.get_channel(channel_id) if guild and channel_id else None
                             if isinstance(channel, discord.TextChannel) and row["message_id"]:
                                 try:
                                     msg = await channel.fetch_message(int(row["message_id"]))
                                     if msg.embeds:
-                                        embed = msg.embeds[0]; embed.title = f"⏱️ REPROVADA AUTOMATICAMENTE · WL #{row['id']}"; embed.color = discord.Color.red()
-                                        await msg.edit(embed=embed, view=None)
+                                        embed = discord.Embed(
+                                            title=f"⏱️ WL REPROVADA AUTOMATICAMENTE · #{row['id']}",
+                                            description=(f"**Solicitante:** <@{row['discord_id']}>\n"
+                                                         f"**Nome no RP:** {row['character_name']}\n"
+                                                         f"**Recrutador escolhido:** <@{row['selected_recruiter_id'] or row['recruiter']}>\n"
+                                                         f"**Status:** **REPROVADA**\n"
+                                                         f"**Motivo:** prazo de 5 minutos expirado"),
+                                            color=discord.Color.red(), timestamp=datetime.now(timezone.utc),
+                                        )
+                                        embed.set_footer(text=f"Registro de WL • request_id={row['id']}")
+                                        await msg.edit(embed=embed, view=None, content=None)
                                 except discord.HTTPException:
                                     pass
+                            if guild:
+                                await send_channel_log(guild, "⏱️ WL reprovada automaticamente", f"Solicitante: <@{row['discord_id']}>\nRecrutador escolhido: <@{row['selected_recruiter_id'] or row['recruiter']}>\nStatus: REPROVADA.", color=discord.Color.red())
         except Exception:
             log.exception("Erro ao verificar expiração das WLs")
         await asyncio.sleep(10)
@@ -870,7 +918,7 @@ def panel_embed(kind: str) -> discord.Embed:
         description = panel_setting(
             "wl_panel_description",
             "Clique em **Fazer WL**, escolha o recrutador e informe seu nome no RP e ID do FiveM. "
-            "Somente o recrutador selecionado pode aprovar ou recusar; ele tem 5 minutos para decidir.",
+            "A aprovação ou recusa é feita por quem possuir o cargo autorizado configurado em /config → WL.",
         )
         return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple()), "wl")
     if kind == "farm":
@@ -931,7 +979,10 @@ def config_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
         value=(
             f"**{panel_setting('wl_panel_title', 'Whitelist')[:90]}**\n"
             f"Publicação: {channel_label('wl_panel_channel_id', str(REGISTRATION_CHANNEL_ID))}\n"
-            f"Solicitações: {channel_label('wl_channel_id', str(APPROVAL_CHANNEL_ID))}"
+            f"Solicitações: {channel_label('wl_channel_id', str(APPROVAL_CHANNEL_ID))}\n"
+            f"Cargo temporário: {role_label(int(panel_setting('wl_pending_role_id', '0') or 0))}\n"
+            f"Cargo após aprovação: {role_label(int(panel_setting('member_role_id', str(MEMBER_ROLE_ID)) or 0))}\n"
+            f"Quem decide WL: {role_label(int(panel_setting('wl_approver_role_id', str(RECRUIT_ROLE_ID)) or 0))}"
         ),
         inline=True,
     )
@@ -942,6 +993,7 @@ def config_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
             f"**{panel_setting('farm_panel_title', 'Registro de farm')[:90]}**\n"
             f"Publicação: {channel_label('farm_panel_channel_id')}\n"
             f"Análise: {channel_label('farm_approval_channel_id')}\n"
+            f"Quem decide: {role_label(int(panel_setting('farm_approver_role_id', str(LEADER_ROLE_ID)) or 0))}\n"
             f"Aprovação: **{'Manual' if farm_approval else 'Automática'}**"
         ),
         inline=True,
@@ -1008,11 +1060,21 @@ class ConfigWLChannelsView(View):
         self.add_item(ConfigTextChannelSelect("wl_channel_id", "Canal que receberá os pedidos de WL", row=1))
 
 
+class ConfigWLRoleView(View):
+    def __init__(self):
+        super().__init__(timeout=600)
+        self.add_item(ConfigSingleRoleSelect("wl_pending_role_id", "Cargo temporário antes da aprovação da WL", row=0))
+        self.add_item(ConfigSingleRoleSelect("member_role_id", "Cargo adicionado quando a WL for aprovada", row=1))
+        self.add_item(ConfigSingleRoleSelect("wl_approver_role_id", "Cargo autorizado a aprovar ou recusar WL", row=2))
+        self.add_item(ConfigSingleRoleSelect("recruit_role_id", "Cargo cujos membros aparecem como recrutadores", row=3))
+
+
 class ConfigFarmChannelsView(View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigTextChannelSelect("farm_panel_channel_id", "Canal onde o painel Farm será publicado", row=0))
         self.add_item(ConfigTextChannelSelect("farm_approval_channel_id", "Canal que receberá comprovantes para aprovação", row=1))
+        self.add_item(ConfigSingleRoleSelect("farm_approver_role_id", "Cargo autorizado a aprovar ou recusar o Farm", row=2))
 
 
 class ConfigSingleRoleSelect(discord.ui.RoleSelect):
@@ -1244,7 +1306,11 @@ class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
         save_config_value("wl_panel_photo_url", photo)
         save_config_value("wl_panel_banner_url", banner)
         await interaction.response.send_message(
-            "✅ Título, descrição, foto e banner da WL salvos. Agora selecione os dois canais abaixo.",
+            "✅ Aparência da WL salva. Configure abaixo os cargos temporário, de aprovação e de decisão, além do cargo usado para listar recrutadores.",
+            view=ConfigWLRoleView(), ephemeral=True,
+        )
+        await interaction.followup.send(
+            "📣 Agora configure os canais de publicação e recebimento das solicitações de WL.",
             view=ConfigWLChannelsView(), ephemeral=True,
         )
 
@@ -1313,7 +1379,7 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         save_config_value("farm_panel_banner_url", banner)
         save_config_value("farm_require_approval", "true" if enabled else "false")
         await interaction.response.send_message(
-            f"✅ Título, descrição, foto, banner e opção de aprovação salvos ({'aprovação obrigatória' if enabled else 'aprovação automática'}). Agora selecione os canais abaixo.",
+            f"✅ Título, descrição, foto, banner e opção de aprovação salvos ({'aprovação obrigatória' if enabled else 'aprovação automática'}). Configure também o cargo que poderá aprovar/recusar o Farm e os canais abaixo.",
             view=ConfigFarmChannelsView(), ephemeral=True,
         )
 
@@ -1345,8 +1411,8 @@ class FarmProofRejectModal(Modal, title="Recusar comprovante de farm"):
         super().__init__(timeout=300)
         self.proof_id = proof_id
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administrador pode recusar comprovantes.", ephemeral=True); return
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
         with db() as con:
             row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (self.proof_id,)).fetchone()
             if not row or row["status"] != "PENDING":
@@ -1406,8 +1472,8 @@ class FarmProofReviewView(View):
 
     @discord.ui.button(label="Aprovar comprovante", style=discord.ButtonStyle.success, emoji="✅", custom_id="fac:farm:approve-proof")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administrador pode aprovar comprovantes.", ephemeral=True); return
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
             await interaction.response.send_message("Não consegui identificar esse comprovante.", ephemeral=True); return
@@ -1432,8 +1498,8 @@ class FarmProofReviewView(View):
 
     @discord.ui.button(label="Recusar comprovante", style=discord.ButtonStyle.danger, emoji="❌", custom_id="fac:farm:reject-proof")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administrador pode recusar comprovantes.", ephemeral=True); return
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
             await interaction.response.send_message("Não consegui identificar esse comprovante.", ephemeral=True); return
@@ -1783,6 +1849,17 @@ async def setup_hook() -> None:  # type: ignore[override]
             "Falha HTTP ao sincronizar comandos slash globalmente (%s). O bot continuará ligado; "
             "veja os logs e tente novamente após corrigir a configuração.", exc
         )
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
+    pending_role = member.guild.get_role(pending_role_id) if pending_role_id else None
+    if pending_role:
+        try:
+            await member.add_roles(pending_role, reason="Cargo inicial antes da whitelist")
+        except discord.Forbidden:
+            log.warning("Sem permissão para aplicar o cargo pré-WL ao novo membro %s", member.id)
+
 
 @bot.event
 async def on_message(message: discord.Message) -> None:

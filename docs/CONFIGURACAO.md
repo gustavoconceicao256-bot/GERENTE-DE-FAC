@@ -45,3 +45,9 @@ O seletor de hierarquia é paginado em grupos de até 25 cargos, pois esse é o 
 ### Assistente sequencial da hierarquia
 
 Informe a quantidade de cargos (1–50), escolha um cargo para cada posição começando pelo mais baixo e confirme cada escolha. Ao terminar, revise e salve a ordem. Para publicar, escolha um canal no seletor do botão `Publicar hierarquia`. Um membro aparece somente sob o cargo de maior prioridade configurada que possui.
+
+### Cargos de WL e Farm
+
+Abra `/config` e entre em **WL** para selecionar separadamente: cargo temporário antes da aprovação, cargo adicionado após aprovação, cargo autorizado a aprovar/recusar e cargo cujos membros aparecem na seleção de recrutadores. O cargo temporário é aplicado a novos membros e removido quando a WL é aprovada; em caso de recusa, permanece.
+
+Em **Farm**, selecione o cargo autorizado a aprovar ou recusar comprovantes. Administradores continuam podendo realizar essas ações. As configurações ficam salvas no banco SQLite.

@@ -182,3 +182,15 @@ Nenhuma licença foi definida neste pacote. Escolha e adicione uma licença ante
 ## Hierarquia por ordem manual
 
 No `/config` → `Hierarquia`, informe a quantidade de cargos (1 a 50), marque os cargos desejados nos menus paginados e salve uma vez. A lista usa a ordem de posição dos cargos no Discord; nº 1 representa o menor cargo. Ao clicar em `Publicar hierarquia`, selecione o canal. O bot publica uma mensagem/embed individual por cargo, com o nome do cargo no título. Cada membro aparece apenas na seção do maior cargo configurado que possui; o mais alto é publicado primeiro e o cargo nº 1 por último.
+
+## Cargos configuráveis de WL e Farm
+
+No comando `/config`:
+
+- **WL → Cargo temporário:** aplicado quando o membro entra no servidor (e como fallback quando envia a WL); permanece se a WL for recusada e é removido quando a WL é aprovada.
+- **WL → Cargo após aprovação:** aplicado ao membro quando a WL é aprovada.
+- **WL → Cargo autorizado a aprovar/recusar:** controla quem pode decidir uma solicitação. Administradores também podem decidir.
+- **WL → Cargo de recrutadores:** define quais membros podem aparecer na lista de recrutadores para seleção.
+- **Farm → Cargo autorizado a aprovar/recusar:** controla quem pode analisar comprovantes. Administradores também podem decidir.
+
+As escolhas são salvas no SQLite e permanecem após reiniciar o bot. O cargo temporário é aplicado automaticamente a novos membros; para membros que já estavam no servidor, também é aplicado quando enviam a solicitação de WL.
