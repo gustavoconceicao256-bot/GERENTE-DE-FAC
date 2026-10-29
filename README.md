@@ -11,7 +11,9 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Recusa exige motivo; solicitações expiram após 5 minutos.
 - Resultado enviado por mensagem direta, com botão para o convite configurado.
 - Cadastro de membro, aplicação do cargo configurado e tentativa de definir apelido no formato `[ M ] NOME - ID`.
-- Painel de comprovantes de farm; imagens são armazenadas no banco SQLite como dados binários.
+- Registro de farm integrado ao cadastro aprovado da WL: o bot identifica o jogador pelo ID do Discord e recupera nome/ID FiveM do SQLite, sem perguntar esses dados novamente.
+- Fluxo de farm pelo painel: seleção de item ativo configurado, quantidade numérica e imagem de prova anexada no mesmo canal.
+- Registros e provas salvos no SQLite; envio para canal de aprovação (se habilitado) e publicação do registro final completo no canal de logs de farm.
 - Comando para recuperar um comprovante salvo.
 - Migrações aditivas para bancos existentes.
 - Painel `/config` simplificado para WL, hierarquia, farm, seleção de cargos e logs.
@@ -101,7 +103,7 @@ Use `/config` no servidor. É necessário ter o cargo de liderança configurado 
 
 - **WL:** título, descrição, canal em que o painel público será publicado e canal que recebe as solicitações para decisão do recrutador.
 - **Hierarquia:** título, descrição, quantidade de cargos e seleção de vários cargos por página. A lista é dividida em páginas de até 25 cargos e a ordem é determinada pela posição no Discord: nº 1 é o cargo mais baixo e o último é o mais alto. A publicação gera uma mensagem/embed separada para cada cargo, com o nome do cargo destacado no título.
-- **Farm:** título, instruções, canal para publicar o painel, canal de revisão de comprovantes e escolha entre aprovação obrigatória ou automática.
+- **Farm:** título, instruções, canal para publicar o painel, canal de revisão, canal de registros finais e escolha entre aprovação obrigatória ou automática. O jogador seleciona um item ativo, informa a quantidade e envia a imagem de prova no próprio canal; nome e ID são recuperados automaticamente do cadastro aprovado da WL.
 - **Painel principal, membros e liderança:** título, descrição e canal de publicação separados para cada painel.
 - **Cargos e regras:** cargo de membro, recrutador, liderança, ADV1/ADV2/ADV3, cooldown, limite diário, fuso e opção de PD automático na ADV3.
 - **Logs:** destinos separados para logs administrativos, públicos, farm, ADV, PD e blacklist.
@@ -134,7 +136,7 @@ No botão **Hierarquia**, informe a quantidade de patentes. Na tela seguinte, ma
 ## Limitações conhecidas
 
 - A interface usa componentes tradicionais do `discord.py`; não é uma implementação integral de Discord Components V2.
-- O comprovante de farm é salvo como imagem e pode exigir aprovação da liderança. O sistema não interpreta automaticamente a imagem para calcular itens, quantidades ou pontos de farm; o registro de pontos continua sendo separado pelo comando `/farm`.
+- O comprovante de farm é salvo como imagem. Item e quantidade são informados pelo jogador no fluxo do painel; o bot não tenta interpretar os dados escritos dentro da imagem. O comando `/farm-item` cria/atualiza os itens e `/farm-item-desativar` desativa opções. O comando antigo `/farm` apenas orienta a usar o painel para garantir que todo registro tenha prova.
 - O comportamento real depende de IDs, permissões, intents e configurações válidas. Teste primeiro em um servidor de desenvolvimento.
 
 ## Resolver erro do Render: `403 Forbidden (50001): Missing Access`

@@ -118,7 +118,11 @@ def init_db() -> None:
             discord_id TEXT PRIMARY KEY,
             character_name TEXT NOT NULL,
             game_id TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            item_name TEXT DEFAULT '',
+            quantity INTEGER DEFAULT 0,
+            points INTEGER DEFAULT 0,
+            channel_id TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS farm_proofs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -135,7 +139,10 @@ def init_db() -> None:
             reviewed_at TEXT DEFAULT '',
             review_reason TEXT DEFAULT '',
             review_channel_id TEXT DEFAULT '',
-            review_message_id TEXT DEFAULT ''
+            review_message_id TEXT DEFAULT '',
+            item_name TEXT DEFAULT '',
+            quantity INTEGER DEFAULT 0,
+            points INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,6 +189,17 @@ def init_db() -> None:
             "review_message_id": "TEXT DEFAULT ''",
         }
         for name, definition in proof_migrations.items():
+            if name not in proof_columns:
+                con.execute(f"ALTER TABLE farm_proofs ADD COLUMN {name} {definition}")
+        pending_columns = {row[1] for row in con.execute("PRAGMA table_info(farm_proof_pending)").fetchall()}
+        pending_migrations = {
+            "item_name": "TEXT DEFAULT ''", "quantity": "INTEGER DEFAULT 0",
+            "points": "INTEGER DEFAULT 0", "channel_id": "TEXT DEFAULT ''",
+        }
+        for name, definition in pending_migrations.items():
+            if name not in pending_columns:
+                con.execute(f"ALTER TABLE farm_proof_pending ADD COLUMN {name} {definition}")
+        for name, definition in {"item_name": "TEXT DEFAULT ''", "quantity": "INTEGER DEFAULT 0", "points": "INTEGER DEFAULT 0"}.items():
             if name not in proof_columns:
                 con.execute(f"ALTER TABLE farm_proofs ADD COLUMN {name} {definition}")
 
@@ -748,129 +766,216 @@ class LeadershipPanelView(View):
         embed = discord.Embed(title="🧾 Últimas ações da liderança", description="\n".join(lines), color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ---------------- REGISTRO DE FARM COM COMPROVANTE ----------------
-class FarmStartModal(Modal, title="Registrar farm"):
-    character_name = TextInput(label="Seu nome no RP", placeholder="Nome cadastrado na facção", max_length=32)
-    game_id = TextInput(label="Seu ID no FiveM", placeholder="Somente números", max_length=8)
+# ---------------- REGISTRO DE FARM COM IDENTIFICAÇÃO PELA WL ----------------
+class FarmQuantityModal(Modal, title="Quantidade do farm"):
+    quantity = TextInput(label="Quantidade farmada", placeholder="Digite somente números", max_length=9)
+
+    def __init__(self, item_id: int, item_name: str, points_per_unit: int, channel_id: int):
+        super().__init__(timeout=300)
+        self.item_id = item_id
+        self.item_name = item_name
+        self.points_per_unit = points_per_unit
+        self.channel_id = channel_id
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        gid = self.game_id.value.strip()
-        if not gid.isdigit():
-            await interaction.response.send_message("O ID do FiveM precisa conter somente números.", ephemeral=True); return
+        raw = self.quantity.value.strip()
+        if not raw.isdigit() or int(raw) < 1 or int(raw) > 100000:
+            await interaction.response.send_message("Informe uma quantidade numérica entre 1 e 100.000.", ephemeral=True)
+            return
+        if not is_active_member(interaction.user.id):
+            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado. Não é possível registrar farm.", ephemeral=True)
+            return
         with db() as con:
-            con.execute("INSERT INTO farm_proof_pending(discord_id,character_name,game_id,created_at) VALUES(?,?,?,?) ON CONFLICT(discord_id) DO UPDATE SET character_name=excluded.character_name,game_id=excluded.game_id,created_at=excluded.created_at", (str(interaction.user.id), self.character_name.value.strip(), gid, now_iso()))
-        try:
-            await interaction.user.send("🌾 **Registro de farm iniciado**\nVocê informou seus dados. Agora envie **uma captura de tela como anexo** ou cole um **link direto para a imagem** nesta conversa privada. O comprovante será salvo no banco de dados. Limite: 8 MB; formatos PNG, JPG, JPEG, GIF ou WEBP.")
-            await interaction.response.send_message("Quase pronto! Enviei uma mensagem privada para você anexar a captura ou colar o link da imagem. O registro só será concluído quando o comprovante for recebido.", ephemeral=True)
-        except discord.Forbidden:
-            with db() as con: con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(interaction.user.id),))
-            await interaction.response.send_message("Não consegui abrir sua DM. Ative mensagens privadas do servidor e tente novamente.", ephemeral=True)
+            member = con.execute("SELECT discord_id, character_name, game_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
+            item = con.execute("SELECT name, points FROM farm_items WHERE id=? AND active=1", (self.item_id,)).fetchone()
+            if not member:
+                await interaction.response.send_message("Não encontrei seu cadastro ativo da WL. Procure a liderança.", ephemeral=True)
+                return
+            if not item:
+                await interaction.response.send_message("Esse item de farm foi desativado. Inicie um novo registro.", ephemeral=True)
+                return
+            quantity = int(raw)
+            day_prefix = local_day_prefix()
+            daily_entries = con.execute("SELECT COUNT(*) AS n FROM farm_entries WHERE discord_id=? AND substr(created_at,1,10)=?", (str(interaction.user.id), day_prefix)).fetchone()["n"]
+            daily_pending = con.execute("SELECT COUNT(*) AS n FROM farm_proofs WHERE discord_id=? AND status='PENDING' AND substr(created_at,1,10)=?", (str(interaction.user.id), day_prefix)).fetchone()["n"]
+            daily = int(daily_entries) + int(daily_pending)
+            if daily >= MAX_FARM_ENTRIES_PER_DAY:
+                await interaction.response.send_message(f"Você atingiu o limite de {MAX_FARM_ENTRIES_PER_DAY} registros de farm hoje.", ephemeral=True)
+                return
+            last_entry = con.execute("SELECT created_at FROM farm_entries WHERE discord_id=? ORDER BY id DESC LIMIT 1", (str(interaction.user.id),)).fetchone()
+            last_pending = con.execute("SELECT created_at FROM farm_proofs WHERE discord_id=? AND status='PENDING' ORDER BY id DESC LIMIT 1", (str(interaction.user.id),)).fetchone()
+            timestamps = [row["created_at"] for row in (last_entry, last_pending) if row and row["created_at"]]
+            if timestamps and FARM_COOLDOWN_SECONDS:
+                try:
+                    latest = max(datetime.fromisoformat(value) for value in timestamps)
+                    elapsed = (datetime.now(timezone.utc) - latest).total_seconds()
+                    if elapsed < FARM_COOLDOWN_SECONDS:
+                        await interaction.response.send_message(f"Aguarde {int(FARM_COOLDOWN_SECONDS-elapsed)+1}s antes de iniciar outro registro.", ephemeral=True)
+                        return
+                except ValueError:
+                    pass
+            con.execute("""INSERT INTO farm_proof_pending(discord_id,character_name,game_id,created_at,item_name,quantity,points,channel_id)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(discord_id) DO UPDATE SET
+                character_name=excluded.character_name, game_id=excluded.game_id, created_at=excluded.created_at,
+                item_name=excluded.item_name, quantity=excluded.quantity, points=excluded.points, channel_id=excluded.channel_id""",
+                (str(interaction.user.id), member["character_name"], member["game_id"], now_iso(), item["name"], quantity,
+                 quantity * int(item["points"]), str(self.channel_id)))
+        await interaction.response.send_message(
+            f"🌾 **Farm selecionado:** {item['name']}\n**Quantidade:** {quantity}\n\n"
+            "Agora envie a **imagem de prova como anexo neste mesmo canal**. O bot já identificou seu nome e ID pela WL; não precisa informar novamente.",
+            ephemeral=True)
+
+
+class FarmItemSelect(discord.ui.Select):
+    def __init__(self, interaction: discord.Interaction):
+        self.requester_id = interaction.user.id
+        self.channel_id = interaction.channel_id
+        with db() as con:
+            items = con.execute("SELECT id,name,points FROM farm_items WHERE active=1 ORDER BY name LIMIT 25").fetchall()
+        options = [discord.SelectOption(label=row["name"][:100], value=str(row["id"]), description=f"{row['points']} ponto(s) por unidade"[:100]) for row in items]
+        super().__init__(placeholder="Selecione o farm configurado...", min_values=1, max_values=1, options=options, disabled=not options)
+        self.items = {int(row["id"]): (row["name"], int(row["points"])) for row in items}
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Somente a pessoa que iniciou o registro pode selecionar o farm.", ephemeral=True)
+            return
+        if not is_active_member(interaction.user.id):
+            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado.", ephemeral=True)
+            return
+        item_id = int(self.values[0])
+        item = self.items.get(item_id)
+        if not item:
+            await interaction.response.send_message("Item inválido. Abra um novo registro.", ephemeral=True)
+            return
+        await interaction.response.send_modal(FarmQuantityModal(item_id, item[0], item[1], self.channel_id))
+
+
+class FarmItemSelectView(View):
+    def __init__(self, interaction: discord.Interaction):
+        super().__init__(timeout=180)
+        self.add_item(FarmItemSelect(interaction))
+
 
 class FarmPanelView(View):
     def __init__(self):
         super().__init__(timeout=None)
-    @discord.ui.button(label="INICIAR REGISTRO", style=discord.ButtonStyle.success, emoji="🌾", custom_id="fac:farm:start")
+
+    @discord.ui.button(label="REGISTRAR FARM", style=discord.ButtonStyle.success, emoji="🌾", custom_id="fac:farm:start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(FarmStartModal())
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("Faça o registro pelo servidor.", ephemeral=True)
+            return
+        with db() as con:
+            member = con.execute("SELECT character_name,game_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
+            items = con.execute("SELECT COUNT(*) AS n FROM farm_items WHERE active=1").fetchone()["n"]
+        if not member:
+            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado. Faça/regularize sua WL antes de registrar farm.", ephemeral=True)
+            return
+        if not items:
+            await interaction.response.send_message("Nenhum tipo de farm está configurado/ativo no painel. Avise a liderança.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Cadastro identificado: **{member['character_name']}** · ID **{member['game_id']}**.\nSelecione o farm que deseja registrar:",
+            view=FarmItemSelectView(interaction), ephemeral=True)
+
 
 async def store_farm_proof(message: discord.Message) -> bool:
     with db() as con:
         pending = con.execute("SELECT * FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),)).fetchone()
     if not pending:
         return False
-    image_bytes = None; filename = "comprovante"; mime = ""; source_url = ""
-    if message.attachments:
-        attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/")), None)
-        if attachment:
-            if attachment.size > 8 * 1024 * 1024:
-                await message.channel.send("A imagem excede o limite de 8 MB. Envie uma imagem menor."); return True
-            try:
-                image_bytes = await attachment.read(use_cached=False)
-                filename = attachment.filename[:200]
-                mime = attachment.content_type or "application/octet-stream"
-                source_url = attachment.url
-            except discord.HTTPException:
-                await message.channel.send("Não consegui baixar o anexo. Tente enviá-lo novamente."); return True
-    if image_bytes is None:
-        match = re.search(r"https?://\S+", message.content or "")
-        if match:
-            url = match.group(0).strip('<>()[]')
-            parsed = urlparse(url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                await message.channel.send("Esse link não parece válido. Envie uma imagem como anexo ou um link HTTP/HTTPS direto."); return True
-            try:
-                import aiohttp
-                timeout = aiohttp.ClientTimeout(total=15)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, allow_redirects=False) as response:
-                        content_type = response.headers.get("Content-Type", "").split(";")[0].lower()
-                        if response.status != 200 or not content_type.startswith("image/"):
-                            await message.channel.send("O link precisa abrir diretamente uma imagem pública (PNG/JPG/WEBP/GIF). Tente anexar o arquivo."); return True
-                        if int(response.headers.get("Content-Length", "0") or 0) > 8 * 1024 * 1024:
-                            await message.channel.send("A imagem excede o limite de 8 MB."); return True
-                        image_bytes = await response.content.read(8 * 1024 * 1024 + 1)
-                        if len(image_bytes) > 8 * 1024 * 1024:
-                            await message.channel.send("A imagem excede o limite de 8 MB."); return True
-                        mime = content_type; filename = os.path.basename(parsed.path)[:200] or "comprovante-link"; source_url = url
-            except Exception as exc:
-                log.warning("Falha ao obter imagem do link de farm: %s", exc)
-                await message.channel.send("Não consegui baixar essa imagem. Envie o arquivo como anexo ou tente outro link."); return True
-        else:
-            await message.channel.send("Envie uma captura como anexo ou cole um link direto para a imagem."); return True
-    # Checagem simples do conteúdo real, além do Content-Type.
+    try:
+        pending_age = (datetime.now(timezone.utc) - datetime.fromisoformat(pending["created_at"])).total_seconds()
+        if pending_age > 900:
+            with db() as con:
+                con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
+            await message.reply("O prazo de 15 minutos para enviar a prova expirou. Inicie um novo registro pelo painel.")
+            return True
+    except (TypeError, ValueError):
+        pass
+    if str(pending["channel_id"] or "") != str(message.channel.id):
+        return False
+    if not is_active_member(message.author.id):
+        with db() as con:
+            con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
+        await message.reply("Seu cadastro ativo da WL não foi localizado. O registro de farm foi cancelado.")
+        return True
+    image_attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
+    if not image_attachment:
+        await message.reply("Envie a imagem de prova como anexo nesta mensagem. Links e mensagens sem imagem não concluem o registro.")
+        return True
+    if image_attachment.size > 8 * 1024 * 1024:
+        await message.reply("A imagem excede o limite de 8 MB. Envie uma imagem menor.")
+        return True
+    try:
+        image_bytes = await image_attachment.read(use_cached=False)
+    except discord.HTTPException:
+        await message.reply("Não consegui baixar a imagem. Envie novamente.")
+        return True
+    filename = image_attachment.filename[:200]
+    mime = image_attachment.content_type or "application/octet-stream"
     signatures = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"RIFF")
-    if not image_bytes or not image_bytes.startswith(signatures):
-        await message.channel.send("O arquivo recebido não parece ser uma imagem compatível. Envie PNG, JPG, GIF ou WEBP."); return True
+    if not image_bytes.startswith(signatures):
+        await message.reply("O arquivo não parece ser uma imagem PNG, JPG, GIF ou WEBP válida.")
+        return True
     require_approval = setting("farm_require_approval", "false").strip().lower() in {"1", "true", "yes", "sim"}
     proof_status = "PENDING" if require_approval else "APPROVED"
-    with db() as con:
-        cur = con.execute(
-            "INSERT INTO farm_proofs(discord_id,character_name,game_id,image_data,image_filename,image_mime,source_url,created_at,status) VALUES(?,?,?,?,?,?,?,?,?)",
-            (str(message.author.id), pending["character_name"], pending["game_id"], sqlite3.Binary(image_bytes), filename, mime, source_url, now_iso(), proof_status),
-        )
-        proof_id = cur.lastrowid
-        con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
-    log_action(message.author.id, "FARM_COMPROVANTE_ENVIADO", message.author.id, "", f"Comprovante #{proof_id}; {filename}; {len(image_bytes)} bytes; status={proof_status}")
-
+    guild = message.guild
+    log_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
+    log_channel = guild.get_channel(log_channel_id) if guild and log_channel_id else None
+    if not isinstance(log_channel, discord.TextChannel):
+        await message.reply("O canal de registros finais de farm não está configurado. A prova ainda não foi registrada. Avise a liderança para configurar `/config` → Farm → Canal de registros finais.")
+        return True
+    review_channel = None
     if require_approval:
-        guild = bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if len(bot.guilds) == 1 else None)
         review_channel_id = int(setting("farm_approval_channel_id", "0") or 0)
         review_channel = guild.get_channel(review_channel_id) if guild and review_channel_id else None
         if not isinstance(review_channel, discord.TextChannel):
-            await message.channel.send(
-                f"✅ Comprovante **#{proof_id}** foi salvo no banco, mas está **aguardando aprovação**. "
-                "A administração precisa configurar um canal de aprovação em `/config` > Farm."
-            )
-            log.error("Comprovante de farm #%s está pendente sem canal de aprovação válido.", proof_id)
+            await message.reply("O canal de aprovação de farm não está configurado. A prova ainda não foi registrada. Avise a liderança para configurar `/config` → Farm → Canal de análise.")
             return True
-        embed = discord.Embed(
-            title=f"🌾 Comprovante de farm #{proof_id} — aguardando aprovação",
-            description=(f"Membro: <@{message.author.id}> (`{message.author.id}`)\n"
-                         f"Nome RP: **{pending['character_name']}**\nID FiveM: **{pending['game_id']}**\n"
-                         f"Arquivo: `{filename[:150]}`\nTamanho: **{len(image_bytes) / 1024:.1f} KB**"),
-            color=discord.Color.gold(), timestamp=datetime.now(timezone.utc),
-        )
+    with db() as con:
+        cur = con.execute("""INSERT INTO farm_proofs(discord_id,character_name,game_id,image_data,image_filename,image_mime,source_url,created_at,status,item_name,quantity,points)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(message.author.id), pending["character_name"], pending["game_id"], sqlite3.Binary(image_bytes), filename, mime,
+             image_attachment.url, now_iso(), proof_status, pending["item_name"], int(pending["quantity"]), int(pending["points"])))
+        proof_id = cur.lastrowid
+        if not require_approval:
+            con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)",
+                (str(message.author.id), pending["item_name"], int(pending["quantity"]), int(pending["points"]), now_iso()))
+        con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
+    log_action(message.author.id, "FARM_COMPROVANTE_ENVIADO", message.author.id, "", f"Comprovante #{proof_id}; {pending['item_name']}; quantidade={pending['quantity']}; {filename}; status={proof_status}")
+    if require_approval:
+        embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id} — AGUARDANDO APROVAÇÃO",
+            description=(f"Jogador: **{pending['character_name']}**\nID: **{pending['game_id']}**\n"
+                         f"Farm: **{pending['item_name']}**\nQuantidade: **{pending['quantity']}**\n"
+                         f"Pontos: **{pending['points']}**\nDiscord: <@{message.author.id}> (`{message.author.id}`)\n"
+                         f"Prova: `{filename[:120]}`"), color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
         embed.set_footer(text=f"farm_proof_id={proof_id}")
         safe_filename = os.path.basename(filename).replace("\n", "_")[:100] or f"farm-{proof_id}.png"
         embed.set_image(url=f"attachment://{safe_filename}")
         try:
             import io
-            review_message = await review_channel.send(
-                embed=embed,
-                file=discord.File(io.BytesIO(image_bytes), filename=safe_filename),
-                view=FarmProofReviewView(),
-            )
+            review_message = await review_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_filename), view=FarmProofReviewView())
             with db() as con:
-                con.execute("UPDATE farm_proofs SET review_channel_id=?,review_message_id=? WHERE id=?",
-                            (str(review_channel.id), str(review_message.id), proof_id))
-            await message.channel.send(f"📨 Comprovante **#{proof_id}** salvo e enviado para aprovação da liderança. Você receberá o resultado após a análise.")
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.exception("Não foi possível publicar comprovante #%s para aprovação: %s", proof_id, exc)
-            await message.channel.send(f"⚠️ Comprovante **#{proof_id}** foi salvo e continua pendente, mas não consegui publicar o pedido de aprovação. Avise a liderança.")
+                con.execute("UPDATE farm_proofs SET review_channel_id=?,review_message_id=? WHERE id=?", (str(review_channel.id), str(review_message.id), proof_id))
+            await message.reply(f"📨 Registro **#{proof_id}** salvo e enviado para aprovação da liderança.")
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Não foi possível publicar comprovante #%s para aprovação", proof_id)
+            await message.reply(f"⚠️ Registro **#{proof_id}** foi salvo e continua pendente, mas não consegui publicar para aprovação. Avise a liderança.")
     else:
-        await message.channel.send(
-            f"✅ Comprovante **#{proof_id}** salvo permanentemente no banco e registrado como aprovado automaticamente. "
-            f"Nome: **{pending['character_name']}** · ID FiveM: **{pending['game_id']}**."
-        )
+        await message.reply(f"✅ Registro **#{proof_id}** concluído!\nJogador: **{pending['character_name']}** · ID: **{pending['game_id']}**\nFarm: **{pending['item_name']}** · Quantidade: **{pending['quantity']}**.")
+        if isinstance(log_channel, discord.TextChannel):
+            embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+            embed.add_field(name="Jogador", value=pending["character_name"], inline=True)
+            embed.add_field(name="ID", value=pending["game_id"], inline=True)
+            embed.add_field(name="Farm", value=pending["item_name"], inline=True)
+            embed.add_field(name="Quantidade", value=str(pending["quantity"]), inline=True)
+            embed.add_field(name="Discord", value=f"<@{message.author.id}> (`{message.author.id}`)", inline=False)
+            safe_log_filename = os.path.basename(filename).replace("\n", "_")[:100] or f"farm-{proof_id}.png"
+            embed.set_image(url=f"attachment://{safe_log_filename}")
+            import io
+            await log_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_log_filename))
     return True
 
 # ---------------- PAINEL INTERATIVO DE CONFIGURAÇÃO ----------------
@@ -925,10 +1030,13 @@ def panel_embed(kind: str) -> discord.Embed:
         title = panel_setting("farm_panel_title", f"🌾 REGISTRO DE FARM — {FACTION_NAME}")
         description = panel_setting(
             "farm_panel_description",
-            "1. Deposite o farm no baú da facção.\n2. Tire uma captura de tela.\n"
-            "3. Clique em **INICIAR REGISTRO** e informe nome e ID.\n"
-            "4. Envie a imagem ou um link direto na DM do bot. O comprovante é salvo no banco.",
+            "1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
+            "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL.",
         )
+        if "informe nome e ID" in description.lower() or "na dm do bot" in description.lower() or "informe seus dados" in description.lower():
+            description = ("1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
+                           "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL.")
+            save_config_value("farm_panel_description", description)
         return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
     if kind == "hierarchy":
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
@@ -993,6 +1101,7 @@ def config_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
             f"**{panel_setting('farm_panel_title', 'Registro de farm')[:90]}**\n"
             f"Publicação: {channel_label('farm_panel_channel_id')}\n"
             f"Análise: {channel_label('farm_approval_channel_id')}\n"
+            f"Registros finais: {channel_label('farm_log_channel_id', str(FARM_LOG_CHANNEL_ID))}\n"
             f"Quem decide: {role_label(int(panel_setting('farm_approver_role_id', str(LEADER_ROLE_ID)) or 0))}\n"
             f"Aprovação: **{'Manual' if farm_approval else 'Automática'}**"
         ),
@@ -1075,6 +1184,7 @@ class ConfigFarmChannelsView(View):
         self.add_item(ConfigTextChannelSelect("farm_panel_channel_id", "Canal onde o painel Farm será publicado", row=0))
         self.add_item(ConfigTextChannelSelect("farm_approval_channel_id", "Canal que receberá comprovantes para aprovação", row=1))
         self.add_item(ConfigSingleRoleSelect("farm_approver_role_id", "Cargo autorizado a aprovar ou recusar o Farm", row=2))
+        self.add_item(ConfigTextChannelSelect("farm_log_channel_id", "Canal que receberá os registros finais de farm", row=3))
 
 
 class ConfigSingleRoleSelect(discord.ui.RoleSelect):
@@ -1357,7 +1467,7 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         super().__init__(timeout=300)
         _set_modal_defaults(self, [
             (self.title_input, panel_setting("farm_panel_title", f"🌾 REGISTRO DE FARM — {FACTION_NAME}")),
-            (self.description_input, panel_setting("farm_panel_description", "Deposite no baú, clique em iniciar registro e envie o comprovante na DM do bot.")),
+            (self.description_input, panel_setting("farm_panel_description", "Clique em REGISTRAR FARM, selecione o item, informe a quantidade e envie a imagem de prova neste canal. Nome e ID são identificados automaticamente pela WL.")),
             (self.photo_url, panel_setting("farm_panel_photo_url", "")),
             (self.banner_url, panel_setting("farm_panel_banner_url", "")),
             (self.require_approval, "sim" if panel_setting("farm_require_approval", "false").lower() in {"1", "true", "yes", "sim"} else "não"),
@@ -1487,8 +1597,26 @@ class FarmProofReviewView(View):
             cur = con.execute("UPDATE farm_proofs SET status='APPROVED',reviewed_by=?,reviewed_at=?,review_reason='' WHERE id=? AND status='PENDING'", (str(interaction.user.id), now_iso(), proof_id))
             if not cur.rowcount:
                 await interaction.response.send_message("Esse comprovante já foi analisado.", ephemeral=True); return
-        log_action(interaction.user.id, "FARM_COMPROVANTE_APROVADO", int(row["discord_id"]), "", f"Comprovante #{proof_id}")
+            con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)",
+                (str(row["discord_id"]), row["item_name"], int(row["quantity"] or 0), int(row["points"] or 0), now_iso()))
+        log_action(interaction.user.id, "FARM_COMPROVANTE_APROVADO", int(row["discord_id"]), "", f"Comprovante #{proof_id}; {row['item_name']} x{row['quantity']}")
         await update_farm_review_message(row, status="APPROVED", reviewer=interaction.user.mention)
+        guild = interaction.guild
+        log_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
+        log_channel = guild.get_channel(log_channel_id) if guild and log_channel_id else None
+        if isinstance(log_channel, discord.TextChannel):
+            approved_embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+            approved_embed.add_field(name="Jogador", value=row["character_name"], inline=True)
+            approved_embed.add_field(name="ID", value=row["game_id"], inline=True)
+            approved_embed.add_field(name="Farm", value=row["item_name"] or "Não informado", inline=True)
+            approved_embed.add_field(name="Quantidade", value=str(row["quantity"] or 0), inline=True)
+            approved_embed.add_field(name="Pontos", value=str(row["points"] or 0), inline=True)
+            approved_embed.add_field(name="Discord", value=f"<@{row['discord_id']}> (`{row['discord_id']}`)", inline=False)
+            approved_embed.add_field(name="Aprovado por", value=interaction.user.mention, inline=True)
+            import io
+            safe_log_filename = os.path.basename(row["image_filename"] or f"farm-{proof_id}.png").replace("\n", "_")[:100]
+            approved_embed.set_image(url=f"attachment://{safe_log_filename}")
+            await log_channel.send(embed=approved_embed, file=discord.File(io.BytesIO(row["image_data"]), filename=safe_log_filename))
         try:
             user = await bot.fetch_user(int(row["discord_id"]))
             await user.send(f"✅ Seu comprovante de farm **#{proof_id}** foi aprovado pela liderança.")
@@ -1865,10 +1993,9 @@ async def on_member_join(member: discord.Member) -> None:
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
-    if isinstance(message.channel, discord.DMChannel):
-        handled = await store_farm_proof(message)
-        if handled:
-            return
+    handled = await store_farm_proof(message)
+    if handled:
+        return
     await bot.process_commands(message)
 
 @bot.event
@@ -2005,35 +2132,11 @@ async def farm_item_desativar(interaction: discord.Interaction, nome: str) -> No
     log_action(interaction.user.id, "FARM_ITEM_DESATIVADO", None, "", nome)
     await interaction.response.send_message(f"Item **{nome}** desativado.", ephemeral=True)
 
-@bot.tree.command(name="farm", description="Registra a quantidade farmada de um item")
-@app_commands.describe(item="Nome exato do item cadastrado", quantidade="Quantidade farmada")
-async def farm(interaction: discord.Interaction, item: str, quantidade: app_commands.Range[int, 1, 100000]) -> None:
-    if not is_active_member(interaction.user.id):
-        await interaction.response.send_message("Somente membros com cadastro aprovado podem registrar farm.", ephemeral=True); return
-    with db() as con:
-        farm_item_row = con.execute("SELECT * FROM farm_items WHERE name=? COLLATE NOCASE AND active=1", (item.strip(),)).fetchone()
-        if not farm_item_row:
-            available = con.execute("SELECT name FROM farm_items WHERE active=1 ORDER BY name").fetchall()
-            names = ", ".join(r["name"] for r in available) or "nenhum item configurado"
-            await interaction.response.send_message(f"Item não encontrado. Itens ativos: {names}", ephemeral=True); return
-        day_prefix = local_day_prefix()
-        daily = con.execute("SELECT COUNT(*) AS n FROM farm_entries WHERE discord_id=? AND substr(created_at,1,10)=?", (str(interaction.user.id), day_prefix)).fetchone()["n"]
-        last = con.execute("SELECT created_at FROM farm_entries WHERE discord_id=? ORDER BY id DESC LIMIT 1", (str(interaction.user.id),)).fetchone()
-        if daily >= MAX_FARM_ENTRIES_PER_DAY:
-            await interaction.response.send_message(f"Você atingiu o limite de {MAX_FARM_ENTRIES_PER_DAY} registros de farm hoje.", ephemeral=True); return
-        if last and FARM_COOLDOWN_SECONDS:
-            try:
-                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last["created_at"])).total_seconds()
-                if elapsed < FARM_COOLDOWN_SECONDS:
-                    await interaction.response.send_message(f"Aguarde {int(FARM_COOLDOWN_SECONDS-elapsed)+1}s antes de registrar outro farm.", ephemeral=True); return
-            except ValueError:
-                pass
-        points = quantidade * int(farm_item_row["points"])
-        con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)", (str(interaction.user.id), farm_item_row["name"], quantidade, points, now_iso()))
-    log_action(interaction.user.id, "FARM_REGISTRADO", interaction.user.id, "", f"{quantidade}x {farm_item_row['name']} = {points} pontos")
-    await interaction.response.send_message(f"🌾 Farm registrado: **{quantidade}x {farm_item_row['name']}** · **{points} pontos**.", ephemeral=True)
-    if interaction.guild:
-        await send_channel_log(interaction.guild, "🌾 Farm registrado", f"Membro: {interaction.user.mention}\nItem: **{farm_item_row['name']}**\nQuantidade: **{quantidade}**\nPontos: **{points}**", public=False, color=discord.Color.green())
+@bot.tree.command(name="farm", description="Informa como registrar farm pelo painel com comprovante")
+async def farm(interaction: discord.Interaction) -> None:
+    await interaction.response.send_message(
+        "Para manter a auditoria, o registro agora deve ser feito pelo **painel de Farm**: clique em **REGISTRAR FARM**, selecione o item, informe a quantidade e envie a imagem de prova no canal. Registros sem comprovante não são contabilizados.",
+        ephemeral=True)
 
 @bot.tree.command(name="farm-comprovante", description="Consulta um comprovante de farm salvo no banco")
 @app_commands.describe(registro="Número do registro de comprovante")
@@ -2045,7 +2148,7 @@ async def farm_comprovante(interaction: discord.Interaction, registro: app_comma
         await interaction.response.send_message("Não encontrei esse comprovante.", ephemeral=True); return
     import io
     file = discord.File(io.BytesIO(row["image_data"]), filename=row["image_filename"] or f"comprovante-{registro}.png")
-    embed = discord.Embed(title=f"🌾 Comprovante de farm #{registro}", description=f"Membro: <@{row['discord_id']}>\nNome RP: **{row['character_name']}**\nID FiveM: **{row['game_id']}**\nStatus: **{row['status']}**\nData: {row['created_at']}", color=discord.Color.green() if row['status'] == 'APPROVED' else discord.Color.gold())
+    embed = discord.Embed(title=f"🌾 Comprovante de farm #{registro}", description=f"Membro: <@{row['discord_id']}>\nNome RP: **{row['character_name']}**\nID FiveM: **{row['game_id']}**\nFarm: **{row['item_name'] or 'Não informado'}**\nQuantidade: **{row['quantity'] or 0}**\nPontos: **{row['points'] or 0}**\nStatus: **{row['status']}**\nData: {row['created_at']}", color=discord.Color.green() if row['status'] == 'APPROVED' else discord.Color.gold())
     await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
 
 @bot.tree.command(name="farm-resumo", description="Mostra o resumo de farm do ciclo atual")
