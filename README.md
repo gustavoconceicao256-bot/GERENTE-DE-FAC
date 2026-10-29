@@ -170,3 +170,15 @@ O workflow em `.github/workflows/python.yml` verifica a sintaxe do código em ca
 ## Licença
 
 Nenhuma licença foi definida neste pacote. Escolha e adicione uma licença antes de permitir que outras pessoas reutilizem ou distribuam o código.
+
+
+### Painel de configuração atualizado
+
+- O botão **Logs** foi removido do `/config`.
+- A configuração da hierarquia lista todos os cargos do servidor em páginas de até 25 opções, respeitando o limite dos menus do Discord.
+- Os cargos da hierarquia e o painel publicado ficam ordenados do cargo mais baixo ao mais alto.
+- Os botões estão separados entre configuração e publicação para facilitar a navegação.
+
+## Hierarquia por ordem manual
+
+No `/config` → `Hierarquia`, informe a quantidade de cargos (1 a 50) e selecione cada cargo individualmente em ordem crescente, do mais baixo ao mais alto. Confirme cada posição e depois a lista completa. Ao clicar em `Publicar hierarquia`, selecione o canal e confirme. Cada membro aparece apenas na seção do maior cargo configurado que possui.

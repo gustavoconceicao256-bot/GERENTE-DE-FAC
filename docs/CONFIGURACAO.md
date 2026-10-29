@@ -36,3 +36,12 @@ Depois de configurar os módulos, use os botões **Publicar WL**, **Publicar hie
 - `DISCORD_GUILD_ID`: ID do servidor principal.
 - Ative as intents Server Members e Message Content no Developer Portal.
 - O SQLite é um arquivo local. Em ambiente com disco efêmero, configure disco persistente para não perder configurações e comprovantes entre recriações.
+
+
+## Seleção de hierarquia
+
+O seletor de hierarquia é paginado em grupos de até 25 cargos, pois esse é o limite por menu do Discord. Use **Próxima** e **Anterior** para percorrer todos os cargos do servidor; as seleções ficam guardadas entre páginas. A publicação é exibida do cargo de menor posição para o de maior posição no Discord. O botão **Logs** foi removido do painel `/config`.
+
+### Assistente sequencial da hierarquia
+
+Informe a quantidade de cargos (1–50), escolha um cargo para cada posição começando pelo mais baixo e confirme cada escolha. Ao terminar, revise e salve a ordem. Para publicar, escolha um canal no seletor do botão `Publicar hierarquia`. Um membro aparece somente sob o cargo de maior prioridade configurada que possui.
