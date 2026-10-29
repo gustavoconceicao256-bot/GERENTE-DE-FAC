@@ -2,18 +2,31 @@
 
 ## Painel `/config`
 
-O comando abre um painel privado para liderança ou administradores. Cada botão abre um formulário e grava as mudanças no banco SQLite. Use números de IDs de canal/cargo copiados com o Modo Desenvolvedor do Discord.
+O comando abre um painel privado para liderança ou administradores. Os módulos disponíveis no painel são **WL**, **Hierarquia**, **Farm**, **Selecionar cargos** e **Logs**. As alterações são salvas no SQLite.
 
-### Módulos
+### WL
 
-- **WL:** título, descrição, canal para publicar o painel de candidatura e canal para receber os pedidos de WL. O recrutador escolhido continua sendo o único que pode decidir a solicitação.
-- **Hierarquia:** título, descrição, canal de publicação e lista de cargos exibidos. O formato para cada item é `ID_CARGO=SIGLA=PRIORIDADE; ID_CARGO=SIGLA=PRIORIDADE`. Prioridade maior aparece primeiro e define a sigla usada no nickname.
-- **Farm:** título, texto de instruções, canal de publicação, canal para revisar comprovantes e aprovação automática ou obrigatória. Se obrigatória, a liderança aprova ou recusa; recusar exige motivo.
-- **Painel principal, membros e liderança:** cada um tem seu próprio título, descrição e canal de publicação.
-- **Cargos principais:** cargos de membro, recrutador, liderança, ADV1 e ADV2. O ADV3 fica nas regras de farm/ADV3.
-- **Logs e punições:** canais separados para logs administrativos/públicos/farm e, opcionalmente, ADV/PD/blacklist. Se um destino específico de ADV/PD/blacklist for `0`, o bot usa o canal de logs administrativos.
+No botão **WL**, configure título e descrição, além de foto/miniatura e banner usando URLs públicas HTTPS. Depois do formulário, escolha nos menus do Discord o canal onde o painel será publicado e o canal que recebe as solicitações. O recrutador escolhido continua sendo o único que pode decidir a solicitação, com prazo de 5 minutos.
 
-Depois de preencher e salvar cada formulário, reabra `/config` para revisar o resumo. Use os botões **Publicar ...** para enviar os painéis aos canais definidos. A configuração de canal deve ser um ID numérico; o bot deve ter acesso ao canal de destino.
+### Hierarquia
+
+Configure título e descrição. Em seguida, selecione o canal de publicação no menu de canais e selecione os cargos que devem aparecer na hierarquia usando o seletor nativo de cargos. Ao salvar, o bot gera uma sigla a partir do nome de cada cargo e usa a posição do cargo no Discord como prioridade; cargos mais altos aparecem primeiro e a sigla é usada para calcular o nickname.
+
+### Farm
+
+Configure título e texto de instruções, foto/miniatura, banner e se o comprovante exige aprovação. Depois escolha o canal onde o painel será publicado e o canal onde a liderança receberá os comprovantes para análise. Se a aprovação for obrigatória, a liderança pode aprovar ou recusar; a recusa exige motivo.
+
+### Selecionar cargos
+
+Use os menus do Discord para selecionar o cargo padrão de membro, o cargo autorizado a recrutar WL e o cargo de liderança. Não é necessário digitar ou copiar IDs de cargos.
+
+### Logs
+
+Os canais de logs administrativos, públicos e de farm permanecem disponíveis no botão **Logs**. Esses campos ainda aceitam IDs numéricos de canais.
+
+## Publicar os painéis
+
+Depois de configurar os módulos, use os botões **Publicar WL**, **Publicar hierarquia** ou **Publicar Farm** no painel `/config`. O bot precisa ter permissão para ver e enviar mensagens nos canais escolhidos. Para foto e banner, use links públicos HTTPS que apontem diretamente para imagens; deixe os campos vazios para remover as imagens.
 
 ## Render
 

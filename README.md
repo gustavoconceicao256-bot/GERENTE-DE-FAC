@@ -14,9 +14,10 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Painel de comprovantes de farm; imagens são armazenadas no banco SQLite como dados binários.
 - Comando para recuperar um comprovante salvo.
 - Migrações aditivas para bancos existentes.
-- Painel `/config` com configurações separadas para WL, hierarquia, farm, painel principal, membros, liderança, cargos, logs e canais de ADV/PD/blacklist.
-- Título, descrição e canal de publicação configuráveis para cada painel; destino informado pelo ID do canal.
-- Painel de hierarquia com lista explícita de cargos exibidos e prioridade para ordenar patentes.
+- Painel `/config` simplificado para WL, hierarquia, farm, seleção de cargos e logs.
+- Cargos de membro, recrutador e liderança escolhidos em menus nativos do Discord, sem digitar IDs de cargos.
+- WL e farm com título, descrição, canal de publicação escolhido em lista, foto/miniatura e banner por URL HTTPS.
+- Hierarquia com seleção nativa dos cargos exibidos e organização automática pela posição do cargo no Discord.
 - Aprovação opcional dos comprovantes de farm; quando ativada, a liderança aprova ou recusa no canal definido, com motivo obrigatório para recusa.
 
 ## Requisitos
@@ -96,7 +97,7 @@ As variáveis iniciais estão documentadas em [`.env.example`](.env.example). En
 
 ### Painel `/config`
 
-Use `/config` no servidor. É necessário ter o cargo de liderança configurado ou a permissão de administrador. O painel é privado e tem áreas para configurar cada módulo e publicar os painéis nos canais escolhidos.
+Use `/config` no servidor. É necessário ter o cargo de liderança configurado ou a permissão de administrador. O painel é privado e tem áreas para configurar WL, hierarquia, farm, selecionar cargos e logs. Para WL, farm e hierarquia, escolha os canais nos menus do Discord. Foto e banner são configurados por links públicos HTTPS.
 
 - **WL:** título, descrição, canal em que o painel público será publicado e canal que recebe as solicitações para decisão do recrutador.
 - **Hierarquia:** título, descrição, canal de publicação e quais cargos aparecem na lista. Cada cargo usa o formato `ID_CARGO=SIGLA=PRIORIDADE`, separado por ponto e vírgula.
