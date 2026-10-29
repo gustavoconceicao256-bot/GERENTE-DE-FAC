@@ -1,0 +1,12 @@
+CORREÇÃO DO IndentationError NO RENDER
+
+O bot.py desta pasta começa com o cabeçalho completo do bot. A linha
+'current_role = guild.get_role(...)' deve aparecer dentro da função add_warning,
+não na linha 1 do arquivo.
+
+No GitHub, substitua o arquivo bot.py inteiro pelo bot.py deste pacote e faça
+Commit changes na branch main. Confira depois que a linha 1 no GitHub é o texto
+inicial/documentação do bot, e não uma linha de dentro de uma função.
+
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py

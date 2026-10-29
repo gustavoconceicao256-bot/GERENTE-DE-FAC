@@ -17,7 +17,7 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Painel `/config` simplificado para WL, hierarquia, farm, seleção de cargos e logs.
 - Cargos de membro, recrutador e liderança escolhidos em menus nativos do Discord, sem digitar IDs de cargos.
 - WL e farm com título, descrição, canal de publicação escolhido em lista, foto/miniatura e banner por URL HTTPS.
-- Hierarquia com seleção nativa dos cargos exibidos e organização automática pela posição do cargo no Discord.
+- Hierarquia configurada por etapas: cada página mostra até 25 cargos diferentes; é possível navegar por todas as páginas do servidor e confirmar um cargo por posição, do mais baixo ao mais alto.
 - Aprovação opcional dos comprovantes de farm; quando ativada, a liderança aprova ou recusa no canal definido, com motivo obrigatório para recusa.
 
 ## Requisitos
@@ -100,7 +100,7 @@ As variáveis iniciais estão documentadas em [`.env.example`](.env.example). En
 Use `/config` no servidor. É necessário ter o cargo de liderança configurado ou a permissão de administrador. O painel é privado e tem áreas para configurar WL, hierarquia, farm, selecionar cargos e logs. Para WL, farm e hierarquia, escolha os canais nos menus do Discord. Foto e banner são configurados por links públicos HTTPS.
 
 - **WL:** título, descrição, canal em que o painel público será publicado e canal que recebe as solicitações para decisão do recrutador.
-- **Hierarquia:** título, descrição, canal de publicação e quais cargos aparecem na lista. Cada cargo usa o formato `ID_CARGO=SIGLA=PRIORIDADE`, separado por ponto e vírgula.
+- **Hierarquia:** título, descrição, quantidade de cargos, seleção passo a passo em ordem crescente e canal de publicação. O menu mostra até 25 cargos por página e os botões de navegação percorrem os demais grupos até alcançar todos os cargos do servidor.
 - **Farm:** título, instruções, canal para publicar o painel, canal de revisão de comprovantes e escolha entre aprovação obrigatória ou automática.
 - **Painel principal, membros e liderança:** título, descrição e canal de publicação separados para cada painel.
 - **Cargos e regras:** cargo de membro, recrutador, liderança, ADV1/ADV2/ADV3, cooldown, limite diário, fuso e opção de PD automático na ADV3.
@@ -111,7 +111,7 @@ Nos campos de canal/cargo, informe o ID numérico do Discord; use `0` quando a t
 
 ### Patentes e apelidos
 
-No botão **Hierarquia**, informe as entradas no formato `ID_CARGO=SIGLA=PRIORIDADE`, separadas por ponto e vírgula. Exemplo ilustrativo: `123456789012345678=M=10; 234567890123456789=DIR=20`. Uma prioridade numérica maior representa uma patente mais alta e define qual sigla será usada no nickname.
+No botão **Hierarquia**, informe a quantidade de patentes e selecione cada cargo em uma etapa própria. Cada etapa mostra um grupo diferente de até 25 cargos; use **Anterior** e **Próxima** para procurar a lista completa. Confirme cada cargo para avançar; a lista final permite revisar a ordem antes de salvar. A primeira posição é a patente mais baixa e a última é a mais alta. A prioridade salva pelo sistema acompanha essa ordem.
 
 > Os IDs devem ser números reais do seu servidor. O bot precisa ter permissões para ver canais, enviar mensagens, anexar arquivos, gerenciar apelidos e cargos; o cargo do bot deve ficar acima dos cargos que ele gerencia.
 
@@ -175,7 +175,7 @@ Nenhuma licença foi definida neste pacote. Escolha e adicione uma licença ante
 ### Painel de configuração atualizado
 
 - O botão **Logs** foi removido do `/config`.
-- A configuração da hierarquia lista todos os cargos do servidor em páginas de até 25 opções, respeitando o limite dos menus do Discord.
+- A configuração sequencial da hierarquia usa páginas de até 25 opções diferentes por vez; o navegador permite avançar por todos os cargos do servidor, respeitando o limite dos menus do Discord.
 - Os cargos da hierarquia e o painel publicado ficam ordenados do cargo mais baixo ao mais alto.
 - Os botões estão separados entre configuração e publicação para facilitar a navegação.
 
