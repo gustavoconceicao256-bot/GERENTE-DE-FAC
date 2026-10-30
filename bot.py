@@ -1162,11 +1162,58 @@ class ConfigTextChannelSelect(discord.ui.ChannelSelect):
         await interaction.response.send_message(f"✅ Canal salvo: {channel.mention}", ephemeral=True)
 
 
+class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
+    setting_key = TextInput(label="Chave da configuração", max_length=80, required=True, placeholder="Ex.: farm_log_channel_id")
+    object_id = TextInput(label="ID do cargo ou canal", max_length=25, required=True, placeholder="Cole o ID numérico")
+
+    def __init__(self, preset_key: str = ""):
+        super().__init__(timeout=300)
+        self.setting_key.default = preset_key[:80] if preset_key else None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        key = self.setting_key.value.strip()
+        raw = self.object_id.value.strip()
+        allowed = {
+            "wl_panel_channel_id", "wl_channel_id", "farm_panel_channel_id",
+            "farm_approval_channel_id", "farm_log_channel_id", "hierarchy_panel_channel_id",
+            "wl_pending_role_id", "member_role_id", "wl_approver_role_id", "recruit_role_id",
+            "farm_approver_role_id", "leader_role_id", "adv1_role_id", "adv2_role_id", "adv3_role_id",
+        }
+        if key not in allowed or not raw.isdigit():
+            await interaction.response.send_message("Chave inválida ou ID não numérico. Confira a chave e cole somente o ID.", ephemeral=True)
+            return
+        object_id = int(raw)
+        if key.endswith("channel_id"):
+            obj = interaction.guild.get_channel(object_id) if interaction.guild else None
+            if obj is None or not isinstance(obj, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
+                await interaction.response.send_message("Esse ID não corresponde a um canal de texto válido deste servidor.", ephemeral=True)
+                return
+            label = f"canal {obj.mention}"
+        else:
+            obj = interaction.guild.get_role(object_id) if interaction.guild else None
+            if obj is None:
+                await interaction.response.send_message("Esse ID não corresponde a um cargo deste servidor.", ephemeral=True)
+                return
+            label = f"cargo {obj.mention}"
+        save_config_value(key, str(object_id))
+        await interaction.response.send_message(f"✅ Configuração **{key}** salva usando {label}.", ephemeral=True)
+
+
+class ConfigManualIdButton(discord.ui.Button):
+    def __init__(self, *, row: int = 4, preset_key: str = ""):
+        super().__init__(label="Informar ID manualmente", style=discord.ButtonStyle.secondary, emoji="🔢", row=row)
+        self.preset_key = preset_key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ConfigManualIdModal(self.preset_key))
+
+
 class ConfigWLChannelsView(View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigTextChannelSelect("wl_panel_channel_id", "Canal onde o painel WL será publicado", row=0))
         self.add_item(ConfigTextChannelSelect("wl_channel_id", "Canal que receberá os pedidos de WL", row=1))
+        self.add_item(ConfigManualIdButton(preset_key="wl_panel_channel_id"))
 
 
 class ConfigWLRoleView(View):
@@ -1176,6 +1223,7 @@ class ConfigWLRoleView(View):
         self.add_item(ConfigSingleRoleSelect("member_role_id", "Cargo adicionado quando a WL for aprovada", row=1))
         self.add_item(ConfigSingleRoleSelect("wl_approver_role_id", "Cargo autorizado a aprovar ou recusar WL", row=2))
         self.add_item(ConfigSingleRoleSelect("recruit_role_id", "Cargo cujos membros aparecem como recrutadores", row=3))
+        self.add_item(ConfigManualIdButton(preset_key="member_role_id"))
 
 
 class ConfigFarmChannelsView(View):
@@ -1185,6 +1233,7 @@ class ConfigFarmChannelsView(View):
         self.add_item(ConfigTextChannelSelect("farm_approval_channel_id", "Canal que receberá comprovantes para aprovação", row=1))
         self.add_item(ConfigSingleRoleSelect("farm_approver_role_id", "Cargo autorizado a aprovar ou recusar o Farm", row=2))
         self.add_item(ConfigTextChannelSelect("farm_log_channel_id", "Canal que receberá os registros finais de farm", row=3))
+        self.add_item(ConfigManualIdButton(preset_key="farm_log_channel_id"))
 
 
 class ConfigSingleRoleSelect(discord.ui.RoleSelect):
@@ -1205,6 +1254,7 @@ class ConfigRolesSelectView(View):
         self.add_item(ConfigSingleRoleSelect("member_role_id", "Selecionar cargo padrão dos membros", row=0))
         self.add_item(ConfigSingleRoleSelect("recruit_role_id", "Selecionar cargo autorizado a recrutar WL", row=1))
         self.add_item(ConfigSingleRoleSelect("leader_role_id", "Selecionar cargo de liderança", row=2))
+        self.add_item(ConfigManualIdButton(preset_key="leader_role_id"))
 
 
 HIERARCHY_ROLES_PER_PAGE = 25
@@ -1264,6 +1314,47 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
                         self.parent_view.selected_role_ids.append(rid)
                 except ValueError:
                     pass
+        self.parent_view._refresh_remove_selector()
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+
+class ConfigHierarchyAddRoleModal(Modal, title="Adicionar cargo por ID"):
+    role_id_input = TextInput(label="ID do cargo", max_length=25, required=True, placeholder="Cole o ID do cargo")
+    def __init__(self, parent_view):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.role_id_input.value.strip()
+        role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
+        if role is None or role == self.parent_view.guild.default_role:
+            await interaction.response.send_message("ID inválido: não encontrei esse cargo neste servidor.", ephemeral=True)
+            return
+        if role.id not in self.parent_view.selected_role_ids:
+            self.parent_view.selected_role_ids.append(role.id)
+        self.parent_view._refresh_role_page()
+        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+
+class ConfigHierarchyAddRoleButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Adicionar cargo por ID", style=discord.ButtonStyle.secondary, emoji="🔢", row=4)
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ConfigHierarchyAddRoleModal(self.view))
+
+class ConfigHierarchyRemoveSelect(discord.ui.Select):
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        roles = [parent_view.guild.get_role(rid) for rid in parent_view.selected_role_ids]
+        roles = [r for r in roles if r]
+        options = [discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles[:25]]
+        if not options:
+            options = [discord.SelectOption(label="Nenhum cargo selecionado", value="none")]
+        super().__init__(placeholder="❌ Remover cargo selecionado", min_values=0, max_values=1, options=options, row=2)
+    async def callback(self, interaction: discord.Interaction) -> None:
+        raw = self.values[0] if self.values else "none"
+        if raw != "none":
+            rid = int(raw)
+            self.parent_view.selected_role_ids = [x for x in self.parent_view.selected_role_ids if x != rid]
+        self.parent_view._refresh_remove_selector()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
 
 
@@ -1295,6 +1386,9 @@ class ConfigHierarchySetupView(View):
         ]
         self.role_selector = ConfigHierarchyRolePageSelect(self)
         self.add_item(self.role_selector)
+        self.remove_selector = ConfigHierarchyRemoveSelect(self)
+        self.add_item(self.remove_selector)
+        self.add_item(ConfigHierarchyAddRoleButton())
         self._update_pager_buttons()
 
     @property
@@ -1309,7 +1403,14 @@ class ConfigHierarchySetupView(View):
         self.remove_item(self.role_selector)
         self.role_selector = ConfigHierarchyRolePageSelect(self)
         self.add_item(self.role_selector)
+        self._refresh_remove_selector()
         self._update_pager_buttons()
+
+    def _refresh_remove_selector(self) -> None:
+        if hasattr(self, "remove_selector"):
+            self.remove_item(self.remove_selector)
+        self.remove_selector = ConfigHierarchyRemoveSelect(self)
+        self.add_item(self.remove_selector)
 
     def build_embed(self, *, saved: bool = False) -> discord.Embed:
         selected_roles = [self.guild.get_role(rid) for rid in self.selected_role_ids]
@@ -1328,16 +1429,14 @@ class ConfigHierarchySetupView(View):
         embed = discord.Embed(
             title="🏛️ Configurar hierarquia",
             description=(
-                "Marque **vários cargos de uma só vez** no menu de cada página. "
-                "Use ◀/▶ para percorrer toda a lista: cada página contém até 25 cargos diferentes.\n\n"
-                "**A ordem define a hierarquia:** o primeiro cargo da lista fica na base (mais baixo); "
-                "os próximos ficam acima. O canal será solicitado somente ao publicar."
+                "Selecione os cargos no menu. Não existe limite de quantidade pré-definida. "
+                "Use o menu **Remover cargo** para retirar uma seleção incorreta; o botão Reiniciar limpa tudo.\n\n"
+                "A ordem de seleção define a hierarquia: primeiro = base; último = topo."
             ),
             color=discord.Color.from_rgb(76, 86, 180),
         )
         embed.add_field(name="📄 Página de cargos", value=f"**{self.page_index + 1}/{self.total_pages}** · {len(self.roles)} cargo(s) disponíveis", inline=True)
-        target_count = f"/{self.required_count}" if self.required_count is not None else ""
-        embed.add_field(name="✅ Selecionados", value=f"**{len(selected_roles)}{target_count} cargo(s)**", inline=True)
+        embed.add_field(name="✅ Selecionados", value=f"**{len(selected_roles)} cargo(s)**", inline=True)
         embed.add_field(name="📋 Hierarquia (topo → base)", value=selected_text[:1024], inline=False)
         if saved:
             embed.set_footer(text="Configuração salva • nº 1 é o cargo mais baixo; último é o mais alto")
@@ -1345,30 +1444,32 @@ class ConfigHierarchySetupView(View):
             embed.set_footer(text="Selecione vários cargos por página • Navegue • Salve uma única vez")
         return embed
 
-    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=2)
+    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=3)
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.page_index > 0:
             self.page_index -= 1
         self._refresh_role_page()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Próxima ▶", style=discord.ButtonStyle.secondary, emoji="➡️", row=2)
+    @discord.ui.button(label="Próxima ▶", style=discord.ButtonStyle.secondary, emoji="➡️", row=3)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.page_index < self.total_pages - 1:
             self.page_index += 1
         self._refresh_role_page()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Salvar hierarquia", style=discord.ButtonStyle.success, emoji="💾", row=3)
+    @discord.ui.button(label="Reiniciar configuração", style=discord.ButtonStyle.danger, emoji="🔄", row=4)
+    async def reset_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.selected_role_ids.clear()
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+        self._refresh_role_page()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Salvar hierarquia", style=discord.ButtonStyle.success, emoji="💾", row=4)
     async def save_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         selected_roles = [self.guild.get_role(rid) for rid in self.selected_role_ids]
         selected_roles = [role for role in selected_roles if role is not None]
-        if self.required_count is not None and len(selected_roles) != self.required_count:
-            await interaction.response.send_message(
-                f"Você informou **{self.required_count} cargo(s)**, mas selecionou **{len(selected_roles)}**. "
-                f"Selecione exatamente {self.required_count} cargos para salvar.", ephemeral=True,
-            )
-            return
         if not selected_roles:
             await interaction.response.send_message("Selecione pelo menos um cargo antes de salvar.", ephemeral=True)
             return
@@ -1425,32 +1526,24 @@ class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
         )
 
 
-class ConfigHierarchyModal(Modal, title="Configurar hierarquia"):
+class ConfigHierarchyModal(Modal, title="Aparência da hierarquia"):
     title_input = TextInput(label="Título da hierarquia", max_length=256, required=True)
-    description_input = TextInput(label="Descrição da hierarquia", style=discord.TextStyle.paragraph, max_length=2000, required=True)
-    count_input = TextInput(label="Quantos cargos terá? (1 a 50)", max_length=2, required=True, placeholder="Ex.: 8")
+    description_input = TextInput(label="Descrição da hierarquia", style=discord.TextStyle.paragraph, max_length=1500, required=True)
 
     def __init__(self):
         super().__init__(timeout=300)
-        existing_count = len([x for x in existing_rank_config().split(';') if x.strip()])
         _set_modal_defaults(self, [
             (self.title_input, panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")),
             (self.description_input, panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais baixo ao mais alto.")),
-            (self.count_input, str(min(50, max(1, existing_count or 5)))),
         ])
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message("Use este formulário dentro do servidor.", ephemeral=True)
             return
-        raw_count = self.count_input.value.strip()
-        if not raw_count.isdigit() or not 1 <= int(raw_count) <= 50:
-            await interaction.response.send_message("Informe uma quantidade entre 1 e 50 cargos.", ephemeral=True)
-            return
-        count = int(raw_count)
         save_config_value("hierarchy_panel_title", self.title_input.value.strip() or f"HIERARQUIA — {FACTION_NAME}")
         save_config_value("hierarchy_panel_description", self.description_input.value.strip())
-        setup_view = ConfigHierarchySetupView(interaction.guild, required_count=count)
+        setup_view = ConfigHierarchySetupView(interaction.guild)
         await interaction.response.send_message(embed=setup_view.build_embed(), view=setup_view, ephemeral=True)
 
 
@@ -1655,6 +1748,7 @@ class HierarchyPublishChannelView(View):
         self.guild = guild
         self.channel_id: Optional[int] = None
         self.add_item(HierarchyPublishChannelSelect(self))
+        self.add_item(ConfigManualIdButton(preset_key="hierarchy_panel_channel_id", row=2))
         self.publish_now.disabled = True
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1679,7 +1773,10 @@ class HierarchyPublishChannelView(View):
     @discord.ui.button(label="Publicar neste canal", style=discord.ButtonStyle.success, emoji="🚀", row=1)
     async def publish_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not self.channel_id:
-            await interaction.response.send_message("Selecione o canal primeiro.", ephemeral=True)
+            raw = setting("hierarchy_panel_channel_id", "0")
+            self.channel_id = int(raw) if raw.isdigit() and int(raw) else None
+        if not self.channel_id:
+            await interaction.response.send_message("Selecione o canal ou informe o ID manualmente.", ephemeral=True)
             return
         save_config_value("hierarchy_panel_channel_id", str(self.channel_id))
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1829,34 +1926,25 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                     members_by_highest_rank.get(role_id, []),
                     key=lambda m: m.display_name.casefold(),
                 )
-                header = f"**{panel_title[:250]}**\n{panel_description[:900]}\n\n"
-                member_lines = [f"• {m.mention}" for m in members]
-                if not member_lines:
-                    member_lines = ["Nenhum membro possui este como maior cargo configurado."]
-                # Discord embed descriptions have a hard 4096-character limit. Long rank lists
-                # continue in separate messages under the same rank title.
-                chunks = []
-                buf = []
-                size = len(header) + 50
+                member_lines = [m.mention for m in members] or ["Ninguém com esse cargo."]
+                chunks, buf, size = [], [], 0
                 for line in member_lines:
-                    if buf and size + len(line) + 1 > 3000:
+                    if buf and size + len(line) + 1 > 3500:
                         chunks.append(buf)
-                        buf = []
-                        size = 100
+                        buf, size = [], 0
                     buf.append(line)
                     size += len(line) + 1
                 if buf:
                     chunks.append(buf)
                 for chunk_index, chunk in enumerate(chunks, start=1):
                     suffix = f" · continuação {chunk_index}/{len(chunks)}" if len(chunks) > 1 else ""
-                    rank_title = f"🏛️ {priority}/{total_ranks} · {role.name}{suffix}"
+                    rank_title = f"📋 | {role.name.upper()} - [{len(members)}] membros{suffix}"
+                    body = f"# {role.mention}\n" + "\n".join(chunk)
+                    body += f"\n\n**Atualizado Automaticamente | Última alteração: {datetime.now().strftime('%d/%m/%Y, %H:%M')}**"
                     role_embed = discord.Embed(
-                        title=rank_title[:256],
-                        description=(header + f"**Cargo:** {role.mention}\n**Membros com este como maior cargo:** {len(members)}\n\n" + "\n".join(chunk))[:4096],
-                        color=discord.Color.from_rgb(76, 86, 180),
-                        timestamp=datetime.now(timezone.utc),
+                        title=rank_title[:256], description=body[:4096],
+                        color=discord.Color.from_rgb(76, 86, 180), timestamp=datetime.now(timezone.utc),
                     )
-                    role_embed.set_footer(text=f"FAC-GERAL • Hierarquia • nº 1 = menor cargo • nº {total_ranks} = maior cargo")
                     await target.send(embed=role_embed)
                     sent_messages += 1
             await reply(
