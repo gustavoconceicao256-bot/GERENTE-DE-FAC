@@ -17,9 +17,9 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Comando para recuperar um comprovante salvo.
 - Migrações aditivas para bancos existentes.
 - Painel `/config` simplificado para WL, hierarquia, farm, seleção de cargos e logs.
-- Cargos de membro, recrutador e liderança escolhidos em menus nativos do Discord, sem digitar IDs de cargos.
+- Cargos e canais configuráveis pelos menus do Discord, com alternativa de informar o ID manualmente quando necessário.
 - WL e farm com título, descrição, canal de publicação escolhido em lista, foto/miniatura e banner por URL HTTPS.
-- Hierarquia configurada em lote: selecione vários cargos por página (até 25 opções) e percorra todas as páginas; não precisa confirmar cargo por cargo. A ordem segue a posição real dos cargos no Discord: nº 1 é o menor cargo e o maior número é o mais alto.
+- Hierarquia configurável sem informar previamente a quantidade de cargos: percorra as páginas, adicione cargos, remova seleções incorretas, reinicie a seleção e salve a ordem escolhida.
 - Aprovação opcional dos comprovantes de farm; quando ativada, a liderança aprova ou recusa no canal definido, com motivo obrigatório para recusa.
 
 ## Requisitos
