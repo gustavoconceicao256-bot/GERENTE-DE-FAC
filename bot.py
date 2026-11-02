@@ -104,7 +104,8 @@ def init_db() -> None:
             name TEXT NOT NULL UNIQUE,
             points INTEGER NOT NULL DEFAULT 1,
             target INTEGER NOT NULL DEFAULT 0,
-            active INTEGER NOT NULL DEFAULT 1
+            active INTEGER NOT NULL DEFAULT 1,
+            unit_price_cents INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS farm_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +123,8 @@ def init_db() -> None:
             item_name TEXT DEFAULT '',
             quantity INTEGER DEFAULT 0,
             points INTEGER DEFAULT 0,
-            channel_id TEXT DEFAULT ''
+            channel_id TEXT DEFAULT '',
+            unit_price_cents INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS farm_proofs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,7 +144,20 @@ def init_db() -> None:
             review_message_id TEXT DEFAULT '',
             item_name TEXT DEFAULT '',
             quantity INTEGER DEFAULT 0,
-            points INTEGER DEFAULT 0
+            points INTEGER DEFAULT 0,
+            unit_price_cents INTEGER DEFAULT 0,
+            total_cents INTEGER DEFAULT 0,
+            paid_by TEXT DEFAULT '',
+            paid_at TEXT DEFAULT '',
+            receipt_data BLOB,
+            receipt_filename TEXT DEFAULT '',
+            receipt_mime TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS farm_receipt_pending (
+            reviewer_id TEXT PRIMARY KEY,
+            proof_id INTEGER NOT NULL,
+            channel_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,7 +214,12 @@ def init_db() -> None:
         for name, definition in pending_migrations.items():
             if name not in pending_columns:
                 con.execute(f"ALTER TABLE farm_proof_pending ADD COLUMN {name} {definition}")
-        for name, definition in {"item_name": "TEXT DEFAULT ''", "quantity": "INTEGER DEFAULT 0", "points": "INTEGER DEFAULT 0"}.items():
+        if "unit_price_cents" not in pending_columns:
+            con.execute("ALTER TABLE farm_proof_pending ADD COLUMN unit_price_cents INTEGER DEFAULT 0")
+        item_columns = {row[1] for row in con.execute("PRAGMA table_info(farm_items)").fetchall()}
+        if "unit_price_cents" not in item_columns:
+            con.execute("ALTER TABLE farm_items ADD COLUMN unit_price_cents INTEGER NOT NULL DEFAULT 0")
+        for name, definition in {"item_name": "TEXT DEFAULT ''", "quantity": "INTEGER DEFAULT 0", "points": "INTEGER DEFAULT 0", "unit_price_cents": "INTEGER DEFAULT 0", "total_cents": "INTEGER DEFAULT 0", "paid_by": "TEXT DEFAULT ''", "paid_at": "TEXT DEFAULT ''", "receipt_data": "BLOB", "receipt_filename": "TEXT DEFAULT ''", "receipt_mime": "TEXT DEFAULT ''"}.items():
             if name not in proof_columns:
                 con.execute(f"ALTER TABLE farm_proofs ADD COLUMN {name} {definition}")
 
@@ -784,12 +804,15 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
             return
         with db() as con:
             member = con.execute("SELECT discord_id, character_name, game_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
-            item = con.execute("SELECT name, points FROM farm_items WHERE id=? AND active=1", (self.item_id,)).fetchone()
+            item = con.execute("SELECT name, points, unit_price_cents FROM farm_items WHERE id=? AND active=1", (self.item_id,)).fetchone()
             if not member:
                 await interaction.response.send_message("Não encontrei seu cadastro ativo da WL. Procure a liderança.", ephemeral=True)
                 return
             if not item:
                 await interaction.response.send_message("Esse item de farm foi desativado. Inicie um novo registro.", ephemeral=True)
+                return
+            if int(item["unit_price_cents"] or 0) <= 0:
+                await interaction.response.send_message("A liderança ainda não definiu o valor por unidade desse item. Avise a liderança para configurar `/farm-preco`.", ephemeral=True)
                 return
             quantity = int(raw)
             day_prefix = local_day_prefix()
@@ -811,15 +834,15 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
                         return
                 except ValueError:
                     pass
-            con.execute("""INSERT INTO farm_proof_pending(discord_id,character_name,game_id,created_at,item_name,quantity,points,channel_id)
-                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(discord_id) DO UPDATE SET
+            con.execute("""INSERT INTO farm_proof_pending(discord_id,character_name,game_id,created_at,item_name,quantity,points,channel_id,unit_price_cents)
+                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(discord_id) DO UPDATE SET
                 character_name=excluded.character_name, game_id=excluded.game_id, created_at=excluded.created_at,
-                item_name=excluded.item_name, quantity=excluded.quantity, points=excluded.points, channel_id=excluded.channel_id""",
+                item_name=excluded.item_name, quantity=excluded.quantity, points=excluded.points, channel_id=excluded.channel_id,
+                unit_price_cents=excluded.unit_price_cents""",
                 (str(interaction.user.id), member["character_name"], member["game_id"], now_iso(), item["name"], quantity,
-                 quantity * int(item["points"]), str(self.channel_id)))
+                 quantity * int(item["points"]), str(self.channel_id), int(item["unit_price_cents"] or 0)))
         await interaction.response.send_message(
-            f"🌾 **Farm selecionado:** {item['name']}\n**Quantidade:** {quantity}\n\n"
-            "Agora envie a **imagem de prova como anexo neste mesmo canal**. O bot já identificou seu nome e ID pela WL; não precisa informar novamente.",
+            (f"🌾 **Farm selecionado:** {item['name']}\n**Quantidade:** {quantity}\n" + (f"**Valor estimado:** R$ {(quantity * int(item['unit_price_cents'] or 0))/100:,.2f}\n\n" if int(item['unit_price_cents'] or 0) else "**Valor:** ainda não definido pela liderança\n\n") + "Agora envie a **imagem de prova como anexo neste mesmo canal**. O bot já identificou seu nome e ID pela WL; não precisa informar novamente."),
             ephemeral=True)
 
 
@@ -828,8 +851,8 @@ class FarmItemSelect(discord.ui.Select):
         self.requester_id = interaction.user.id
         self.channel_id = interaction.channel_id
         with db() as con:
-            items = con.execute("SELECT id,name,points FROM farm_items WHERE active=1 ORDER BY name LIMIT 25").fetchall()
-        options = [discord.SelectOption(label=row["name"][:100], value=str(row["id"]), description=f"{row['points']} ponto(s) por unidade"[:100]) for row in items]
+            items = con.execute("SELECT id,name,points,unit_price_cents FROM farm_items WHERE active=1 ORDER BY name LIMIT 25").fetchall()
+        options = [discord.SelectOption(label=row["name"][:100], value=str(row["id"]), description=(f"R$ {int(row['unit_price_cents'] or 0)/100:.2f} por unidade · {row['points']} pts" if int(row['unit_price_cents'] or 0) else f"{row['points']} ponto(s) por unidade")[:100]) for row in items]
         super().__init__(placeholder="Selecione o farm configurado...", min_values=1, max_values=1, options=options, disabled=not options)
         self.items = {int(row["id"]): (row["name"], int(row["points"])) for row in items}
 
@@ -916,63 +939,52 @@ async def store_farm_proof(message: discord.Message) -> bool:
     if not image_bytes.startswith(signatures):
         await message.reply("O arquivo não parece ser uma imagem PNG, JPG, GIF ou WEBP válida.")
         return True
-    require_approval = setting("farm_require_approval", "false").strip().lower() in {"1", "true", "yes", "sim"}
-    proof_status = "PENDING" if require_approval else "APPROVED"
     guild = message.guild
+    private_channel_id = int(setting("farm_private_channel_id", "0") or 0)
+    review_channel = guild.get_channel(private_channel_id) if guild and private_channel_id else None
+    if not isinstance(review_channel, discord.TextChannel):
+        await message.reply("O canal privado de cobranças ainda não foi configurado. A prova não foi registrada. Avise a liderança em `/config` → Farm.")
+        return True
     log_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
     log_channel = guild.get_channel(log_channel_id) if guild and log_channel_id else None
-    if not isinstance(log_channel, discord.TextChannel):
-        await message.reply("O canal de registros finais de farm não está configurado. A prova ainda não foi registrada. Avise a liderança para configurar `/config` → Farm → Canal de registros finais.")
-        return True
-    review_channel = None
-    if require_approval:
-        review_channel_id = int(setting("farm_approval_channel_id", "0") or 0)
-        review_channel = guild.get_channel(review_channel_id) if guild and review_channel_id else None
-        if not isinstance(review_channel, discord.TextChannel):
-            await message.reply("O canal de aprovação de farm não está configurado. A prova ainda não foi registrada. Avise a liderança para configurar `/config` → Farm → Canal de análise.")
-            return True
+    proof_status = "PENDING"
     with db() as con:
-        cur = con.execute("""INSERT INTO farm_proofs(discord_id,character_name,game_id,image_data,image_filename,image_mime,source_url,created_at,status,item_name,quantity,points)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        cur = con.execute("""INSERT INTO farm_proofs(discord_id,character_name,game_id,image_data,image_filename,image_mime,source_url,created_at,status,item_name,quantity,points,unit_price_cents,total_cents)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(message.author.id), pending["character_name"], pending["game_id"], sqlite3.Binary(image_bytes), filename, mime,
-             image_attachment.url, now_iso(), proof_status, pending["item_name"], int(pending["quantity"]), int(pending["points"])))
+             image_attachment.url, now_iso(), proof_status, pending["item_name"], int(pending["quantity"]), int(pending["points"]),
+             int(pending["unit_price_cents"] or 0), int(pending["unit_price_cents"] or 0) * int(pending["quantity"])))
         proof_id = cur.lastrowid
-        if not require_approval:
-            con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)",
-                (str(message.author.id), pending["item_name"], int(pending["quantity"]), int(pending["points"]), now_iso()))
         con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
     log_action(message.author.id, "FARM_COMPROVANTE_ENVIADO", message.author.id, "", f"Comprovante #{proof_id}; {pending['item_name']}; quantidade={pending['quantity']}; {filename}; status={proof_status}")
-    if require_approval:
-        embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id} — AGUARDANDO APROVAÇÃO",
-            description=(f"Jogador: **{pending['character_name']}**\nID: **{pending['game_id']}**\n"
-                         f"Farm: **{pending['item_name']}**\nQuantidade: **{pending['quantity']}**\n"
-                         f"Pontos: **{pending['points']}**\nDiscord: <@{message.author.id}> (`{message.author.id}`)\n"
-                         f"Prova: `{filename[:120]}`"), color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
-        embed.set_footer(text=f"farm_proof_id={proof_id}")
-        safe_filename = os.path.basename(filename).replace("\n", "_")[:100] or f"farm-{proof_id}.png"
-        embed.set_image(url=f"attachment://{safe_filename}")
+    total_cents = int(pending["unit_price_cents"] or 0) * int(pending["quantity"])
+    embed = discord.Embed(
+        title=f"🧾 COBRANÇA DE FARM #{proof_id} — AGUARDANDO DECISÃO",
+        description=(f"**Membro:** {pending['character_name']} · <@{message.author.id}>\n"
+                     f"**ID FiveM:** {pending['game_id']}\n**Item:** {pending['item_name']}\n"
+                     f"**Quantidade:** {pending['quantity']}\n**Valor unitário:** R$ {int(pending['unit_price_cents'] or 0)/100:.2f}\n"
+                     f"**Total:** R$ {total_cents/100:.2f}\n**Pontos:** {pending['points']}\n\n"
+                     "A liderança deve confirmar o pagamento e anexar o comprovante, ou recusar informando o motivo."),
+        color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text=f"farm_proof_id={proof_id}")
+    safe_filename = os.path.basename(filename).replace("\n", "_")[:100] or f"farm-{proof_id}.png"
+    embed.set_image(url=f"attachment://{safe_filename}")
+    try:
+        import io
+        invoice_message = await review_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_filename), view=FarmInvoiceView())
+        with db() as con:
+            con.execute("UPDATE farm_proofs SET review_channel_id=?,review_message_id=? WHERE id=?", (str(review_channel.id), str(invoice_message.id), proof_id))
         try:
-            import io
-            review_message = await review_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_filename), view=FarmProofReviewView())
-            with db() as con:
-                con.execute("UPDATE farm_proofs SET review_channel_id=?,review_message_id=? WHERE id=?", (str(review_channel.id), str(review_message.id), proof_id))
-            await message.reply(f"📨 Registro **#{proof_id}** salvo e enviado para aprovação da liderança.")
-        except (discord.Forbidden, discord.HTTPException):
-            log.exception("Não foi possível publicar comprovante #%s para aprovação", proof_id)
-            await message.reply(f"⚠️ Registro **#{proof_id}** foi salvo e continua pendente, mas não consegui publicar para aprovação. Avise a liderança.")
-    else:
-        await message.reply(f"✅ Registro **#{proof_id}** concluído!\nJogador: **{pending['character_name']}** · ID: **{pending['game_id']}**\nFarm: **{pending['item_name']}** · Quantidade: **{pending['quantity']}**.")
-        if isinstance(log_channel, discord.TextChannel):
-            embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
-            embed.add_field(name="Jogador", value=pending["character_name"], inline=True)
-            embed.add_field(name="ID", value=pending["game_id"], inline=True)
-            embed.add_field(name="Farm", value=pending["item_name"], inline=True)
-            embed.add_field(name="Quantidade", value=str(pending["quantity"]), inline=True)
-            embed.add_field(name="Discord", value=f"<@{message.author.id}> (`{message.author.id}`)", inline=False)
-            safe_log_filename = os.path.basename(filename).replace("\n", "_")[:100] or f"farm-{proof_id}.png"
-            embed.set_image(url=f"attachment://{safe_log_filename}")
-            import io
-            await log_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_log_filename))
+            await message.delete()
+        except discord.HTTPException:
+            log.warning("Não consegui apagar a mensagem de prova do membro %s", message.author.id)
+        try:
+            await message.channel.send(f"📨 Sua solicitação de farm **#{proof_id}** foi enviada para a liderança. A decisão chegará por mensagem privada.", delete_after=20)
+        except discord.HTTPException:
+            pass
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Não foi possível publicar cobrança #%s", proof_id)
+        await message.reply(f"⚠️ A prova #{proof_id} foi salva, mas a cobrança não pôde ser publicada. Avise a liderança; não envie outra prova.")
     return True
 
 # ---------------- PAINEL INTERATIVO DE CONFIGURAÇÃO ----------------
@@ -1091,16 +1103,15 @@ def config_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
         ),
         inline=True,
     )
-    farm_approval = panel_setting("farm_require_approval", "false").lower() in {"1", "true", "yes", "sim"}
     embed.add_field(
         name="🌾 Farm",
         value=(
             f"**{panel_setting('farm_panel_title', 'Registro de farm')[:90]}**\n"
             f"Publicação: {channel_label('farm_panel_channel_id')}\n"
-            f"Análise: {channel_label('farm_approval_channel_id')}\n"
+            f"Cobranças: {channel_label('farm_private_channel_id')}\n"
             f"Registros finais: {channel_label('farm_log_channel_id', str(FARM_LOG_CHANNEL_ID))}\n"
             f"Quem decide: {role_label(int(panel_setting('farm_approver_role_id', str(LEADER_ROLE_ID)) or 0))}\n"
-            f"Aprovação: **{'Manual' if farm_approval else 'Automática'}**"
+            f"Decisão: **Liderança** (pagamento com comprovante ou recusa justificada)"
         ),
         inline=True,
     )
@@ -1172,7 +1183,7 @@ class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
         raw = self.object_id.value.strip()
         allowed = {
             "wl_panel_channel_id", "wl_channel_id", "farm_panel_channel_id",
-            "farm_approval_channel_id", "farm_log_channel_id", "hierarchy_panel_channel_id",
+            "farm_approval_channel_id", "farm_private_channel_id", "farm_log_channel_id", "hierarchy_panel_channel_id",
             "wl_pending_role_id", "member_role_id", "wl_approver_role_id", "recruit_role_id",
             "farm_approver_role_id", "leader_role_id", "adv1_role_id", "adv2_role_id", "adv3_role_id",
         }
@@ -1226,11 +1237,11 @@ class ConfigWLRoleView(View):
 class ConfigFarmChannelsView(View):
     def __init__(self):
         super().__init__(timeout=600)
-        self.add_item(ConfigTextChannelSelect("farm_panel_channel_id", "Canal onde o painel Farm será publicado", row=0))
-        self.add_item(ConfigTextChannelSelect("farm_approval_channel_id", "Canal que receberá comprovantes para aprovação", row=1))
-        self.add_item(ConfigSingleRoleSelect("farm_approver_role_id", "Cargo autorizado a aprovar ou recusar o Farm", row=2))
-        self.add_item(ConfigTextChannelSelect("farm_log_channel_id", "Canal que receberá os registros finais de farm", row=3))
-        self.add_item(ConfigManualIdButton(preset_key="farm_log_channel_id"))
+        self.add_item(ConfigTextChannelSelect("farm_panel_channel_id", "Canal público do painel Farm", row=0))
+        self.add_item(ConfigTextChannelSelect("farm_private_channel_id", "Canal privado de cobranças e pagamentos", row=1))
+        self.add_item(ConfigSingleRoleSelect("farm_approver_role_id", "Cargo autorizado a decidir cobranças", row=2))
+        self.add_item(ConfigTextChannelSelect("farm_log_channel_id", "Canal de histórico final do Farm", row=3))
+        self.add_item(ConfigManualIdButton(preset_key="farm_private_channel_id"))
 
 
 class ConfigSingleRoleSelect(discord.ui.RoleSelect):
@@ -1551,7 +1562,6 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
     description_input = TextInput(label="Descrição/instruções do farm", style=discord.TextStyle.paragraph, max_length=2500, required=True)
     photo_url = TextInput(label="URL da foto / miniatura (opcional)", max_length=500, required=False, placeholder="https://.../foto.png")
     banner_url = TextInput(label="URL do banner (opcional)", max_length=500, required=False, placeholder="https://.../banner.png")
-    require_approval = TextInput(label="Exigir aprovação? (sim/não)", max_length=5, required=True)
 
     def __init__(self):
         super().__init__(timeout=300)
@@ -1560,7 +1570,6 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
             (self.description_input, panel_setting("farm_panel_description", "Clique em REGISTRAR FARM, selecione o item, informe a quantidade e envie a imagem de prova neste canal. Nome e ID são identificados automaticamente pela WL.")),
             (self.photo_url, panel_setting("farm_panel_photo_url", "")),
             (self.banner_url, panel_setting("farm_panel_banner_url", "")),
-            (self.require_approval, "sim" if panel_setting("farm_require_approval", "false").lower() in {"1", "true", "yes", "sim"} else "não"),
         ])
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -1568,18 +1577,12 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         if not valid_asset_url(photo) or not valid_asset_url(banner):
             await interaction.response.send_message("Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem.", ephemeral=True)
             return
-        raw_approval = self.require_approval.value.strip().lower()
-        if raw_approval not in {"sim", "não", "nao", "yes", "no", "true", "false", "1", "0"}:
-            await interaction.response.send_message("No campo de aprovação, informe sim ou não.", ephemeral=True)
-            return
-        enabled = raw_approval in {"sim", "yes", "true", "1"}
         save_config_value("farm_panel_title", self.title_input.value.strip() or f"FARM — {FACTION_NAME}")
         save_config_value("farm_panel_description", self.description_input.value.strip())
         save_config_value("farm_panel_photo_url", photo)
         save_config_value("farm_panel_banner_url", banner)
-        save_config_value("farm_require_approval", "true" if enabled else "false")
         await interaction.response.send_message(
-            f"✅ Título, descrição, foto, banner e opção de aprovação salvos ({'aprovação obrigatória' if enabled else 'aprovação automática'}). Configure também o cargo que poderá aprovar/recusar o Farm e os canais abaixo.",
+            "✅ Aparência do painel salva. O Farm agora sempre gera uma cobrança para a liderança decidir: pagamento com comprovante ou recusa justificada. Configure o preço dos itens e os canais abaixo.",
             view=ConfigFarmChannelsView(), ephemeral=True,
         )
 
@@ -1657,6 +1660,158 @@ async def update_farm_review_message(row, *, status: str, reviewer: str, reason:
             await msg.edit(embed=embed, view=None)
     except discord.HTTPException:
         log.exception("Não foi possível atualizar a mensagem do comprovante #%s", row["id"])
+
+
+class FarmInvoiceRejectModal(Modal, title="Recusar cobrança de farm"):
+    reason = TextInput(label="Motivo da recusa", style=discord.TextStyle.paragraph, min_length=5, max_length=500, required=True)
+    def __init__(self, proof_id: int):
+        super().__init__(timeout=300)
+        self.proof_id = proof_id
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+        with db() as con:
+            row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (self.proof_id,)).fetchone()
+            if not row or row["status"] != "PENDING":
+                await interaction.response.send_message("Essa cobrança já foi finalizada ou não existe.", ephemeral=True); return
+            cur = con.execute("UPDATE farm_proofs SET status='REJECTED',reviewed_by=?,reviewed_at=?,review_reason=? WHERE id=? AND status='PENDING'", (str(interaction.user.id), now_iso(), self.reason.value.strip(), self.proof_id))
+            if not cur.rowcount:
+                await interaction.response.send_message("Essa cobrança já foi decidida por outra pessoa.", ephemeral=True); return
+        log_action(interaction.user.id, "FARM_COBRANCA_RECUSADA", int(row["discord_id"]), self.reason.value.strip(), f"Cobrança #{self.proof_id}")
+        await finalize_farm_invoice(row, "REJECTED", interaction.user, reason=self.reason.value.strip())
+        await interaction.response.send_message(f"Cobrança #{self.proof_id} recusada e registrada.", ephemeral=True)
+
+
+class FarmInvoiceConfirmView(View):
+    def __init__(self, proof_id: int):
+        super().__init__(timeout=300)
+        self.proof_id = proof_id
+    @discord.ui.button(label="SIM, pagar", style=discord.ButtonStyle.success, emoji="✅")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+        with db() as con:
+            row = con.execute("SELECT * FROM farm_proofs WHERE id=? AND status='PENDING'", (self.proof_id,)).fetchone()
+        if not row:
+            await interaction.response.send_message("Essa cobrança já foi finalizada.", ephemeral=True); return
+        with db() as con:
+            con.execute("INSERT INTO farm_receipt_pending(reviewer_id,proof_id,channel_id,created_at) VALUES(?,?,?,?) ON CONFLICT(reviewer_id) DO UPDATE SET proof_id=excluded.proof_id,channel_id=excluded.channel_id,created_at=excluded.created_at", (str(interaction.user.id), self.proof_id, str(interaction.channel_id), now_iso()))
+        await interaction.response.send_message(f"Envie agora, neste canal privado, a **foto do comprovante de pagamento** da cobrança #{self.proof_id}. A imagem será salva no banco e enviada ao membro por DM. Prazo: 10 minutos.", ephemeral=True)
+    @discord.ui.button(label="NÃO, não pagar", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+        await interaction.response.send_modal(FarmInvoiceRejectModal(self.proof_id))
+
+
+class FarmInvoiceView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+    def proof_id_from(self, interaction: discord.Interaction) -> Optional[int]:
+        if not interaction.message or not interaction.message.embeds: return None
+        footer = interaction.message.embeds[0].footer.text or ""
+        try: return int(footer.split("farm_proof_id=")[-1])
+        except (ValueError, IndexError): return None
+    @discord.ui.button(label="Registrar pagamento", style=discord.ButtonStyle.success, emoji="💸", custom_id="fac:farm:invoice-pay")
+    async def pay(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+        proof_id = self.proof_id_from(interaction)
+        if not proof_id:
+            await interaction.response.send_message("Não consegui identificar essa cobrança.", ephemeral=True); return
+        await interaction.response.send_message(f"Confirma o pagamento da cobrança **#{proof_id}**?", view=FarmInvoiceConfirmView(proof_id), ephemeral=True)
+    @discord.ui.button(label="Recusar cobrança", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="fac:farm:invoice-reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not can_decide_farm(interaction):
+            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+        proof_id = self.proof_id_from(interaction)
+        if not proof_id:
+            await interaction.response.send_message("Não consegui identificar essa cobrança.", ephemeral=True); return
+        await interaction.response.send_modal(FarmInvoiceRejectModal(proof_id))
+
+
+async def finalize_farm_invoice(row, status: str, reviewer: discord.abc.User, *, reason: str = "", receipt: bytes = b"", receipt_filename: str = "", receipt_mime: str = "") -> None:
+    proof_id = int(row["id"])
+    with db() as con:
+        expected_status = "PENDING" if status == "APPROVED" else "REJECTED"
+        cur = con.execute("UPDATE farm_proofs SET status=?,reviewed_by=?,reviewed_at=?,review_reason=?,paid_by=?,paid_at=?,receipt_data=?,receipt_filename=?,receipt_mime=? WHERE id=? AND status=?", (status, str(reviewer.id), now_iso(), reason, str(reviewer.id) if status == "APPROVED" else "", now_iso() if status == "APPROVED" else "", sqlite3.Binary(receipt) if receipt else None, receipt_filename, receipt_mime, proof_id, expected_status))
+        if not cur.rowcount:
+            return
+        if status == "APPROVED":
+            con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)", (str(row["discord_id"]), row["item_name"], int(row["quantity"] or 0), int(row["points"] or 0), now_iso()))
+    channel_id = int(row["review_channel_id"] or 0); message_id = int(row["review_message_id"] or 0)
+    channel = bot.get_channel(channel_id) if channel_id else None
+    if not isinstance(channel, discord.TextChannel) and channel_id:
+        try: channel = await bot.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException): channel = None
+    if isinstance(channel, discord.TextChannel) and message_id:
+        try:
+            msg = await channel.fetch_message(message_id)
+            final_embed = discord.Embed(title=f"{'✅ PAGAMENTO CONFIRMADO' if status == 'APPROVED' else '❌ COBRANÇA RECUSADA'} · FARM #{proof_id}", color=discord.Color.green() if status == 'APPROVED' else discord.Color.red(), timestamp=datetime.now(timezone.utc))
+            final_embed.description = (
+                f"**Membro:** <@{row['discord_id']}> · {row['character_name']}\n"
+                f"**ID:** {row['game_id']}\n**Item:** {row['item_name']} × {row['quantity']}\n"
+                f"**Total:** R$ {int(row['total_cents'] or 0)/100:.2f}\n**Decidido por:** {reviewer.mention}"
+                + (f"\n**Motivo:** {reason}" if reason else "")
+            )
+            await msg.edit(embed=final_embed, view=None)
+            history_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
+            history_channel = bot.get_channel(history_channel_id) if history_channel_id else None
+            if isinstance(history_channel, discord.TextChannel) and history_channel.id != channel.id:
+                await history_channel.send(embed=final_embed)
+        except discord.HTTPException: log.exception("Falha ao atualizar cobrança finalizada #%s", proof_id)
+    try:
+        user = await bot.fetch_user(int(row["discord_id"]))
+        if status == "APPROVED" and receipt:
+            import io
+            await user.send(f"✅ Seu farm #{proof_id} foi pago! Valor: **R$ {int(row['total_cents'] or 0)/100:.2f}**. Comprovante anexado.", file=discord.File(io.BytesIO(receipt), filename=receipt_filename or f"pagamento-{proof_id}.png"))
+        elif status == "REJECTED":
+            await user.send(f"❌ Sua cobrança de farm #{proof_id} foi recusada. Motivo: **{reason}**")
+    except discord.HTTPException:
+        log.info("Não foi possível enviar DM para o membro da cobrança #%s", proof_id)
+    log_action(reviewer.id, "FARM_PAGAMENTO_CONFIRMADO" if status == "APPROVED" else "FARM_COBRANCA_FINALIZADA_COM_RECUSA", int(row["discord_id"]), reason, f"Cobrança #{proof_id}; total={int(row['total_cents'] or 0)} centavos")
+
+
+async def store_farm_payment_receipt(message: discord.Message) -> bool:
+    with db() as con:
+        pending = con.execute("SELECT * FROM farm_receipt_pending WHERE reviewer_id=?", (str(message.author.id),)).fetchone()
+    if not pending: return False
+    if str(pending["channel_id"]) != str(message.channel.id): return False
+    try:
+        if (datetime.now(timezone.utc) - datetime.fromisoformat(pending["created_at"])).total_seconds() > 600:
+            with db() as con: con.execute("DELETE FROM farm_receipt_pending WHERE reviewer_id=?", (str(message.author.id),))
+            await message.reply("O prazo para enviar o comprovante expirou. Inicie a confirmação novamente."); return True
+    except (TypeError, ValueError): pass
+    if not isinstance(message.author, discord.Member) or not can_decide_farm_for_member(message.author):
+        await message.reply("Somente o cargo configurado para decidir Farm pode anexar esse comprovante."); return True
+    attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
+    if not attachment:
+        await message.reply("Anexe a imagem do comprovante de pagamento nesta mensagem."); return True
+    if attachment.size > 8 * 1024 * 1024:
+        await message.reply("A imagem excede 8 MB. Envie uma menor."); return True
+    try: data = await attachment.read(use_cached=False)
+    except discord.HTTPException:
+        await message.reply("Não consegui baixar o comprovante. Envie novamente."); return True
+    if not data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"RIFF")):
+        await message.reply("O arquivo não parece ser uma imagem válida."); return True
+    with db() as con:
+        row = con.execute("SELECT * FROM farm_proofs WHERE id=? AND status='PENDING'", (int(pending["proof_id"]),)).fetchone()
+        con.execute("DELETE FROM farm_receipt_pending WHERE reviewer_id=?", (str(message.author.id),))
+    if not row:
+        await message.reply("Essa cobrança já foi finalizada ou não existe."); return True
+    await finalize_farm_invoice(row, "APPROVED", message.author, receipt=data, receipt_filename=attachment.filename[:150], receipt_mime=attachment.content_type or "application/octet-stream")
+    try: await message.delete()
+    except discord.HTTPException: pass
+    try: await message.channel.send(f"✅ Pagamento da cobrança **#{row['id']}** registrado e comprovante salvo.", delete_after=15)
+    except discord.HTTPException: pass
+    return True
+
+
+def can_decide_farm_for_member(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator: return True
+    try: role_id = int(setting("farm_approver_role_id", str(LEADER_ROLE_ID)) or 0)
+    except (TypeError, ValueError): role_id = 0
+    return bool(role_id and any(role.id == role_id for role in member.roles))
 
 
 class FarmProofReviewView(View):
@@ -1891,7 +2046,7 @@ class HierarchyRoleIdsModal(Modal):
         self.inputs = []
         for index in range(start, end):
             field = TextInput(
-                label=f"Cargo {parent.count - index} — {'MAIS ALTO' if index == 0 else 'ID do cargo'}",
+                label=f"Cargo {index + 1} — {'BASE / MAIS BAIXO' if index == 0 else 'ID do cargo'}",
                 placeholder="Cole o ID do cargo do Discord",
                 required=True, max_length=25
             )
@@ -1907,7 +2062,7 @@ class HierarchyRoleIdsModal(Modal):
             raw = field.value.strip()
             role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
             if not role or role == self.parent_view.guild.default_role:
-                await interaction.response.send_message(f"ID inválido no campo Cargo {self.parent_view.count - (self.start + offset)}. Confira se o cargo pertence a este servidor.", ephemeral=True)
+                await interaction.response.send_message(f"ID inválido no campo Cargo {self.start + offset + 1}. Confira se o cargo pertence a este servidor.", ephemeral=True)
                 return
             if role.id in resolved or role.id in [x for i, x in enumerate(self.parent_view.role_ids) if x and not self.start <= i < self.end]:
                 await interaction.response.send_message("Você informou o mesmo cargo mais de uma vez. Cada posição precisa ter um cargo diferente.", ephemeral=True)
@@ -1935,10 +2090,10 @@ class HierarchyRoleConfigView(View):
         lines = []
         for idx in range(start, end):
             role = self.guild.get_role(self.role_ids[idx]) if self.role_ids[idx] else None
-            label = f"Cargo {self.count - idx}"
+            label = f"Cargo {idx + 1}"
             lines.append(f"**{label}:** {role.mention if role else '— não preenchido —'}")
         e = discord.Embed(title="Etapa 2 — IDs dos cargos", description=(
-            "Informe os IDs na ordem **do maior para o menor**. Após salvar, o bot mostrará a menção do cargo encontrado.\n\n"
+            "Informe os cargos na ordem **do mais baixo para o mais alto**. O primeiro será a base e o último será o topo. Após salvar, o bot mostrará a menção do cargo encontrado.\n\n"
             + "\n".join(lines)
         ), color=discord.Color.blurple())
         e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(x is not None for x in self.role_ids)}/{self.count} cargos definidos")
@@ -2081,9 +2236,9 @@ class HierarchyTagConfigView(View):
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             total = len(self.role_ids)
-            # A primeira posição é o cargo mais alto; prioridade maior = cargo mais alto.
+            # A primeira posição é o cargo mais baixo; prioridade maior = cargo mais alto.
             for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
-                priority = total - idx
+                priority = idx + 1
                 con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"rank_role_{rid}", f"{tag}|{priority}"))
                 con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
         view = HierarchyFinalChannelView(self.guild)
@@ -2418,6 +2573,7 @@ async def setup_hook() -> None:  # type: ignore[override]
     bot.add_view(RegistrationPanelView())
     bot.add_view(RegistrationApprovalView())
     bot.add_view(FarmPanelView())
+    bot.add_view(FarmInvoiceView())
     bot.add_view(FarmProofReviewView())
     bot.add_view(LeadershipPanelView())
     bot.loop.create_task(expire_pending_wls())
@@ -2511,6 +2667,9 @@ async def on_member_update(before: discord.Member, after: discord.Member) -> Non
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
+        return
+    receipt_handled = await store_farm_payment_receipt(message)
+    if receipt_handled:
         return
     handled = await store_farm_proof(message)
     if handled:
@@ -2640,6 +2799,20 @@ async def farm_item(interaction: discord.Interaction, nome: str, pontos: app_com
         con.execute("INSERT INTO farm_items(name,points,target,active) VALUES(?,?,?,1) ON CONFLICT(name) DO UPDATE SET points=excluded.points,target=excluded.target,active=1", (name, pontos, meta))
     log_action(interaction.user.id, "FARM_ITEM_CONFIG", None, "", f"{name}: {pontos} ponto(s), meta {meta}")
     await interaction.response.send_message(f"Item **{name}** configurado: **{pontos}** ponto(s) por unidade; meta: **{meta}**.", ephemeral=True)
+
+@bot.tree.command(name="farm-preco", description="Define o valor unitário em reais de um item de farm")
+@app_commands.describe(nome="Nome exato do item cadastrado", valor="Valor em reais por unidade, por exemplo 2.50")
+async def farm_preco(interaction: discord.Interaction, nome: str, valor: app_commands.Range[float, 0.01, 1000000.0]) -> None:
+    if not await deny_unless_leader(interaction):
+        return
+    cents = int(round(float(valor) * 100))
+    with db() as con:
+        cur = con.execute("UPDATE farm_items SET unit_price_cents=? WHERE name=? COLLATE NOCASE AND active=1", (cents, nome.strip()))
+    if not cur.rowcount:
+        await interaction.response.send_message("Não encontrei esse item ativo. Cadastre primeiro com `/farm-item`.", ephemeral=True)
+        return
+    log_action(interaction.user.id, "FARM_PRECO_CONFIG", None, "", f"{nome.strip()}: R$ {cents/100:.2f} por unidade")
+    await interaction.response.send_message(f"Valor de **{nome.strip()}** atualizado para **R$ {cents/100:.2f} por unidade**.", ephemeral=True)
 
 @bot.tree.command(name="farm-item-desativar", description="Desativa um item de farm")
 async def farm_item_desativar(interaction: discord.Interaction, nome: str) -> None:

@@ -16,9 +16,9 @@ Configure título e descrição. Em seguida, selecione o canal de publicação n
 
 Configure título e texto de instruções, foto/miniatura, banner e se o comprovante exige aprovação. Depois escolha o canal onde o painel será publicado, o canal onde a liderança receberá os comprovantes para análise, o cargo autorizado a decidir e o canal que receberá os registros finais.
 
-O jogador clica em **REGISTRAR FARM**. O bot identifica o Discord ID e consulta o cadastro ativo em `members`, criado pela WL aprovada. Em seguida, o jogador seleciona um item ativo cadastrado, informa a quantidade e envia a imagem de prova como anexo no mesmo canal do painel. O bot monta o registro com nome, ID FiveM, item, quantidade, pontos, Discord e imagem. Com aprovação obrigatória, só contabiliza os pontos após aprovação; com aprovação automática, contabiliza ao receber a prova. A imagem e os dados ficam salvos em `farm_proofs` e os registros contabilizados em `farm_entries`.
+O jogador clica em **REGISTRAR FARM**. O bot identifica o Discord ID e consulta o cadastro ativo em `members`, criado pela WL aprovada. Itens sem preço cadastrado não podem ser solicitados. Em seguida, o jogador seleciona um item ativo cadastrado, informa a quantidade e envia a imagem de prova como anexo no mesmo canal do painel. O bot monta o registro com nome, ID FiveM, item, quantidade, pontos, Discord e imagem. Com aprovação obrigatória, só contabiliza os pontos após aprovação; com aprovação automática, contabiliza ao receber a prova. A imagem e os dados ficam salvos em `farm_proofs` e os registros contabilizados em `farm_entries`.
 
-A liderança configura os itens com `/farm-item` (nome, pontos por unidade e meta) e pode desativá-los com `/farm-item-desativar`. O comando legado `/farm` não contabiliza registros sem prova: ele orienta o uso do painel.
+A liderança configura os itens com `/farm-item` (nome, pontos por unidade e meta), define o preço em reais por unidade com `/farm-preco` (ex.: `2.50`) e pode desativá-los com `/farm-item-desativar`. O comando legado `/farm` não contabiliza registros sem prova: ele orienta o uso do painel.
 
 ### Selecionar cargos
 
@@ -72,7 +72,7 @@ A publicação cria uma mensagem limpa por cargo, com o nome do cargo, quantidad
 A configuração da hierarquia é feita em `/config` → **Hierarquia**. O fluxo guiado possui quatro etapas:
 
 1. Informe a quantidade de cargos (de 1 a 25).
-2. Informe os IDs dos cargos na ordem do mais alto para o mais baixo. Para respeitar o limite de cinco campos por modal do Discord, o preenchimento é dividido em blocos.
+2. Informe os IDs dos cargos na ordem do mais baixo para o mais alto. Para respeitar o limite de cinco campos por modal do Discord, o preenchimento é dividido em blocos.
 3. Defina uma tag/abreviação para cada cargo. A tag é aplicada antes do nome RP e do ID do jogador.
 4. Selecione o canal de publicação pelo menu ou informe o ID manualmente.
 

@@ -20,7 +20,7 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 - Cargos e canais configuráveis pelos menus do Discord, com alternativa de informar o ID manualmente quando necessário.
 - WL e farm com título, descrição, canal de publicação escolhido em lista, foto/miniatura e banner por URL HTTPS.
 - Hierarquia configurável sem informar previamente a quantidade de cargos: percorra as páginas, adicione cargos, remova seleções incorretas, reinicie a seleção e salve a ordem escolhida.
-- Aprovação opcional dos comprovantes de farm; quando ativada, a liderança aprova ou recusa no canal definido, com motivo obrigatório para recusa.
+- Fluxo de cobrança de farm: o membro envia a prova no canal público, o bot salva a imagem no SQLite e cria uma cobrança no canal privado da liderança; pagamento exige comprovante de pagamento salvo no banco, e recusa exige motivo.
 
 ## Requisitos
 
@@ -135,7 +135,7 @@ No botão **Hierarquia**, informe a quantidade de patentes. Na tela seguinte, ma
 
 ## Limitações conhecidas
 
-- A interface usa componentes tradicionais do `discord.py`; não é uma implementação integral de Discord Components V2.
+- As telas de configuração ainda não foram integralmente migradas para Discord Components V2; parte dos fluxos usa Views/Embeds tradicionais. Essa migração precisa ser concluída e validada em servidor de teste antes de considerar o redesign visual final.
 - O comprovante de farm é salvo como imagem. Item e quantidade são informados pelo jogador no fluxo do painel; o bot não tenta interpretar os dados escritos dentro da imagem. O comando `/farm-item` cria/atualiza os itens e `/farm-item-desativar` desativa opções. O comando antigo `/farm` apenas orienta a usar o painel para garantir que todo registro tenha prova.
 - O comportamento real depende de IDs, permissões, intents e configurações válidas. Teste primeiro em um servidor de desenvolvimento.
 
