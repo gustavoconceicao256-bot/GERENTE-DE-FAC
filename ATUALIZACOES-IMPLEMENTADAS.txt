@@ -1,0 +1,23 @@
+GERENTE-DE-FAC — ALTERAÇÕES DESTA VERSÃO DE TRABALHO
+
+Base: GERENTE-DE-FAC-main (1)(2).zip enviado em 02/11/2026.
+
+Implementado nesta versão:
+- /config abre um painel principal em Discord Components V2.
+- Entrada da Hierarquia apresenta as etapas na ordem correta: cargo mais baixo -> cargo mais alto.
+- Guia inicial da Hierarquia usa Components V2.
+- Etapa de cargos da Hierarquia agora permite selecionar cargos pelo seletor do Discord ou informar IDs manualmente; mantém paginação por blocos de até 5 cargos e valida duplicados.
+- Configuração do Farm agora começa pelo cadastro de itens, permitindo adicionar vários itens com preço unitário e pontos por unidade.
+- Configuração de canais/permissões do Farm usa Components V2 e permite selecionar canal/cargo ou informar ID manualmente.
+- Mantida a persistência existente de fotos de prova, cobranças e recibos no SQLite.
+- Mantidos os demais módulos e tabelas do banco.
+
+Verificações executadas:
+- Compilação sintática de bot.py (py_compile): OK.
+- Execução do DDL inicial do SQLite em banco temporário: OK.
+- Integridade estrutural do ZIP: verificada.
+
+PENDÊNCIAS / LIMITAÇÕES:
+- A migração para Components V2 ainda não cobre todas as telas antigas de configuração (por exemplo, etapas de tags e algumas configurações gerais ainda usam Embed/View).
+- Não foi possível executar teste de interação real com Discord neste ambiente; dependências/rede para instalar discord.py não estavam disponíveis.
+- Antes de colocar em produção, testar as interações no servidor e revisar permissões de canais/cargos.

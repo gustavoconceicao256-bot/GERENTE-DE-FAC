@@ -1583,7 +1583,7 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         save_config_value("farm_panel_banner_url", banner)
         await interaction.response.send_message(
             "✅ Aparência do painel salva. O Farm agora sempre gera uma cobrança para a liderança decidir: pagamento com comprovante ou recusa justificada. Configure o preço dos itens e os canais abaixo.",
-            view=ConfigFarmChannelsView(), ephemeral=True,
+            view=ConfigFarmChannelsV2(), ephemeral=True,
         )
 
 
@@ -2034,6 +2034,7 @@ class HierarchyCountModal(Modal, title="Etapa 1 — Quantidade de cargos"):
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
         view = HierarchyRoleConfigView(self.guild, count)
+        view.owner_id = interaction.user.id
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
 
@@ -2073,12 +2074,42 @@ class HierarchyRoleIdsModal(Modal):
         await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
 
 
+
+class HierarchyRolePicker(discord.ui.RoleSelect):
+    def __init__(self, parent):
+        super().__init__(placeholder="Ou selecione um cargo do servidor para a próxima posição", min_values=1, max_values=1, row=0)
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.owner_id:
+            await interaction.response.send_message("Somente quem iniciou a configuração pode alterar os cargos.", ephemeral=True)
+            return
+        role = self.values[0]
+        if role.is_default():
+            await interaction.response.send_message("O cargo @everyone não pode fazer parte da hierarquia.", ephemeral=True)
+            return
+        start = self.parent_view.page * 5
+        end = min(start + 5, self.parent_view.count)
+        if role.id in [rid for rid in self.parent_view.role_ids if rid]:
+            await interaction.response.send_message("Esse cargo já foi selecionado em outra posição.", ephemeral=True)
+            return
+        try:
+            index = self.parent_view.role_ids.index(None, start, end)
+        except ValueError:
+            await interaction.response.send_message("Este bloco já está completo. Avance para o próximo bloco.", ephemeral=True)
+            return
+        self.parent_view.role_ids[index] = role.id
+        await interaction.response.edit_message(embed=self.parent_view.embed(), view=self.parent_view)
+
+
 class HierarchyRoleConfigView(View):
     def __init__(self, guild, count):
         super().__init__(timeout=900)
         self.guild, self.count = guild, count
         self.role_ids = [None] * count
         self.page = 0
+        self.owner_id = 0
+        self.add_item(HierarchyRolePicker(self))
 
     @property
     def pages(self):
@@ -2093,28 +2124,28 @@ class HierarchyRoleConfigView(View):
             label = f"Cargo {idx + 1}"
             lines.append(f"**{label}:** {role.mention if role else '— não preenchido —'}")
         e = discord.Embed(title="Etapa 2 — IDs dos cargos", description=(
-            "Informe os cargos na ordem **do mais baixo para o mais alto**. O primeiro será a base e o último será o topo. Após salvar, o bot mostrará a menção do cargo encontrado.\n\n"
+            "Selecione no menu ou informe os IDs na ordem **do mais baixo para o mais alto**. O primeiro será a base e o último será o topo.\n\n"
             + "\n".join(lines)
         ), color=discord.Color.blurple())
         e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(x is not None for x in self.role_ids)}/{self.count} cargos definidos")
         return e
 
-    @discord.ui.button(label="Preencher / editar IDs deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    @discord.ui.button(label="Preencher / editar IDs deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=1)
     async def edit_block(self, interaction: discord.Interaction, button: discord.ui.Button):
         start = self.page * 5
         await interaction.response.send_modal(HierarchyRoleIdsModal(self, start, min(start + 5, self.count)))
 
-    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=3)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=3)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = min(self.pages - 1, self.page + 1)
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Voltar à quantidade", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Voltar à quantidade", style=discord.ButtonStyle.secondary, row=3)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(HierarchyCountModal(self.guild))
 
@@ -2124,7 +2155,7 @@ class HierarchyRoleConfigView(View):
         self.page = 0
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Confirmar cargos e continuar", style=discord.ButtonStyle.success, row=3)
+    @discord.ui.button(label="Confirmar cargos e continuar", style=discord.ButtonStyle.success, row=4)
     async def continue_tags(self, interaction: discord.Interaction, button: discord.ui.Button):
         if any(x is None for x in self.role_ids):
             await interaction.response.send_message("Preencha todos os IDs antes de continuar.", ephemeral=True)
@@ -2217,6 +2248,7 @@ class HierarchyTagConfigView(View):
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = HierarchyRoleConfigView(self.guild, len(self.role_ids))
         view.role_ids = list(self.role_ids)
+        view.owner_id = interaction.user.id
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
     @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
@@ -2359,7 +2391,7 @@ class ConfigPanelView(View):
             title="🏛️ Guia de configuração da hierarquia",
             description=(
                 "Configure a hierarquia em quatro etapas: **1)** quantidade de cargos; "
-                "**2)** IDs dos cargos, do mais alto ao mais baixo; **3)** tag/abreviação de cada cargo; "
+                "**2)** cargos, do mais baixo ao mais alto; **3)** tag/abreviação de cada cargo; "
                 "**4)** canal de publicação.\\n\\n"
                 "O bot identifica o maior cargo configurado do membro e atualiza o nickname para "
                 "**[ TAG ] NOME - ID**. Os dados ficam salvos no SQLite.\\n\\n"
@@ -2368,7 +2400,7 @@ class ConfigPanelView(View):
             ),
             color=discord.Color.blurple(),
         )
-        await interaction.response.send_message(embed=guide, view=HierarchyGuideView(interaction.guild), ephemeral=True)
+        await interaction.response.send_message(embed=guide, view=HierarchyGuideV2(interaction.guild), ephemeral=True)
 
     @discord.ui.button(label="Farm", style=discord.ButtonStyle.primary, emoji="🌾", row=0)
     async def farm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2686,11 +2718,215 @@ async def on_ready() -> None:
             GUILD_ID,
         )
 
+
+
+
+
+class FarmItemConfigModal(discord.ui.Modal, title="Adicionar item ao Farm"):
+    nome = discord.ui.TextInput(label="Nome do item", placeholder="Ex.: Alumínio", max_length=60)
+    valor = discord.ui.TextInput(label="Valor por unidade (R$)", placeholder="Ex.: 500,00", max_length=20)
+    pontos = discord.ui.TextInput(label="Pontos por unidade", placeholder="Ex.: 1", default="1", max_length=7)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        name = self.nome.value.strip()
+        raw_value = self.valor.value.strip().replace("R$", "").replace(" ", "")
+        raw_value = raw_value.replace(".", "").replace(",", ".") if "," in raw_value else raw_value
+        try:
+            cents = int(round(float(raw_value) * 100))
+            points = int(self.pontos.value.strip())
+        except (ValueError, OverflowError):
+            await interaction.response.send_message("Informe um valor em reais e uma quantidade de pontos válidos.", ephemeral=True)
+            return
+        if not name or cents <= 0 or points < 1 or cents > 100000000:
+            await interaction.response.send_message("Confira o nome, o valor (maior que zero) e os pontos (mínimo 1).", ephemeral=True)
+            return
+        with db() as con:
+            con.execute(
+                "INSERT INTO farm_items(name,points,target,active,unit_price_cents) VALUES(?,?,0,1,?) "
+                "ON CONFLICT(name) DO UPDATE SET points=excluded.points,active=1,unit_price_cents=excluded.unit_price_cents",
+                (name, points, cents),
+            )
+        log_action(interaction.user.id, "FARM_ITEM_CONFIG", None, "", f"{name}: R$ {cents/100:.2f}; {points} ponto(s)")
+        await interaction.response.send_message(
+            f"✅ **{name}** salvo — R$ {cents/100:.2f} por unidade; {points} ponto(s) por unidade.",
+            view=FarmItemSetupV2(), ephemeral=True
+        )
+
+
+class FarmItemSetupV2(discord.ui.LayoutView):
+    def __init__(self):
+        super().__init__(timeout=900)
+        with db() as con:
+            rows = con.execute("SELECT name,unit_price_cents,points FROM farm_items WHERE active=1 ORDER BY name").fetchall()
+        summary = "\n".join(f"• **{r['name']}** — R$ {int(r['unit_price_cents'] or 0)/100:.2f} / un. · {r['points']} pt(s)" for r in rows[:25])
+        if len(rows) > 25:
+            summary += f"\n… e mais {len(rows)-25} item(ns)."
+        if not summary:
+            summary = "Nenhum item cadastrado ainda."
+        container = discord.ui.Container(
+            discord.ui.TextDisplay("## 🌾 Etapa 1 — Itens e valores\nCadastre os itens que os membros poderão registrar. Você pode adicionar quantos precisar."),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(summary),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Adicionar item", emoji="➕", style=discord.ButtonStyle.success, custom_id="fac:farmv2:add"),
+                discord.ui.Button(label="Configurar canais e painel", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"),
+            ),
+        )
+        self.add_item(container)
+        row = container.children[-1]
+        row.children[0].callback = self.add_item_modal
+        row.children[1].callback = self.next_step
+
+    async def add_item_modal(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(FarmItemConfigModal())
+
+    async def next_step(self, interaction: discord.Interaction):
+        if not await deny_unless_config_access(interaction):
+            return
+        with db() as con:
+            count = con.execute("SELECT COUNT(*) AS n FROM farm_items WHERE active=1").fetchone()["n"]
+        if not count:
+            await interaction.response.send_message("Cadastre pelo menos um item antes de continuar.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ConfigFarmPanelModal())
+
+
+class ConfigFarmChannelsV2(discord.ui.LayoutView):
+    def __init__(self):
+        super().__init__(timeout=600)
+        channels = discord.ui.Container(
+            discord.ui.TextDisplay(
+                "## 🌾 Configurar canais do Farm\n"
+                "Escolha os canais. O painel público recebe os registros; o canal privado recebe as cobranças e comprovantes."
+            ),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay("**1. Canal público**"),
+            discord.ui.ActionRow(ConfigTextChannelSelect("farm_panel_channel_id", "Selecione o canal público do Farm")),
+            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_panel_channel_id")),
+            discord.ui.TextDisplay("**2. Canal privado da liderança**"),
+            discord.ui.ActionRow(ConfigTextChannelSelect("farm_private_channel_id", "Selecione o canal privado de cobranças")),
+            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_private_channel_id")),
+        )
+        approval = discord.ui.Container(
+            discord.ui.TextDisplay("## 🔐 Permissões e histórico"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay("**3. Cargo autorizado a aprovar, pagar ou recusar**"),
+            discord.ui.ActionRow(ConfigSingleRoleSelect("farm_approver_role_id", "Selecione o cargo da liderança", row=0)),
+            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_approver_role_id")),
+            discord.ui.TextDisplay("**4. Canal de histórico final (opcional)**"),
+            discord.ui.ActionRow(ConfigTextChannelSelect("farm_log_channel_id", "Selecione o canal de histórico do Farm")),
+            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_log_channel_id")),
+        )
+        self.add_item(channels)
+        self.add_item(approval)
+
+
+class HierarchyGuideV2(discord.ui.LayoutView):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=900)
+        self.guild = guild
+        container = discord.ui.Container(
+            discord.ui.TextDisplay(
+                "## 🏛️ Hierarquia\n"
+                "A configuração é feita do **cargo mais baixo para o mais alto**.\n\n"
+                "**1.** Informe a quantidade de cargos.\n"
+                "**2.** Selecione cada cargo ou informe seu ID.\n"
+                "**3.** Defina a abreviação de cada cargo.\n"
+                "**4.** Escolha o canal e publique.\n\n"
+                "O bot usa sempre o cargo mais alto que o membro possuir e atualiza o apelido no formato `[TAG] NOME - ID`."
+            ),
+            discord.ui.Separator(),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Configurar do zero", emoji="⚙️", style=discord.ButtonStyle.success, custom_id="fac:hierarchyv2:start"),
+                discord.ui.Button(label="Apagar configuração", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="fac:hierarchyv2:reset"),
+            ),
+        )
+        self.add_item(container)
+        row = container.children[-1]
+        row.children[0].callback = self.start
+        row.children[1].callback = self.reset
+
+    async def start(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(HierarchyCountModal(self.guild))
+
+    async def reset(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "⚠️ **Confirma a exclusão?** Serão apagados os cargos, tags, canal salvo e as mensagens publicadas da hierarquia.",
+            view=HierarchyResetConfirmView(self.guild), ephemeral=True
+        )
+
+
+class ConfigPanelV2(discord.ui.LayoutView):
+    """Painel principal de configuração usando Discord Components V2."""
+    def __init__(self):
+        super().__init__(timeout=900)
+        container = discord.ui.Container(
+            discord.ui.TextDisplay("# ⚙️ GERENTE-DE-FAC\nConfigure os módulos da facção por etapas.\n\n**Escolha o que deseja configurar:**"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay("📋 **WL** — painel e cadastro de membros\n🏛️ **Hierarquia** — cargos, tags e publicação\n🌾 **Farm** — itens, valores, canais e cobranças\n🧾 **Publicação** — enviar os painéis configurados"),
+            discord.ui.Separator(),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="WL", emoji="📋", style=discord.ButtonStyle.primary, custom_id="fac:configv2:wl"),
+                discord.ui.Button(label="Hierarquia", emoji="🏛️", style=discord.ButtonStyle.primary, custom_id="fac:configv2:hierarchy"),
+                discord.ui.Button(label="Farm", emoji="🌾", style=discord.ButtonStyle.primary, custom_id="fac:configv2:farm"),
+            ),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Publicar WL", emoji="📨", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-wl"),
+                discord.ui.Button(label="Publicar hierarquia", emoji="🏛️", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-hierarchy"),
+                discord.ui.Button(label="Publicar Farm", emoji="🌾", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-farm"),
+            ),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Outras configurações", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="fac:configv2:other"),
+            ),
+        )
+        self.add_item(container)
+        for item in container.children:
+            if isinstance(item, discord.ui.ActionRow):
+                for button in item.children:
+                    button.callback = self._make_callback(button.custom_id)
+
+    def _make_callback(self, action):
+        async def callback(interaction: discord.Interaction):
+            if not await deny_unless_config_access(interaction):
+                return
+            if action == "fac:configv2:wl":
+                await interaction.response.send_modal(ConfigWLPanelModal())
+            elif action == "fac:configv2:hierarchy":
+                if not interaction.guild:
+                    await interaction.response.send_message("Use no servidor.", ephemeral=True)
+                    return
+                await interaction.response.send_message(
+                    "## 🏛️ Configuração da hierarquia\n"
+                    "Configure do **cargo mais baixo para o mais alto**. Para cada cargo, selecione na lista ou informe o ID. "
+                    "Depois defina a abreviação e o canal de publicação.\n\n"
+                    "O bot usa sempre o cargo mais alto do membro para montar `[TAG] NOME - ID`.",
+                    view=HierarchyGuideV2(interaction.guild), ephemeral=True
+                )
+            elif action == "fac:configv2:farm":
+                await interaction.response.send_message(view=FarmItemSetupV2(), ephemeral=True)
+            elif action == "fac:configv2:publish-wl":
+                await publish_configured_panel(interaction, "wl")
+            elif action == "fac:configv2:publish-hierarchy":
+                if not interaction.guild:
+                    await interaction.response.send_message("Use no servidor.", ephemeral=True)
+                    return
+                view = HierarchyPublishChannelView(interaction.guild)
+                await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+            elif action == "fac:configv2:publish-farm":
+                await publish_configured_panel(interaction, "farm")
+            elif action == "fac:configv2:other":
+                await interaction.response.send_message(
+                    "## 🛠️ Outras configurações\nEscolha uma área para continuar.",
+                    view=ConfigPanelView(), ephemeral=True
+                )
+        return callback
+
+
 @bot.tree.command(name="config", description="Abre o painel interativo de configuração da facção")
 async def config(interaction: discord.Interaction) -> None:
     if not await deny_unless_config_access(interaction):
         return
-    await interaction.response.send_message(embed=config_embed(interaction.guild), view=ConfigPanelView(), ephemeral=True)
+    await interaction.response.send_message(view=ConfigPanelV2(), ephemeral=True)
 
 
 @bot.tree.command(name="painel-wl", description="Publica o painel WL no canal configurado")
