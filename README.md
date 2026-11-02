@@ -1,8 +1,8 @@
 # FacControl FiveM RP — Bot para Discord
 
-Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com fluxo de whitelist (WL), recrutadores autorizados, registros de farm e armazenamento de comprovantes em SQLit.
+Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com fluxo de whitelist (WL), recrutadores autorizados, registros de farm e armazenamento de comprovantes em SQLite.
 
-> **Status:** versão inicial organizada para publicação no GitHub. A sintaxe Python foi verificada; configure e teste no seu próprio servidor Discord antes de usar em produção. Nem todos os recursos planejados estão completos — veja [Limitações conhecidas](#limitações-conhecidas).
+> **Status:** versão revisada com recuperação progressiva para HTTP 429 no login, healthcheck iniciado antes da autenticação e exemplo de ambiente sem credenciais reais. Configure e teste no seu servidor Discord antes de usar em produção.
 
 ## Recursos incluídos
 
@@ -33,8 +33,8 @@ Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com f
 1. Baixe este repositório ou clone-o:
 
    ```bash
-   git clone https://github.com/SEU-USUARIO/SEU-REPOSITORIO.git
-   cd SEU-REPOSITORIO
+   git clone https://github.com/gustavoconceicao256-bot/GERENTE-DE-FAC.git
+   cd GERENTE-DE-FAC
    ```
 
 2. Crie e ative um ambiente virtual:
@@ -138,6 +138,18 @@ No botão **Hierarquia**, informe a quantidade de patentes. Na tela seguinte, ma
 - As telas de configuração ainda não foram integralmente migradas para Discord Components V2; parte dos fluxos usa Views/Embeds tradicionais. Essa migração precisa ser concluída e validada em servidor de teste antes de considerar o redesign visual final.
 - O comprovante de farm é salvo como imagem. Item e quantidade são informados pelo jogador no fluxo do painel; o bot não tenta interpretar os dados escritos dentro da imagem. O comando `/farm-item` cria/atualiza os itens e `/farm-item-desativar` desativa opções. O comando antigo `/farm` apenas orienta a usar o painel para garantir que todo registro tenha prova.
 - O comportamento real depende de IDs, permissões, intents e configurações válidas. Teste primeiro em um servidor de desenvolvimento.
+
+## Resolver erro do Render: `429 Too Many Requests` (limite global)
+
+A inicialização agora trata respostas HTTP 429 durante o login com espera progressiva: 30 s, 60 s, 120 s e assim por diante, até 15 minutos entre tentativas. O healthcheck HTTP é iniciado antes da autenticação quando a variável `PORT` existe, para que um Web Service não pareça indisponível enquanto aguarda o bloqueio expirar.
+
+**Atenção:** o código não consegue remover um bloqueio global aplicado pelo Discord nem impedir outro processo de usar o mesmo token. Para resolver a causa:
+
+1. No Render, mantenha somente uma instância/serviço ativo para este bot.
+2. Pare temporariamente outras cópias do bot que usem o mesmo token (PC, outro host ou outro serviço).
+3. Não use Restart repetidamente durante o bloqueio; deixe o processo aguardar a próxima tentativa automática.
+4. Se o token foi publicado no GitHub ou em qualquer arquivo público, regenere-o no Discord Developer Portal e atualize `DISCORD_TOKEN` no Render.
+5. Se o 429 persistir, aguarde o bloqueio expirar e verifique se não há outra aplicação compartilhando o mesmo token/IP.
 
 ## Resolver erro do Render: `403 Forbidden (50001): Missing Access`
 

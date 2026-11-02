@@ -2719,6 +2719,8 @@ _render_http_runner = None
 async def start_render_health_server() -> None:
     """Abre uma rota HTTP mínima quando o host fornece PORT (ex.: Render Web Service)."""
     global _render_http_runner
+    if _render_http_runner is not None:
+        return  # Evita abrir duas vezes a mesma porta durante uma recuperação.
     raw_port = os.getenv("PORT", "").strip()
     if not raw_port:
         return  # Background Worker: não precisa de uma porta HTTP.
@@ -3716,9 +3718,62 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except discord.HTTPException:
         pass
 
-if __name__ == "__main__":
+async def run_bot_with_recovery() -> None:
+    """Mantém o processo vivo durante bloqueios 429 temporários no login.
+
+    Um 429 global pode ocorrer antes de o gateway conectar. Sem este laço,
+    bot.run() encerra o processo e o Render pode reiniciá-lo em sequência,
+    repetindo a tentativa enquanto o bloqueio ainda está ativo.
+    """
+    retry_delay = 30
+    max_retry_delay = 900  # 15 minutos; evita martelar a API durante bloqueios longos.
+
+    # Inicia o healthcheck antes do login para o Render não interpretar a
+    # espera por rate limit como um processo morto em Web Service.
+    await start_render_health_server()
+
+    while not bot.is_closed():
+        try:
+            await bot.start(TOKEN, reconnect=True)
+            return  # Saída normal (por exemplo, encerramento solicitado).
+        except discord.HTTPException as exc:
+            if exc.status != 429:
+                raise
+            log.error(
+                "Discord recusou o login com HTTP 429 (limite global). "
+                "Nova tentativa em %s segundos. Não reinicie manualmente o serviço.",
+                retry_delay,
+            )
+            # Descarta a sessão HTTP da tentativa anterior antes de tentar de novo.
+            try:
+                await bot.http.close()
+            except Exception:
+                log.debug("Não foi possível fechar a sessão HTTP anterior.", exc_info=True)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+        except (OSError, asyncio.TimeoutError) as exc:
+            log.warning(
+                "Falha temporária de rede ao iniciar o bot (%s). Nova tentativa em %s segundos.",
+                exc, retry_delay,
+            )
+            try:
+                await bot.http.close()
+            except Exception:
+                log.debug("Não foi possível fechar a sessão HTTP anterior.", exc_info=True)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+
+
+async def main() -> None:
     if not TOKEN or TOKEN == "SEU_TOKEN_AQUI":
-        raise SystemExit("Configure DISCORD_TOKEN no arquivo .env antes de iniciar o bot.")
+        raise SystemExit("Configure DISCORD_TOKEN nas variáveis de ambiente do Render ou no arquivo .env.")
     init_db()
     remove_legacy_gtt_branding()
-    bot.run(TOKEN)
+    await run_bot_with_recovery()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Encerramento solicitado pelo usuário.")
