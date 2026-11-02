@@ -1,6 +1,6 @@
 # FacControl FiveM RP — Bot para Discord
 
-Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com fluxo de whitelist (WL), recrutadores autorizados, registros de farm e armazenamento de comprovantes em SQLite.
+Bot Discord em Python para gerenciamento de facção de servidor FiveM RP, com fluxo de whitelist (WL), recrutadores autorizados, registros de farm e armazenamento de comprovantes em SQLit.
 
 > **Status:** versão inicial organizada para publicação no GitHub. A sintaxe Python foi verificada; configure e teste no seu próprio servidor Discord antes de usar em produção. Nem todos os recursos planejados estão completos — veja [Limitações conhecidas](#limitações-conhecidas).
 
