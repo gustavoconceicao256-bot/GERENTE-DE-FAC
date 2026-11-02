@@ -25,7 +25,7 @@ load_dotenv()
 # ---------------- CONFIGURAÇÃO ----------------
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0") or 0)
-FACTION_NAME = os.getenv("FACTION_NAME", "Facção RP")
+FACTION_NAME = re.sub(r"\bGTT\b", "", os.getenv("FACTION_NAME", "Facção RP"), flags=re.IGNORECASE).strip(" -—|") or "Facção RP"
 DB_PATH = os.getenv("DATABASE_PATH", "fac_control.sqlite3")
 
 MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID", "1523371849487220828") or 1523371849487220828)
@@ -568,10 +568,9 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
     if approve and member:
         try:
             # Patente mais alta e abreviação configurável por cargo; fallback seguro para M.
-            # Patente mais alta e abreviação configurável por cargo; fallback seguro para M.
             rank_role, abbreviation = highest_configured_rank(member)
             prefix = abbreviation or "M"
-            nickname = f"[ {prefix} ] {request['character_name'].upper()} - {request['game_id']}"[:32]
+            nickname = build_member_nickname(request["character_name"], request["game_id"], prefix)
             await member.edit(nick=nickname, reason=f"WL aprovada por recrutador {interaction.user}")
         except discord.Forbidden:
             log.warning("Sem permissão para atualizar cargo/nickname do membro %s", member.id)
@@ -661,6 +660,15 @@ class RegistrationApprovalView(View):
         if not can_decide_wl(interaction):
             await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar WL.", ephemeral=True); return
         await interaction.response.send_modal(RegistrationRejectModal(request_id))
+
+
+def build_member_nickname(character_name: str, game_id: str, abbreviation: str) -> str:
+    """Monta [TAG] NOME - ID sem cortar o ID no limite de 32 caracteres do Discord."""
+    prefix = f"[ {abbreviation or 'M'} ] "
+    suffix = f" - {game_id}"
+    available = max(1, 32 - len(prefix) - len(suffix))
+    safe_name = str(character_name or "Membro").upper()[:available].rstrip()
+    return f"{prefix}{safe_name}{suffix}"[:32]
 
 
 def highest_configured_rank(member: discord.Member):
@@ -1049,7 +1057,7 @@ def panel_embed(kind: str) -> discord.Embed:
         return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
     if kind == "hierarchy":
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
-        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do cargo mais alto ao mais baixo.")
+        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do cargo mais baixo ao mais alto.")
         return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
     # Os demais painéis continuam disponíveis pelos comandos existentes, mas não são apresentados no /config simplificado.
     if kind == "members":
@@ -1309,8 +1317,7 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         visible_ids = {role.id for role in self.page_roles}
-        # Mantém a ordem em que os cargos são adicionados: primeiro cargo selecionado
-        # ocupa a base da hierarquia; os próximos são empilhados acima dele.
+        # Mantém a ordem de seleção: primeiro é o cargo mais baixo; o último é o mais alto.
         self.parent_view.selected_role_ids = [
             rid for rid in self.parent_view.selected_role_ids if rid not in visible_ids
         ]
@@ -1322,6 +1329,14 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
                         self.parent_view.selected_role_ids.append(rid)
                 except ValueError:
                     pass
+        self.parent_view.selected_role_ids.sort(
+            key=lambda rid: (
+                self.parent_view.guild.get_role(rid).position
+                if self.parent_view.guild.get_role(rid) else -1,
+                self.parent_view.guild.get_role(rid).name.casefold()
+                if self.parent_view.guild.get_role(rid) else "",
+            )
+        )
         self.parent_view._persist_selected_roles()
         self.parent_view._refresh_remove_selector()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
@@ -1340,6 +1355,10 @@ class ConfigHierarchyAddRoleModal(Modal, title="Adicionar cargo por ID"):
             return
         if role.id not in self.parent_view.selected_role_ids:
             self.parent_view.selected_role_ids.append(role.id)
+        self.parent_view.selected_role_ids.sort(
+            key=lambda rid: self.parent_view.guild.get_role(rid).position
+            if self.parent_view.guild.get_role(rid) else -1
+        )
         self.parent_view._persist_selected_roles()
         self.parent_view._refresh_role_page()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
@@ -1379,7 +1398,7 @@ class ConfigHierarchySetupView(View):
         self.roles = sorted(
             (role for role in guild.roles if role != guild.default_role),
             key=lambda role: (role.position, role.name.casefold()),
-            reverse=True,
+            reverse=False,
         )
         self.page_index = 0
         with db() as con:
@@ -1394,7 +1413,7 @@ class ConfigHierarchySetupView(View):
             except (ValueError, TypeError):
                 continue
         self.selected_role_ids: list[int] = [
-            role_id for _priority, role_id in sorted(saved_roles, reverse=True)
+            role_id for _priority, role_id in sorted(saved_roles)
         ]
         self.role_selector = ConfigHierarchyRolePageSelect(self)
         self.add_item(self.role_selector)
@@ -1417,7 +1436,7 @@ class ConfigHierarchySetupView(View):
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             for idx, role in enumerate(selected_roles):
-                priority = len(selected_roles) - idx
+                priority = idx + 1
                 words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
                 abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
                 con.execute(
@@ -1457,7 +1476,7 @@ class ConfigHierarchySetupView(View):
             description=(
                 "Selecione os cargos no menu. Não existe limite de quantidade pré-definida. "
                 "Use o menu **Remover cargo** para retirar uma seleção incorreta; o botão Reiniciar limpa tudo.\n\n"
-                "A ordem de seleção define a hierarquia: primeiro = base; último = topo."
+                "A ordem de seleção define a hierarquia: selecione primeiro o cargo mais baixo e termine no cargo mais alto."
             ),
             color=discord.Color.from_rgb(76, 86, 180),
         )
@@ -1584,8 +1603,10 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         save_config_value("farm_panel_photo_url", photo)
         save_config_value("farm_panel_banner_url", banner)
         await interaction.response.send_message(
-            "✅ Aparência do painel salva. O Farm agora sempre gera uma cobrança para a liderança decidir: pagamento com comprovante ou recusa justificada. Configure o preço dos itens e os canais abaixo.",
-            view=ConfigFarmChannelsV2(), ephemeral=True,
+            view=ConfigFarmChannelsV2(
+                success_message="✅ Aparência do painel salva. Agora configure os canais e as permissões do Farm abaixo."
+            ),
+            ephemeral=True,
         )
 
 
@@ -2049,7 +2070,7 @@ class HierarchyRoleIdsModal(Modal):
         self.inputs = []
         for index in range(start, end):
             field = TextInput(
-                label=f"Cargo {index + 1} — {'MAIS ALTO' if index == 0 else 'ID do cargo'}",
+                label=f"Cargo {index + 1} — {'MAIS BAIXO' if index == 0 else ('MAIS ALTO' if index == len(parent.role_ids) - 1 else 'ID do cargo')}",
                 placeholder="Cole o ID do cargo do Discord",
                 required=True, max_length=25
             )
@@ -2156,17 +2177,17 @@ class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
 
 
 class HierarchyRoleConfigView(View):
-    """Seleciona cargos do servidor em páginas, do cargo mais alto ao mais baixo."""
+    """Seleciona cargos do servidor em páginas, do cargo mais baixo ao mais alto."""
     def __init__(self, guild, count):
         super().__init__(timeout=900)
         self.guild, self.count = guild, count
         self.role_ids = [None] * count
         self.owner_id = 0
-        # Lista de cima para baixo: primeiro o cargo mais alto do servidor.
+        # Ordem de seleção: primeiro o cargo mais baixo; último o mais alto.
         self.available_roles = sorted(
             (role for role in guild.roles if role != guild.default_role),
             key=lambda role: (role.position, role.name.casefold()),
-            reverse=True,
+            reverse=False,
         )
         self.role_page = 0
         self.role_picker = HierarchyRolePicker(self)
@@ -2209,7 +2230,7 @@ class HierarchyRoleConfigView(View):
         e = discord.Embed(
             title="Etapa 2 — Seleção de cargos",
             description=(
-                "Use o menu para selecionar os cargos na ordem **do mais alto para o mais baixo**. "
+                "Use o menu para selecionar os cargos na ordem **do mais baixo para o mais alto**. "
                 "As setas mudam a página do menu e percorrem todos os cargos do servidor.\n\n"
                 + "\n".join(lines)
             ),
@@ -2360,9 +2381,9 @@ class HierarchyTagConfigView(View):
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             total = len(self.role_ids)
-            # O primeiro cargo da lista é o mais alto e recebe a maior prioridade.
+            # A seleção começa no cargo mais baixo e termina no mais alto.
             for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
-                priority = total - idx
+                priority = idx + 1
                 con.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?)",
                     (f"rank_role_{rid}", f"{tag}|{priority}")
@@ -2692,9 +2713,25 @@ async def start_render_health_server() -> None:
     log.info("Servidor de healthcheck HTTP iniciado em 0.0.0.0:%s (/health).", port)
 
 
+
+def remove_legacy_gtt_branding() -> None:
+    """Limpa menções antigas a GTT de títulos e descrições salvos no banco."""
+    try:
+        with db() as con:
+            rows = con.execute("SELECT key,value FROM settings").fetchall()
+            for row in rows:
+                value = re.sub(r"\bGTT\b", "", str(row["value"]), flags=re.IGNORECASE)
+                value = re.sub(r"\s{2,}", " ", value).strip(" -—|")
+                if value != row["value"]:
+                    con.execute("UPDATE settings SET value=? WHERE key=?", (value, row["key"]))
+    except sqlite3.Error:
+        log.exception("Falha ao limpar nomes antigos da organização nas configurações")
+
+
 @bot.event
 async def setup_hook() -> None:  # type: ignore[override]
     init_db()
+    remove_legacy_gtt_branding()
     await start_render_health_server()
     apply_saved_settings()
     bot.add_view(RegistrationPanelView())
@@ -2772,7 +2809,7 @@ async def sync_configured_member_nickname(member: discord.Member, reason: str = 
         return
     with db() as con:
         con.execute("UPDATE members SET rank_name=? WHERE discord_id=?", (rank_role.name, str(member.id)))
-    nickname = f"[ {abbreviation or 'M'} ] {row['character_name'].upper()} - {row['game_id']}"[:32]
+    nickname = build_member_nickname(row["character_name"], row["game_id"], abbreviation or "M")
     if member.nick == nickname:
         return
     try:
@@ -2870,7 +2907,7 @@ class FarmItemSetupV2(discord.ui.LayoutView):
             discord.ui.TextDisplay(summary),
             discord.ui.ActionRow(
                 discord.ui.Button(label="Adicionar item", emoji="➕", style=discord.ButtonStyle.success, custom_id="fac:farmv2:add"),
-                discord.ui.Button(label="Configurar canais e painel", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"),
+                discord.ui.Button(label="Próximo", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"),
             ),
         ])
         container = discord.ui.Container(*parts)
@@ -2894,9 +2931,10 @@ class FarmItemSetupV2(discord.ui.LayoutView):
 
 
 class ConfigFarmChannelsV2(discord.ui.LayoutView):
-    def __init__(self):
+    def __init__(self, success_message: str = ""):
         super().__init__(timeout=600)
         channels = discord.ui.Container(
+            *([discord.ui.TextDisplay(success_message), discord.ui.Separator()] if success_message else []),
             discord.ui.TextDisplay(
                 "## 🌾 Configurar canais do Farm\n"
                 "Escolha os canais. O painel público recebe os registros; o canal privado recebe as cobranças e comprovantes."
@@ -2930,7 +2968,7 @@ class HierarchyGuideV2(discord.ui.LayoutView):
         container = discord.ui.Container(
             discord.ui.TextDisplay(
                 "## 🏛️ Hierarquia\n"
-                "A configuração é feita do **cargo mais alto para o mais baixo**.\n\n"
+                "A configuração é feita do **cargo mais baixo para o mais alto**.\n\n"
                 "**1.** Informe a quantidade de cargos.\n"
                 "**2.** Selecione cada cargo ou informe seu ID.\n"
                 "**3.** Defina a abreviação de cada cargo.\n"
@@ -3415,4 +3453,5 @@ if __name__ == "__main__":
     if not TOKEN or TOKEN == "SEU_TOKEN_AQUI":
         raise SystemExit("Configure DISCORD_TOKEN no arquivo .env antes de iniciar o bot.")
     init_db()
+    remove_legacy_gtt_branding()
     bot.run(TOKEN)

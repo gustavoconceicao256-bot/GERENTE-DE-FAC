@@ -1,18 +1,22 @@
-ATUALIZACOES DESTA VERSAO
+ATUALIZAÇÕES DESTA VERSÃO
 
-- O seletor de cargos apresenta a hierarquia do mais alto para o mais baixo.
-- A paginação pelas setas percorre todos os cargos do servidor, em páginas de até 25 opções.
-- A ordem escolhida é mantida entre a seleção dos cargos e a configuração das tags.
-- A prioridade salva considera o primeiro cargo configurado como o mais alto.
-- Ao salvar as tags de um bloco, a tela avança automaticamente para o próximo bloco.
-- Os botões da etapa de tags agora são somente: Definir tag, Voltar, Recomeçar e Próximo.
-- Voltar retorna ao bloco anterior; no primeiro bloco, retorna à seleção de cargos.
-- Próximo navega entre blocos e, no último, conclui as tags e avança para a etapa do canal.
-- Mantida a correção do erro Components V2: respostas que usam LayoutView não enviam o campo legado content.
-- Mantida a imagem fixa assets/painel_configuracao.png no painel principal.
-- Removido o botão Outras configurações do painel.
+HIERARQUIA
+- A seleção e a configuração agora seguem do cargo mais baixo para o mais alto.
+- A prioridade gravada aumenta de 1 em diante; o maior valor representa o cargo mais alto.
+- O bot identifica o cargo configurado de maior prioridade entre os cargos que o membro possui.
+- O apelido usa [TAG] NOME - ID e preserva o ID no final dentro do limite de 32 caracteres do Discord.
+- A seleção por menu e por ID mantém a ordem da hierarquia.
 
-VALIDACOES
-- bot.py compilado com sucesso usando compile(...).
-- Integridade do arquivo ZIP verificada após a geração.
-- As interações reais ainda precisam ser testadas no servidor Discord/Render.
+FARM
+- Corrigido o envio da etapa de canais: LayoutView/Components V2 não recebe mais texto no campo content.
+- A mensagem de confirmação agora fica dentro do próprio LayoutView.
+- O botão da etapa de itens foi renomeado para Próximo.
+
+IDENTIDADE
+- Menções antigas a GTT em títulos e descrições salvos nas configurações são removidas na inicialização.
+- O nome de usuário/apelido global do bot no Discord precisa ser alterado no perfil do bot; a API de mensagens não altera esse nome.
+
+VALIDAÇÃO
+- Compilação sintática do bot.py aprovada.
+- Verificação funcional isolada do formato do apelido aprovada.
+- O bot não foi conectado ao Discord nesta validação; faça o deploy e teste as interações no servidor.

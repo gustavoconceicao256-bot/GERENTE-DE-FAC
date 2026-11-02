@@ -81,3 +81,7 @@ Exemplo de nickname: `[ LT ] GUSTAVO BOBO - 1908`. Quando o membro recebe ou per
 A configuração é persistida no SQLite. O botão **Apagar configuração anterior** solicita confirmação e, após confirmado, remove os cargos/tags/canal salvos e limpa as mensagens do canal anteriormente configurado. O botão de publicação também limpa o canal escolhido antes de publicar a hierarquia nova.
 
 **Permissões necessárias:** habilite `Server Members Intent` no Developer Portal e conceda ao bot `View Channel`, `Send Messages`, `Embed Links`, `Read Message History` e `Manage Messages` no canal da hierarquia. O cargo do bot deve ficar acima dos cargos que ele precisa atribuir/gerenciar e ter `Manage Nicknames` para editar apelidos.
+
+
+## Nome exibido do bot
+O nome global exibido pelo Discord (por exemplo, o nome do usuário do bot) deve ser alterado no perfil/aplicação do bot no Discord Developer Portal. O código remove GTT de títulos e descrições salvos, mas não pode renomear a conta do bot.
