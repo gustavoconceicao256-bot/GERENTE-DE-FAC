@@ -1182,9 +1182,10 @@ class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
     setting_key = TextInput(label="Chave da configuração", max_length=80, required=True, placeholder="Ex.: farm_log_channel_id")
     object_id = TextInput(label="ID do cargo ou canal", max_length=25, required=True, placeholder="Cole o ID numérico")
 
-    def __init__(self, preset_key: str = ""):
+    def __init__(self, preset_key: str = "", *, farm_return: bool = False):
         super().__init__(timeout=300)
         self.setting_key.default = preset_key[:80] if preset_key else None
+        self.farm_return = farm_return
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         key = self.setting_key.value.strip()
@@ -1211,17 +1212,47 @@ class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
                 await interaction.response.send_message("Esse ID não corresponde a um cargo deste servidor.", ephemeral=True)
                 return
             label = f"cargo {obj.mention}"
+        if self.farm_return and key in FARM_CONFIG_FIELDS:
+            field_kind = FARM_CONFIG_FIELDS[key][1]
+            if field_kind == "channel" and not isinstance(obj, discord.TextChannel):
+                await interaction.response.send_message(
+                    "Para o Farm, informe um canal de texto deste servidor.", ephemeral=True
+                )
+                return
+            if field_kind == "role" and obj.is_default():
+                await interaction.response.send_message(
+                    "O cargo @everyone não pode ser usado como cargo autorizador do Farm.", ephemeral=True
+                )
+                return
         save_config_value(key, str(object_id))
+        if self.farm_return and key in FARM_CONFIG_FIELDS:
+            if interaction.guild is None:
+                await interaction.response.send_message(
+                    "Use este formulário dentro do servidor.", ephemeral=True
+                )
+                return
+            await interaction.response.send_message(
+                view=ConfigFarmChannelsV2(
+                    interaction.guild,
+                    selected_key=key,
+                    success_message=f"✅ **{FARM_CONFIG_FIELDS[key][0]}** salvo usando {label}.",
+                ),
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message(f"✅ Configuração **{key}** salva usando {label}.", ephemeral=True)
 
 
 class ConfigManualIdButton(discord.ui.Button):
-    def __init__(self, *, row: int = 4, preset_key: str = ""):
+    def __init__(self, *, row: int = 4, preset_key: str = "", farm_return: bool = False):
         super().__init__(label="Informar ID manualmente", style=discord.ButtonStyle.secondary, emoji="🔢", row=row)
         self.preset_key = preset_key
+        self.farm_return = farm_return
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(ConfigManualIdModal(self.preset_key))
+        await interaction.response.send_modal(
+            ConfigManualIdModal(self.preset_key, farm_return=self.farm_return)
+        )
 
 
 class ConfigWLChannelsView(View):
@@ -3012,8 +3043,58 @@ class FarmConfigPageButton(discord.ui.Button):
         )
 
 
+class FarmSendPanelButton(discord.ui.Button):
+    def __init__(self, parent: "ConfigFarmChannelsV2"):
+        super().__init__(
+            label="ENVIAR PAINEL",
+            emoji="📨",
+            style=discord.ButtonStyle.success,
+            row=3,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await deny_unless_config_access(interaction):
+            return
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "Use esta configuração dentro do servidor.", ephemeral=True
+            )
+            return
+
+        required = (
+            ("farm_panel_channel_id", "Canal público do Farm", "channel"),
+            ("farm_private_channel_id", "Canal privado da liderança", "channel"),
+            ("farm_approver_role_id", "Cargo autorizado a aprovar, pagar ou recusar", "role"),
+        )
+        missing = []
+        for key, label, kind in required:
+            raw_id = panel_setting(key, "0")
+            try:
+                object_id = int(raw_id or 0)
+            except (TypeError, ValueError):
+                object_id = 0
+            obj = guild.get_role(object_id) if kind == "role" and object_id else (
+                guild.get_channel(object_id) if object_id else None
+            )
+            if obj is None:
+                missing.append(label)
+
+        if missing:
+            await interaction.response.send_message(
+                "Ainda faltam configurações obrigatórias válidas:\n"
+                + "\n".join(f"• {label}" for label in missing)
+                + "\nSelecione cada campo acima para definir ou corrigir.",
+                ephemeral=True,
+            )
+            return
+
+        await publish_configured_panel(interaction, "farm")
+
+
 class ConfigFarmChannelsV2(discord.ui.LayoutView):
-    """Configuração paginada para listar todos os canais de texto e cargos do servidor."""
+    """Configuração paginada com resumo dos campos salvos e possibilidade de redefinir qualquer campo."""
     PAGE_SIZE = 25
 
     def __init__(self, guild: discord.Guild | None, success_message: str = "",
@@ -3046,27 +3127,83 @@ class ConfigFarmChannelsV2(discord.ui.LayoutView):
                 description="Verifique as permissões e o servidor",
             )]
 
+        summary_lines = self._build_current_summary()
+        required_keys = (
+            "farm_panel_channel_id",
+            "farm_private_channel_id",
+            "farm_approver_role_id",
+        )
+        complete_count = sum(1 for key in required_keys if self._resolve_saved_object(key) is not None)
+        all_required_ready = complete_count == len(required_keys)
+
         parts = []
         if success_message:
             parts.extend([discord.ui.TextDisplay(success_message), discord.ui.Separator()])
         parts.extend([
+            discord.ui.TextDisplay("## ✅ Configurações já definidas\n" + "\n".join(summary_lines)),
             discord.ui.TextDisplay(
-                "## 🌾 Configurar canais do Farm\n"
-                "Escolha uma das quatro configurações e selecione o canal ou cargo. "
-                "Use as setas para percorrer todas as opções do servidor, em páginas de até 25 itens."
+                f"**Obrigatórias concluídas: {complete_count}/3** · "
+                "O canal de histórico é opcional."
             ),
             discord.ui.Separator(),
-            discord.ui.TextDisplay(f"**Configuração atual:** {label}"),
+            discord.ui.TextDisplay(
+                "## 🌾 Configurar canais do Farm\n"
+                "Escolha abaixo qual campo deseja definir ou **redefinir**. "
+                "O resumo acima é atualizado conforme você salva cada opção."
+            ),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(f"**Editando agora:** {label}"),
             discord.ui.ActionRow(FarmConfigFieldSelect(self)),
             discord.ui.ActionRow(FarmConfigTargetSelect(self, options)),
-            discord.ui.TextDisplay(f"Página **{self.page + 1}/{page_count}** · {len(objects)} opção(ões) encontradas"),
+            discord.ui.TextDisplay(
+                f"Página **{self.page + 1}/{page_count}** · "
+                f"{len(objects)} opção(ões) encontradas"
+            ),
             discord.ui.ActionRow(
                 FarmConfigPageButton(self, -1, disabled=(self.page == 0)),
                 FarmConfigPageButton(self, 1, disabled=(self.page >= page_count - 1)),
-                ConfigManualIdButton(row=2, preset_key=self.selected_key),
+                ConfigManualIdButton(
+                    row=2, preset_key=self.selected_key, farm_return=True
+                ),
             ),
         ])
+        if all_required_ready:
+            parts.append(discord.ui.ActionRow(FarmSendPanelButton(self)))
+        else:
+            parts.append(discord.ui.TextDisplay(
+                "🔒 **ENVIAR PAINEL** será liberado quando o canal público, "
+                "o canal privado e o cargo autorizador estiverem definidos."
+            ))
         self.add_item(discord.ui.Container(*parts))
+
+    def _resolve_saved_object(self, key: str):
+        if not self.guild:
+            return None
+        raw_id = panel_setting(key, "0")
+        try:
+            object_id = int(raw_id or 0)
+        except (TypeError, ValueError):
+            return None
+        if object_id <= 0:
+            return None
+        _label, kind = FARM_CONFIG_FIELDS[key]
+        if kind == "role":
+            role = self.guild.get_role(object_id)
+            return role if role and not role.is_default() else None
+        channel = self.guild.get_channel(object_id)
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    def _build_current_summary(self) -> list[str]:
+        summary = []
+        for key, (label, kind) in FARM_CONFIG_FIELDS.items():
+            obj = self._resolve_saved_object(key)
+            optional = " *(opcional)*" if key == "farm_log_channel_id" else ""
+            if obj is None:
+                summary.append(f"▫️ **{label}:** Não definido{optional}")
+            else:
+                display = obj.mention if hasattr(obj, "mention") else f"`{obj.name}`"
+                summary.append(f"✅ **{label}:** {display}{optional}")
+        return summary
 
     def _get_objects(self, kind: str):
         if not self.guild:

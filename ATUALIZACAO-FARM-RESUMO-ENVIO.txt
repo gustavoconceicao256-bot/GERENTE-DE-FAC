@@ -1,0 +1,19 @@
+ATUALIZAÇÃO — CONFIGURAÇÃO FINAL DO FARM
+
+- O topo da etapa mostra o estado atual dos quatro campos:
+  1. Canal público do Farm (obrigatório)
+  2. Canal privado da liderança (obrigatório)
+  3. Cargo autorizado a aprovar, pagar ou recusar (obrigatório)
+  4. Canal de histórico final (opcional)
+- O resumo é atualizado após cada seleção.
+- O seletor permite escolher novamente qualquer campo, então uma configuração incorreta pode ser redefinida.
+- O formulário de ID manual retorna para a tela de configuração já atualizada.
+- O botão ENVIAR PAINEL aparece quando os três campos obrigatórios apontam para canais/cargo válidos do servidor.
+- Ao clicar, o painel Farm é publicado no canal público configurado.
+- IDs manuais de canais do Farm agora exigem canal de texto; @everyone não pode ser o cargo autorizador.
+
+Validação executada:
+- Compilação sintática de bot.py: aprovada.
+- Análise AST: aprovada.
+- Integridade do ZIP: verificada após empacotamento.
+- Não houve teste conectado a um servidor Discord nesta execução.
