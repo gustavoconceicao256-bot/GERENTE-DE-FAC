@@ -2895,11 +2895,9 @@ class ConfigPanelV2(discord.ui.LayoutView):
                 if not interaction.guild:
                     await interaction.response.send_message("Use no servidor.", ephemeral=True)
                     return
+                # Components V2 não aceita o campo legado "content".
+                # Todo o texto da tela fica dentro do LayoutView/Container.
                 await interaction.response.send_message(
-                    "## 🏛️ Configuração da hierarquia\n"
-                    "Configure do **cargo mais baixo para o mais alto**. Para cada cargo, selecione na lista ou informe o ID. "
-                    "Depois defina a abreviação e o canal de publicação.\n\n"
-                    "O bot usa sempre o cargo mais alto do membro para montar `[TAG] NOME - ID`.",
                     view=HierarchyGuideV2(interaction.guild), ephemeral=True
                 )
             elif action == "fac:configv2:farm":
