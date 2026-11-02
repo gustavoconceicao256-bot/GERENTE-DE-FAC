@@ -1594,6 +1594,11 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         ])
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Use este formulário dentro de um servidor.", ephemeral=True
+            )
+            return
         photo, banner = self.photo_url.value.strip(), self.banner_url.value.strip()
         if not valid_asset_url(photo) or not valid_asset_url(banner):
             await interaction.response.send_message("Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem.", ephemeral=True)
@@ -1604,6 +1609,7 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
         save_config_value("farm_panel_banner_url", banner)
         await interaction.response.send_message(
             view=ConfigFarmChannelsV2(
+                interaction.guild,
                 success_message="✅ Aparência do painel salva. Agora configure os canais e as permissões do Farm abaixo."
             ),
             ephemeral=True,

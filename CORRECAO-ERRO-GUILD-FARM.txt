@@ -1,0 +1,8 @@
+CORREÇÃO DO ERRO NO FORMULÁRIO DO FARM
+
+Log: TypeError: ConfigFarmChannelsV2.__init__() missing 1 required positional argument: 'guild'
+
+Causa: ConfigFarmPanelModal.on_submit construía ConfigFarmChannelsV2 sem passar o servidor.
+Correção: agora a chamada passa interaction.guild e valida que o formulário foi enviado dentro de um servidor.
+
+Validação feita: compilação sintática do bot.py e integridade do ZIP. As interações ainda precisam ser testadas no Discord.
