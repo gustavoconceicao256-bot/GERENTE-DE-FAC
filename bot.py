@@ -1322,6 +1322,7 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
                         self.parent_view.selected_role_ids.append(rid)
                 except ValueError:
                     pass
+        self.parent_view._persist_selected_roles()
         self.parent_view._refresh_remove_selector()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
 
@@ -1339,6 +1340,7 @@ class ConfigHierarchyAddRoleModal(Modal, title="Adicionar cargo por ID"):
             return
         if role.id not in self.parent_view.selected_role_ids:
             self.parent_view.selected_role_ids.append(role.id)
+        self.parent_view._persist_selected_roles()
         self.parent_view._refresh_role_page()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
 
@@ -1362,6 +1364,7 @@ class ConfigHierarchyRemoveSelect(discord.ui.Select):
         if raw != "none":
             rid = int(raw)
             self.parent_view.selected_role_ids = [x for x in self.parent_view.selected_role_ids if x != rid]
+        self.parent_view._persist_selected_roles()
         self.parent_view._refresh_remove_selector()
         await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
 
@@ -1396,7 +1399,6 @@ class ConfigHierarchySetupView(View):
         self.add_item(self.role_selector)
         self.remove_selector = ConfigHierarchyRemoveSelect(self)
         self.add_item(self.remove_selector)
-        self.add_item(ConfigHierarchyAddRoleButton())
         self._update_pager_buttons()
 
     @property
@@ -1406,6 +1408,20 @@ class ConfigHierarchySetupView(View):
     def _update_pager_buttons(self) -> None:
         self.previous_page.disabled = self.page_index <= 0
         self.next_page.disabled = self.page_index >= self.total_pages - 1
+
+    def _persist_selected_roles(self) -> None:
+        """Salva a seleção atual para não perder cargos ao voltar ou fechar o painel."""
+        selected_roles = [self.guild.get_role(rid) for rid in self.selected_role_ids]
+        selected_roles = [role for role in selected_roles if role is not None]
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+            for priority, role in enumerate(selected_roles, start=1):
+                words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
+                abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?)",
+                    (f"rank_role_{role.id}", f"{abbreviation or 'RANK'}|{priority}"),
+                )
 
     def _refresh_role_page(self) -> None:
         self.remove_item(self.role_selector)
@@ -1449,7 +1465,7 @@ class ConfigHierarchySetupView(View):
         if saved:
             embed.set_footer(text="Configuração salva • nº 1 é o cargo mais baixo; último é o mais alto")
         else:
-            embed.set_footer(text="Selecione vários cargos por página • Navegue • Salve uma única vez")
+            embed.set_footer(text="A seleção é salva automaticamente • Use as setas para ver todos os cargos")
         return embed
 
     @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=3)
@@ -1466,38 +1482,22 @@ class ConfigHierarchySetupView(View):
         self._refresh_role_page()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
-    @discord.ui.button(label="Reiniciar configuração", style=discord.ButtonStyle.danger, emoji="🔄", row=4)
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, emoji="⬅️", row=4)
+    async def back_to_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._persist_selected_roles()
+        await interaction.response.send_message(view=HierarchyGuideV2(self.guild), ephemeral=True)
+
+    @discord.ui.button(label="Por ID", style=discord.ButtonStyle.primary, emoji="🔢", row=4)
+    async def add_role_by_id(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ConfigHierarchyAddRoleModal(self))
+
+    @discord.ui.button(label="Recomeçar", style=discord.ButtonStyle.danger, emoji="🔄", row=4)
     async def reset_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.selected_role_ids.clear()
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
         self._refresh_role_page()
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
-
-    @discord.ui.button(label="Salvar hierarquia", style=discord.ButtonStyle.success, emoji="💾", row=4)
-    async def save_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        selected_roles = [self.guild.get_role(rid) for rid in self.selected_role_ids]
-        selected_roles = [role for role in selected_roles if role is not None]
-        if not selected_roles:
-            await interaction.response.send_message("Selecione pelo menos um cargo antes de salvar.", ephemeral=True)
-            return
-        with db() as con:
-            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            # Prioridade 1 = base/mais baixo; cargos selecionados depois ficam acima.
-            for priority, role in enumerate(selected_roles, start=1):
-                words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
-                abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
-                abbreviation = abbreviation or "RANK"
-                con.execute(
-                    "INSERT INTO settings(key,value) VALUES(?,?)",
-                    (f"rank_role_{role.id}", f"{abbreviation}|{priority}"),
-                )
-        await interaction.response.edit_message(embed=self.build_embed(saved=True), view=None)
-        await interaction.followup.send(
-            f"✅ Hierarquia salva: **{len(selected_roles)} cargo(s)**. Ordem confirmada: **nº 1 é a base (mais baixo)** e **nº {len(selected_roles)} é o topo (mais alto)**. "
-            "A ordem segue a sequência em que você adicionou os cargos.",
-            ephemeral=True,
-        )
 
 
 class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
@@ -2075,96 +2075,171 @@ class HierarchyRoleIdsModal(Modal):
 
 
 
-class HierarchyRolePicker(discord.ui.RoleSelect):
+class HierarchyRolePicker(discord.ui.Select):
+    """Menu próprio com 25 cargos por página; as setas percorrem todos os cargos do servidor."""
     def __init__(self, parent):
-        super().__init__(placeholder="Ou selecione um cargo do servidor para a próxima posição", min_values=1, max_values=1, row=0)
         self.parent_view = parent
+        start = parent.role_page * HIERARCHY_ROLES_PER_PAGE
+        self.page_roles = parent.available_roles[start:start + HIERARCHY_ROLES_PER_PAGE]
+        options = [
+            discord.SelectOption(
+                label=role.name[:100],
+                value=str(role.id),
+                description=f"Posição: {role.position}"[:100],
+            )
+            for role in self.page_roles
+        ]
+        if not options:
+            options = [discord.SelectOption(label="Nenhum cargo disponível", value="none")]
+        super().__init__(
+            placeholder=f"Selecione um cargo • página {parent.role_page + 1}/{parent.role_pages}",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.parent_view.owner_id:
-            await interaction.response.send_message("Somente quem iniciou a configuração pode alterar os cargos.", ephemeral=True)
+            await interaction.response.send_message("Somente quem iniciou a configuração pode selecionar os cargos.", ephemeral=True)
             return
-        role = self.values[0]
-        if role.is_default():
-            await interaction.response.send_message("O cargo @everyone não pode fazer parte da hierarquia.", ephemeral=True)
+        raw = self.values[0]
+        role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
+        if role is None or role == self.parent_view.guild.default_role:
+            await interaction.response.send_message("Cargo inválido. Selecione um cargo deste servidor.", ephemeral=True)
             return
-        start = self.parent_view.page * 5
-        end = min(start + 5, self.parent_view.count)
         if role.id in [rid for rid in self.parent_view.role_ids if rid]:
-            await interaction.response.send_message("Esse cargo já foi selecionado em outra posição.", ephemeral=True)
+            await interaction.response.send_message("Esse cargo já foi selecionado. Escolha outro.", ephemeral=True)
             return
         try:
-            index = self.parent_view.role_ids.index(None, start, end)
+            index = self.parent_view.role_ids.index(None)
         except ValueError:
-            await interaction.response.send_message("Este bloco já está completo. Avance para o próximo bloco.", ephemeral=True)
+            await interaction.response.send_message("Todos os cargos já foram preenchidos.", ephemeral=True)
             return
         self.parent_view.role_ids[index] = role.id
-        await interaction.response.edit_message(embed=self.parent_view.embed(), view=self.parent_view)
+        await self.parent_view.refresh_after_role_change(interaction)
+
+
+class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
+    role_id_input = TextInput(label="ID do cargo", max_length=25, required=True, placeholder="Cole o ID do cargo do servidor")
+
+    def __init__(self, parent_view):
+        super().__init__(timeout=300)
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.parent_view.owner_id:
+            await interaction.response.send_message("Somente quem iniciou a configuração pode informar os IDs.", ephemeral=True)
+            return
+        raw = self.role_id_input.value.strip()
+        role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
+        if role is None or role == self.parent_view.guild.default_role:
+            await interaction.response.send_message("ID inválido: não encontrei esse cargo neste servidor.", ephemeral=True)
+            return
+        if role.id in [rid for rid in self.parent_view.role_ids if rid]:
+            await interaction.response.send_message("Esse cargo já foi selecionado. Informe outro ID.", ephemeral=True)
+            return
+        try:
+            index = self.parent_view.role_ids.index(None)
+        except ValueError:
+            await interaction.response.send_message("Todos os cargos já foram preenchidos.", ephemeral=True)
+            return
+        self.parent_view.role_ids[index] = role.id
+        if all(rid is not None for rid in self.parent_view.role_ids):
+            next_view = HierarchyTagConfigView(self.parent_view.guild, self.parent_view.role_ids)
+            await interaction.response.send_message(embed=next_view.embed(), view=next_view, ephemeral=True)
+        else:
+            self.parent_view._refresh_role_picker()
+            await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
 
 
 class HierarchyRoleConfigView(View):
+    """Seleciona cargos do servidor em páginas, mantendo a ordem de menor para maior."""
     def __init__(self, guild, count):
         super().__init__(timeout=900)
         self.guild, self.count = guild, count
         self.role_ids = [None] * count
-        self.page = 0
         self.owner_id = 0
-        self.add_item(HierarchyRolePicker(self))
+        self.available_roles = sorted(
+            (role for role in guild.roles if role != guild.default_role),
+            key=lambda role: (role.position, role.name.casefold()),
+        )
+        self.role_page = 0
+        self.role_picker = HierarchyRolePicker(self)
+        self.add_item(self.role_picker)
+        self._update_role_page_buttons()
 
     @property
-    def pages(self):
-        return (self.count + 4) // 5
+    def role_pages(self):
+        return max(1, math.ceil(len(self.available_roles) / HIERARCHY_ROLES_PER_PAGE))
+
+    def _update_role_page_buttons(self):
+        self.previous.disabled = self.role_page <= 0
+        self.next.disabled = self.role_page >= self.role_pages - 1
+
+    def _refresh_role_picker(self):
+        self.remove_item(self.role_picker)
+        self.role_picker = HierarchyRolePicker(self)
+        self.add_item(self.role_picker)
+        self._update_role_page_buttons()
+
+    async def refresh_after_role_change(self, interaction):
+        if all(rid is not None for rid in self.role_ids):
+            tags_view = HierarchyTagConfigView(self.guild, self.role_ids)
+            await interaction.response.edit_message(embed=tags_view.embed(), view=tags_view)
+            return
+        self._refresh_role_picker()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("Somente quem iniciou a configuração pode alterar os cargos.", ephemeral=True)
+            return False
+        return True
 
     def embed(self):
-        start = self.page * 5
-        end = min(start + 5, self.count)
         lines = []
-        for idx in range(start, end):
-            role = self.guild.get_role(self.role_ids[idx]) if self.role_ids[idx] else None
-            label = f"Cargo {idx + 1}"
-            lines.append(f"**{label}:** {role.mention if role else '— não preenchido —'}")
-        e = discord.Embed(title="Etapa 2 — IDs dos cargos", description=(
-            "Selecione no menu ou informe os IDs na ordem **do mais baixo para o mais alto**. O primeiro será a base e o último será o topo.\n\n"
-            + "\n".join(lines)
-        ), color=discord.Color.blurple())
-        e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(x is not None for x in self.role_ids)}/{self.count} cargos definidos")
+        for idx, rid in enumerate(self.role_ids):
+            role = self.guild.get_role(rid) if rid else None
+            lines.append(f"**Cargo {idx + 1}:** {role.mention if role else '— não preenchido —'}")
+        e = discord.Embed(
+            title="Etapa 2 — Seleção de cargos",
+            description=(
+                "Use o menu para selecionar os cargos na ordem **do mais baixo para o mais alto**. "
+                "As setas mudam a página do menu e percorrem todos os cargos do servidor.\n\n"
+                + "\n".join(lines)
+            ),
+            color=discord.Color.blurple(),
+        )
+        e.set_footer(text=f"Página de cargos {self.role_page + 1}/{self.role_pages} • {sum(rid is not None for rid in self.role_ids)}/{self.count} cargos definidos")
         return e
 
-    @discord.ui.button(label="Preencher / editar IDs deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=1)
-    async def edit_block(self, interaction: discord.Interaction, button: discord.ui.Button):
-        start = self.page * 5
-        await interaction.response.send_modal(HierarchyRoleIdsModal(self, start, min(start + 5, self.count)))
-
-    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = max(0, self.page - 1)
+        self.role_page = max(0, self.role_page - 1)
+        self._refresh_role_picker()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = min(self.pages - 1, self.page + 1)
+        self.role_page = min(self.role_pages - 1, self.role_page + 1)
+        self._refresh_role_picker()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Voltar à quantidade", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(HierarchyCountModal(self.guild))
 
-    @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Por ID", style=discord.ButtonStyle.primary, emoji="🔢", row=2)
+    async def by_id(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HierarchyRoleIdModal(self))
+
+    @discord.ui.button(label="Recomeçar", style=discord.ButtonStyle.danger, emoji="🔄", row=2)
     async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.role_ids = [None] * self.count
-        self.page = 0
+        self.role_page = 0
+        self._refresh_role_picker()
         await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    @discord.ui.button(label="Confirmar cargos e continuar", style=discord.ButtonStyle.success, row=4)
-    async def continue_tags(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if any(x is None for x in self.role_ids):
-            await interaction.response.send_message("Preencha todos os IDs antes de continuar.", ephemeral=True)
-            return
-        if len(set(self.role_ids)) != self.count:
-            await interaction.response.send_message("Existem cargos repetidos. Corrija antes de continuar.", ephemeral=True)
-            return
-        view = HierarchyTagConfigView(self.guild, self.role_ids)
-        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
 
 
 class HierarchyTagsModal(Modal):
@@ -2747,14 +2822,17 @@ class FarmItemConfigModal(discord.ui.Modal, title="Adicionar item ao Farm"):
                 (name, points, cents),
             )
         log_action(interaction.user.id, "FARM_ITEM_CONFIG", None, "", f"{name}: R$ {cents/100:.2f}; {points} ponto(s)")
+        # LayoutView usa Components V2: não envie o campo legado `content` junto.
         await interaction.response.send_message(
-            f"✅ **{name}** salvo — R$ {cents/100:.2f} por unidade; {points} ponto(s) por unidade.",
-            view=FarmItemSetupV2(), ephemeral=True
+            view=FarmItemSetupV2(
+                success_message=f"✅ **{name}** salvo — R$ {cents/100:.2f} por unidade; {points} ponto(s) por unidade."
+            ),
+            ephemeral=True,
         )
 
 
 class FarmItemSetupV2(discord.ui.LayoutView):
-    def __init__(self):
+    def __init__(self, success_message: str = ""):
         super().__init__(timeout=900)
         with db() as con:
             rows = con.execute("SELECT name,unit_price_cents,points FROM farm_items WHERE active=1 ORDER BY name").fetchall()
@@ -2763,7 +2841,10 @@ class FarmItemSetupV2(discord.ui.LayoutView):
             summary += f"\n… e mais {len(rows)-25} item(ns)."
         if not summary:
             summary = "Nenhum item cadastrado ainda."
-        container = discord.ui.Container(
+        parts = []
+        if success_message:
+            parts.extend([discord.ui.TextDisplay(success_message), discord.ui.Separator()])
+        parts.extend([
             discord.ui.TextDisplay("## 🌾 Etapa 1 — Itens e valores\nCadastre os itens que os membros poderão registrar. Você pode adicionar quantos precisar."),
             discord.ui.Separator(),
             discord.ui.TextDisplay(summary),
@@ -2771,7 +2852,8 @@ class FarmItemSetupV2(discord.ui.LayoutView):
                 discord.ui.Button(label="Adicionar item", emoji="➕", style=discord.ButtonStyle.success, custom_id="fac:farmv2:add"),
                 discord.ui.Button(label="Configurar canais e painel", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"),
             ),
-        )
+        ])
+        container = discord.ui.Container(*parts)
         self.add_item(container)
         row = container.children[-1]
         row.children[0].callback = self.add_item_modal
@@ -2862,6 +2944,7 @@ class ConfigPanelV2(discord.ui.LayoutView):
         super().__init__(timeout=900)
         container = discord.ui.Container(
             discord.ui.TextDisplay("# ⚙️ GERENTE-DE-FAC\nConfigure os módulos da facção por etapas.\n\n**Escolha o que deseja configurar:**"),
+            discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://painel_configuracao.png", description="Painel de configuração GERENTE-DE-FAC")),
             discord.ui.Separator(),
             discord.ui.TextDisplay("📋 **WL** — painel e cadastro de membros\n🏛️ **Hierarquia** — cargos, tags e publicação\n🌾 **Farm** — itens, valores, canais e cobranças\n🧾 **Publicação** — enviar os painéis configurados"),
             discord.ui.Separator(),
@@ -2874,9 +2957,6 @@ class ConfigPanelV2(discord.ui.LayoutView):
                 discord.ui.Button(label="Publicar WL", emoji="📨", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-wl"),
                 discord.ui.Button(label="Publicar hierarquia", emoji="🏛️", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-hierarchy"),
                 discord.ui.Button(label="Publicar Farm", emoji="🌾", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-farm"),
-            ),
-            discord.ui.ActionRow(
-                discord.ui.Button(label="Outras configurações", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="fac:configv2:other"),
             ),
         )
         self.add_item(container)
@@ -2912,11 +2992,6 @@ class ConfigPanelV2(discord.ui.LayoutView):
                 await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
             elif action == "fac:configv2:publish-farm":
                 await publish_configured_panel(interaction, "farm")
-            elif action == "fac:configv2:other":
-                await interaction.response.send_message(
-                    "## 🛠️ Outras configurações\nEscolha uma área para continuar.",
-                    view=ConfigPanelView(), ephemeral=True
-                )
         return callback
 
 
@@ -2924,7 +2999,9 @@ class ConfigPanelV2(discord.ui.LayoutView):
 async def config(interaction: discord.Interaction) -> None:
     if not await deny_unless_config_access(interaction):
         return
-    await interaction.response.send_message(view=ConfigPanelV2(), ephemeral=True)
+    image_path = os.path.join(os.path.dirname(__file__), "assets", "painel_configuracao.png")
+    panel_image = discord.File(image_path, filename="painel_configuracao.png")
+    await interaction.response.send_message(view=ConfigPanelV2(), file=panel_image, ephemeral=True)
 
 
 @bot.tree.command(name="painel-wl", description="Publica o painel WL no canal configurado")
