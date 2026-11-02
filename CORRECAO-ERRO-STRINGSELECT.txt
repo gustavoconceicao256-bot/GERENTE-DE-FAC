@@ -1,0 +1,11 @@
+CORREÇÃO DE DEPLOY — discord.py 2.7.1
+
+Erro:
+AttributeError: module 'discord.ui' has no attribute 'StringSelect'
+
+Causa:
+discord.py 2.7.1 disponibiliza o componente de seleção de texto como
+discord.ui.Select. O nome StringSelect não existe nessa versão.
+
+Correção:
+As duas classes de menu do Farm agora herdam de discord.ui.Select.

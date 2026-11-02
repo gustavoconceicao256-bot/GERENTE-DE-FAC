@@ -2940,7 +2940,7 @@ FARM_CONFIG_FIELDS = {
 }
 
 
-class FarmConfigFieldSelect(discord.ui.StringSelect):
+class FarmConfigFieldSelect(discord.ui.Select):
     def __init__(self, parent: "ConfigFarmChannelsV2"):
         self.parent_view = parent
         options = [
@@ -2959,7 +2959,7 @@ class FarmConfigFieldSelect(discord.ui.StringSelect):
         )
 
 
-class FarmConfigTargetSelect(discord.ui.StringSelect):
+class FarmConfigTargetSelect(discord.ui.Select):
     def __init__(self, parent: "ConfigFarmChannelsV2", options: list[discord.SelectOption]):
         self.parent_view = parent
         super().__init__(placeholder=f"Opções — página {parent.page + 1}",
