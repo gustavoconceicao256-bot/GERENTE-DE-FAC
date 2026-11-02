@@ -2905,16 +2905,18 @@ class FarmItemSetupV2(discord.ui.LayoutView):
             discord.ui.TextDisplay("## 🌾 Etapa 1 — Itens e valores\nCadastre os itens que os membros poderão registrar. Você pode adicionar quantos precisar."),
             discord.ui.Separator(),
             discord.ui.TextDisplay(summary),
-            discord.ui.ActionRow(
-                discord.ui.Button(label="Adicionar item", emoji="➕", style=discord.ButtonStyle.success, custom_id="fac:farmv2:add"),
-                discord.ui.Button(label="Próximo", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"),
-            ),
         ])
+        buttons = [discord.ui.Button(label="Adicionar item", emoji="➕", style=discord.ButtonStyle.success, custom_id="fac:farmv2:add")]
+        # O botão Próximo só aparece depois que existe pelo menos um item ativo.
+        if rows:
+            buttons.append(discord.ui.Button(label="Próximo", emoji="➡️", style=discord.ButtonStyle.primary, custom_id="fac:farmv2:next"))
+        parts.append(discord.ui.ActionRow(*buttons))
         container = discord.ui.Container(*parts)
         self.add_item(container)
         row = container.children[-1]
         row.children[0].callback = self.add_item_modal
-        row.children[1].callback = self.next_step
+        if len(row.children) > 1:
+            row.children[1].callback = self.next_step
 
     async def add_item_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(FarmItemConfigModal())
@@ -2930,35 +2932,157 @@ class FarmItemSetupV2(discord.ui.LayoutView):
         await interaction.response.send_modal(ConfigFarmPanelModal())
 
 
+FARM_CONFIG_FIELDS = {
+    "farm_panel_channel_id": ("Canal público do Farm", "channel"),
+    "farm_private_channel_id": ("Canal privado da liderança", "channel"),
+    "farm_approver_role_id": ("Cargo autorizado a aprovar, pagar ou recusar", "role"),
+    "farm_log_channel_id": ("Canal de histórico final (opcional)", "channel"),
+}
+
+
+class FarmConfigFieldSelect(discord.ui.StringSelect):
+    def __init__(self, parent: "ConfigFarmChannelsV2"):
+        self.parent_view = parent
+        options = [
+            discord.SelectOption(label=label[:100], value=key, default=(key == parent.selected_key))
+            for key, (label, _kind) in FARM_CONFIG_FIELDS.items()
+        ]
+        super().__init__(placeholder="Escolha qual configuração deseja editar",
+                         min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            view=ConfigFarmChannelsV2(
+                interaction.guild, selected_key=self.values[0], page=0,
+                success_message="Agora escolha o canal ou cargo. Use as setas para percorrer todas as opções.",
+            )
+        )
+
+
+class FarmConfigTargetSelect(discord.ui.StringSelect):
+    def __init__(self, parent: "ConfigFarmChannelsV2", options: list[discord.SelectOption]):
+        self.parent_view = parent
+        super().__init__(placeholder=f"Opções — página {parent.page + 1}",
+                         min_values=1, max_values=1, options=options[:25], row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        key = self.parent_view.selected_key
+        if selected == "__none__":
+            await interaction.response.send_message(
+                "Não há opções disponíveis. Confira os canais/cargos e as permissões do bot.",
+                ephemeral=True,
+            )
+            return
+        save_config_value(key, selected)
+        label = FARM_CONFIG_FIELDS[key][0]
+        if key == "farm_approver_role_id":
+            obj = interaction.guild.get_role(int(selected)) if interaction.guild else None
+        else:
+            obj = interaction.guild.get_channel(int(selected)) if interaction.guild else None
+        shown = obj.mention if obj else f"`{selected}`"
+        await interaction.response.edit_message(
+            view=ConfigFarmChannelsV2(
+                interaction.guild, selected_key=key, page=self.parent_view.page,
+                success_message=f"✅ **{label}** salvo: {shown}",
+            )
+        )
+
+
+class FarmConfigPageButton(discord.ui.Button):
+    def __init__(self, parent: "ConfigFarmChannelsV2", delta: int, *, disabled: bool):
+        self.parent_view = parent
+        self.delta = delta
+        super().__init__(label=("◀ Anterior" if delta < 0 else "Próxima ▶"),
+                         style=discord.ButtonStyle.secondary, disabled=disabled, row=2)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            view=ConfigFarmChannelsV2(
+                interaction.guild,
+                selected_key=self.parent_view.selected_key,
+                page=max(0, self.parent_view.page + self.delta),
+            )
+        )
+
+
 class ConfigFarmChannelsV2(discord.ui.LayoutView):
-    def __init__(self, success_message: str = ""):
-        super().__init__(timeout=600)
-        channels = discord.ui.Container(
-            *([discord.ui.TextDisplay(success_message), discord.ui.Separator()] if success_message else []),
+    """Configuração paginada para listar todos os canais de texto e cargos do servidor."""
+    PAGE_SIZE = 25
+
+    def __init__(self, guild: discord.Guild | None, success_message: str = "",
+                 *, selected_key: str = "farm_panel_channel_id", page: int = 0):
+        super().__init__(timeout=900)
+        self.guild = guild
+        self.selected_key = selected_key if selected_key in FARM_CONFIG_FIELDS else "farm_panel_channel_id"
+        self.page = max(0, int(page))
+        label, kind = FARM_CONFIG_FIELDS[self.selected_key]
+        objects = self._get_objects(kind)
+        page_count = max(1, (len(objects) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = min(self.page, page_count - 1)
+        page_objects = objects[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
+
+        options = []
+        for obj in page_objects:
+            if kind == "role":
+                option_label = obj.name
+                option_desc = f"Cargo • posição {obj.position}"
+            else:
+                option_label = f"#{obj.name}"
+                category = getattr(getattr(obj, "category", None), "name", None)
+                option_desc = f"Canal de texto • {category}" if category else "Canal de texto"
+            options.append(discord.SelectOption(
+                label=option_label[:100], value=str(obj.id), description=option_desc[:100]
+            ))
+        if not options:
+            options = [discord.SelectOption(
+                label="Nenhuma opção encontrada", value="__none__",
+                description="Verifique as permissões e o servidor",
+            )]
+
+        parts = []
+        if success_message:
+            parts.extend([discord.ui.TextDisplay(success_message), discord.ui.Separator()])
+        parts.extend([
             discord.ui.TextDisplay(
                 "## 🌾 Configurar canais do Farm\n"
-                "Escolha os canais. O painel público recebe os registros; o canal privado recebe as cobranças e comprovantes."
+                "Escolha uma das quatro configurações e selecione o canal ou cargo. "
+                "Use as setas para percorrer todas as opções do servidor, em páginas de até 25 itens."
             ),
             discord.ui.Separator(),
-            discord.ui.TextDisplay("**1. Canal público**"),
-            discord.ui.ActionRow(ConfigTextChannelSelect("farm_panel_channel_id", "Selecione o canal público do Farm")),
-            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_panel_channel_id")),
-            discord.ui.TextDisplay("**2. Canal privado da liderança**"),
-            discord.ui.ActionRow(ConfigTextChannelSelect("farm_private_channel_id", "Selecione o canal privado de cobranças")),
-            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_private_channel_id")),
+            discord.ui.TextDisplay(f"**Configuração atual:** {label}"),
+            discord.ui.ActionRow(FarmConfigFieldSelect(self)),
+            discord.ui.ActionRow(FarmConfigTargetSelect(self, options)),
+            discord.ui.TextDisplay(f"Página **{self.page + 1}/{page_count}** · {len(objects)} opção(ões) encontradas"),
+            discord.ui.ActionRow(
+                FarmConfigPageButton(self, -1, disabled=(self.page == 0)),
+                FarmConfigPageButton(self, 1, disabled=(self.page >= page_count - 1)),
+                ConfigManualIdButton(row=2, preset_key=self.selected_key),
+            ),
+        ])
+        self.add_item(discord.ui.Container(*parts))
+
+    def _get_objects(self, kind: str):
+        if not self.guild:
+            return []
+        if kind == "role":
+            return sorted(
+                (role for role in self.guild.roles if not role.is_default()),
+                key=lambda role: (role.position, role.id),
+            )
+        channel_types = tuple(
+            cls for cls in (getattr(discord, "TextChannel", None),
+                            getattr(discord, "NewsChannel", None))
+            if cls is not None
         )
-        approval = discord.ui.Container(
-            discord.ui.TextDisplay("## 🔐 Permissões e histórico"),
-            discord.ui.Separator(),
-            discord.ui.TextDisplay("**3. Cargo autorizado a aprovar, pagar ou recusar**"),
-            discord.ui.ActionRow(ConfigSingleRoleSelect("farm_approver_role_id", "Selecione o cargo da liderança", row=0)),
-            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_approver_role_id")),
-            discord.ui.TextDisplay("**4. Canal de histórico final (opcional)**"),
-            discord.ui.ActionRow(ConfigTextChannelSelect("farm_log_channel_id", "Selecione o canal de histórico do Farm")),
-            discord.ui.ActionRow(ConfigManualIdButton(row=0, preset_key="farm_log_channel_id")),
+        return sorted(
+            (channel for channel in self.guild.channels if isinstance(channel, channel_types)),
+            key=lambda channel: (
+                getattr(getattr(channel, "category", None), "position", -1),
+                channel.position,
+                channel.name.casefold(),
+            ),
         )
-        self.add_item(channels)
-        self.add_item(approval)
 
 
 class HierarchyGuideV2(discord.ui.LayoutView):

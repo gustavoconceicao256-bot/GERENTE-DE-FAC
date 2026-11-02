@@ -20,3 +20,16 @@ VALIDAÇÃO
 - Compilação sintática do bot.py aprovada.
 - Verificação funcional isolada do formato do apelido aprovada.
 - O bot não foi conectado ao Discord nesta validação; faça o deploy e teste as interações no servidor.
+
+
+ATUALIZAÇÃO — LISTAS COMPLETAS DO FARM
+- Etapa 1: o botão Próximo só é exibido quando existe pelo menos um item ativo cadastrado.
+- Configuração do Farm: os quatro campos agora são escolhidos em um seletor de configuração.
+- Canais de texto e cargos são listados em páginas de até 25 opções, com botões Anterior/Próxima para percorrer a lista completa.
+- A seleção salva o ID correspondente no banco de dados.
+- A seleção manual por ID continua disponível.
+- Canais listados são canais de texto/anúncio em que o bot pode publicar mensagens; categorias e canais de voz não são destinos válidos para o painel de Farm.
+
+VALIDAÇÃO DESTA ATUALIZAÇÃO
+- Compilação sintática de bot.py aprovada.
+- O ambiente desta execução não possui discord.py instalado; portanto, não foi possível executar um teste real de montagem das views nem conectar ao Discord.
