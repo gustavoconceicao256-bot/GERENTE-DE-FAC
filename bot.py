@@ -613,12 +613,12 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
         compact_result = discord.Embed(
             title=f"{'✅ WL APROVADA' if approve else '❌ WL REPROVADA'} · #{request_id}",
             description=(
-                f"**Solicitante:** {request['discord_name'] or request['character_name']} (<@{request['discord_id']}>)\\n"
-                f"**Nome no RP:** {request['character_name']}\\n"
-                f"**Recrutador escolhido:** <@{request['selected_recruiter_id'] or request['recruiter']}>\\n"
-                f"**Decisão por:** {interaction.user.mention}\\n"
+                f"**Solicitante:** {request['discord_name'] or request['character_name']} (<@{request['discord_id']}>)\n"
+                f"**Nome no RP:** {request['character_name']}\n"
+                f"**Recrutador escolhido:** <@{request['selected_recruiter_id'] or request['recruiter']}>\n"
+                f"**Decisão por:** {interaction.user.mention}\n"
                 f"**Status:** **{'APROVADA' if approve else 'REPROVADA'}**"
-                + (f"\\n**Motivo:** {reason[:500]}" if reason else "")
+                + (f"\n**Motivo:** {reason[:500]}" if reason else "")
             ),
             color=color,
             timestamp=datetime.now(timezone.utc),
@@ -1049,7 +1049,7 @@ def panel_embed(kind: str) -> discord.Embed:
         return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
     if kind == "hierarchy":
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
-        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do cargo mais baixo ao mais alto.")
+        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do cargo mais alto ao mais baixo.")
         return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
     # Os demais painéis continuam disponíveis pelos comandos existentes, mas não são apresentados no /config simplificado.
     if kind == "members":
@@ -1379,6 +1379,7 @@ class ConfigHierarchySetupView(View):
         self.roles = sorted(
             (role for role in guild.roles if role != guild.default_role),
             key=lambda role: (role.position, role.name.casefold()),
+            reverse=True,
         )
         self.page_index = 0
         with db() as con:
@@ -1393,7 +1394,7 @@ class ConfigHierarchySetupView(View):
             except (ValueError, TypeError):
                 continue
         self.selected_role_ids: list[int] = [
-            role_id for _priority, role_id in sorted(saved_roles)
+            role_id for _priority, role_id in sorted(saved_roles, reverse=True)
         ]
         self.role_selector = ConfigHierarchyRolePageSelect(self)
         self.add_item(self.role_selector)
@@ -1415,7 +1416,8 @@ class ConfigHierarchySetupView(View):
         selected_roles = [role for role in selected_roles if role is not None]
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            for priority, role in enumerate(selected_roles, start=1):
+            for idx, role in enumerate(selected_roles):
+                priority = len(selected_roles) - idx
                 words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
                 abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
                 con.execute(
@@ -1463,7 +1465,7 @@ class ConfigHierarchySetupView(View):
         embed.add_field(name="✅ Selecionados", value=f"**{len(selected_roles)} cargo(s)**", inline=True)
         embed.add_field(name="📋 Hierarquia (topo → base)", value=selected_text[:1024], inline=False)
         if saved:
-            embed.set_footer(text="Configuração salva • nº 1 é o cargo mais baixo; último é o mais alto")
+            embed.set_footer(text="Configuração salva • nº 1 é o cargo mais alto; último é o mais baixo")
         else:
             embed.set_footer(text="A seleção é salva automaticamente • Use as setas para ver todos os cargos")
         return embed
@@ -1542,7 +1544,7 @@ class ConfigHierarchyModal(Modal, title="Aparência da hierarquia"):
         super().__init__(timeout=300)
         _set_modal_defaults(self, [
             (self.title_input, panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")),
-            (self.description_input, panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais baixo ao mais alto.")),
+            (self.description_input, panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais alto ao mais baixo.")),
         ])
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -1911,11 +1913,11 @@ class HierarchyPublishChannelView(View):
 
     def build_embed(self) -> discord.Embed:
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
-        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais baixo ao mais alto.")
+        description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais alto ao mais baixo.")
         channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
         embed = discord.Embed(
             title="📣 Publicar hierarquia",
-            description=f"**{title[:180]}**\n{description[:700]}\n\nSelecione o canal de destino. A hierarquia será publicada em seções por cargo, do mais baixo ao mais alto.",
+            description=f"**{title[:180]}**\n{description[:700]}\n\nSelecione o canal de destino. A hierarquia será publicada em seções por cargo, do mais alto ao mais baixo.",
             color=discord.Color.from_rgb(76, 86, 180),
         )
         embed.add_field(name="Canal escolhido", value=channel.mention if channel else "`Selecione um canal abaixo`", inline=False)
@@ -2047,7 +2049,7 @@ class HierarchyRoleIdsModal(Modal):
         self.inputs = []
         for index in range(start, end):
             field = TextInput(
-                label=f"Cargo {index + 1} — {'BASE / MAIS BAIXO' if index == 0 else 'ID do cargo'}",
+                label=f"Cargo {index + 1} — {'MAIS ALTO' if index == 0 else 'ID do cargo'}",
                 placeholder="Cole o ID do cargo do Discord",
                 required=True, max_length=25
             )
@@ -2146,7 +2148,7 @@ class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
             return
         self.parent_view.role_ids[index] = role.id
         if all(rid is not None for rid in self.parent_view.role_ids):
-            next_view = HierarchyTagConfigView(self.parent_view.guild, self.parent_view.role_ids)
+            next_view = HierarchyTagConfigView(self.parent_view.guild, self.parent_view.role_ids, self.parent_view.owner_id)
             await interaction.response.send_message(embed=next_view.embed(), view=next_view, ephemeral=True)
         else:
             self.parent_view._refresh_role_picker()
@@ -2154,15 +2156,17 @@ class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
 
 
 class HierarchyRoleConfigView(View):
-    """Seleciona cargos do servidor em páginas, mantendo a ordem de menor para maior."""
+    """Seleciona cargos do servidor em páginas, do cargo mais alto ao mais baixo."""
     def __init__(self, guild, count):
         super().__init__(timeout=900)
         self.guild, self.count = guild, count
         self.role_ids = [None] * count
         self.owner_id = 0
+        # Lista de cima para baixo: primeiro o cargo mais alto do servidor.
         self.available_roles = sorted(
             (role for role in guild.roles if role != guild.default_role),
             key=lambda role: (role.position, role.name.casefold()),
+            reverse=True,
         )
         self.role_page = 0
         self.role_picker = HierarchyRolePicker(self)
@@ -2185,7 +2189,7 @@ class HierarchyRoleConfigView(View):
 
     async def refresh_after_role_change(self, interaction):
         if all(rid is not None for rid in self.role_ids):
-            tags_view = HierarchyTagConfigView(self.guild, self.role_ids)
+            tags_view = HierarchyTagConfigView(self.guild, self.role_ids, self.owner_id)
             await interaction.response.edit_message(embed=tags_view.embed(), view=tags_view)
             return
         self._refresh_role_picker()
@@ -2205,7 +2209,7 @@ class HierarchyRoleConfigView(View):
         e = discord.Embed(
             title="Etapa 2 — Seleção de cargos",
             description=(
-                "Use o menu para selecionar os cargos na ordem **do mais baixo para o mais alto**. "
+                "Use o menu para selecionar os cargos na ordem **do mais alto para o mais baixo**. "
                 "As setas mudam a página do menu e percorrem todos os cargos do servidor.\n\n"
                 + "\n".join(lines)
             ),
@@ -2270,13 +2274,17 @@ class HierarchyTagsModal(Modal):
             self.parent_view.tags[idx] = tag
             rid = self.parent_view.role_ids[idx]
             save_config_value(f"hierarchy_draft_tag_{rid}", tag)
+        # Ao concluir o bloco atual, avança automaticamente para o próximo.
+        if self.parent_view.page < self.parent_view.pages - 1:
+            self.parent_view.page += 1
         await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
 
 
 class HierarchyTagConfigView(View):
-    def __init__(self, guild, role_ids):
+    def __init__(self, guild, role_ids, owner_id=0):
         super().__init__(timeout=900)
         self.guild, self.role_ids = guild, list(role_ids)
+        self.owner_id = owner_id
         with db() as con:
             self.tags = [
                 (con.execute("SELECT value FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",)).fetchone() or {"value": ""})["value"]
@@ -2286,7 +2294,15 @@ class HierarchyTagConfigView(View):
 
     @property
     def pages(self):
-        return (len(self.role_ids) + 4) // 5
+        return max(1, (len(self.role_ids) + 4) // 5)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Somente quem iniciou a configuração pode alterar as tags.", ephemeral=True
+            )
+            return False
+        return True
 
     def embed(self):
         start, end = self.page * 5, min(self.page * 5 + 5, len(self.role_ids))
@@ -2304,29 +2320,24 @@ class HierarchyTagConfigView(View):
         e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(bool(x) for x in self.tags)}/{len(self.tags)} tags definidas")
         return e
 
-    @discord.ui.button(label="Preencher / editar tags deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
-    async def edit_block(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Definir tag", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    async def define_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
         start = self.page * 5
         await interaction.response.send_modal(HierarchyTagsModal(self, start, min(start + 5, len(self.tags))))
 
-    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=1)
-    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = max(0, self.page - 1)
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=1)
-    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = min(self.pages - 1, self.page + 1)
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    @discord.ui.button(label="Voltar aos IDs", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page > 0:
+            self.page -= 1
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+            return
         view = HierarchyRoleConfigView(self.guild, len(self.role_ids))
         view.role_ids = list(self.role_ids)
-        view.owner_id = interaction.user.id
+        view.owner_id = self.owner_id or interaction.user.id
+        view._refresh_role_picker()
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
-    @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Recomeçar", style=discord.ButtonStyle.danger, emoji="🔄", row=1)
     async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.tags = [""] * len(self.tags)
         with db() as con:
@@ -2335,18 +2346,27 @@ class HierarchyTagConfigView(View):
         self.page = 0
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Confirmar tags e continuar", style=discord.ButtonStyle.success, row=3)
-    async def continue_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Próximo", style=discord.ButtonStyle.secondary, emoji="➡️", row=1)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.page < self.pages - 1:
+            self.page += 1
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+            return
         if any(not x for x in self.tags):
-            await interaction.response.send_message("Defina a tag de todos os cargos antes de continuar.", ephemeral=True)
+            await interaction.response.send_message(
+                "Defina a tag de todos os cargos antes de continuar.", ephemeral=True
+            )
             return
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             total = len(self.role_ids)
-            # A primeira posição é o cargo mais baixo; prioridade maior = cargo mais alto.
+            # O primeiro cargo da lista é o mais alto e recebe a maior prioridade.
             for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
-                priority = idx + 1
-                con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"rank_role_{rid}", f"{tag}|{priority}"))
+                priority = total - idx
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?)",
+                    (f"rank_role_{rid}", f"{tag}|{priority}")
+                )
                 con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
         view = HierarchyFinalChannelView(self.guild)
         await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
@@ -2406,7 +2426,7 @@ class HierarchyFinalChannelView(View):
 
     @discord.ui.button(label="Voltar às tags", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = HierarchyTagConfigView(self.guild, [rid for _priority, rid, _tag in hierarchy_rows()])
+        view = HierarchyTagConfigView(self.guild, [rid for _priority, rid, _tag in hierarchy_rows()], interaction.user.id)
         view.tags = [tag for _priority, _rid, tag in hierarchy_rows()]
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
@@ -2466,10 +2486,10 @@ class ConfigPanelView(View):
             title="🏛️ Guia de configuração da hierarquia",
             description=(
                 "Configure a hierarquia em quatro etapas: **1)** quantidade de cargos; "
-                "**2)** cargos, do mais baixo ao mais alto; **3)** tag/abreviação de cada cargo; "
-                "**4)** canal de publicação.\\n\\n"
+                "**2)** cargos, do mais alto ao mais baixo; **3)** tag/abreviação de cada cargo; "
+                "**4)** canal de publicação.\n\n"
                 "O bot identifica o maior cargo configurado do membro e atualiza o nickname para "
-                "**[ TAG ] NOME - ID**. Os dados ficam salvos no SQLite.\\n\\n"
+                "**[ TAG ] NOME - ID**. Os dados ficam salvos no SQLite.\n\n"
                 "Você também pode apagar a configuração anterior e limpar as mensagens do canal "
                 "da hierarquia para começar do zero."
             ),
@@ -2575,8 +2595,8 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
             panel_description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização.")
             total_ranks = len(ranks)
             sent_messages = 0
-            # Publish highest rank first at the top of the channel; rank nº 1 (lowest) comes last.
-            for priority, role_id, abbreviation, role in reversed(ranks):
+            # Publish in configured order: highest rank first, lowest rank last.
+            for priority, role_id, abbreviation, role in ranks:
                 members = sorted(
                     members_by_highest_rank.get(role_id, []),
                     key=lambda m: m.display_name.casefold(),
@@ -2910,7 +2930,7 @@ class HierarchyGuideV2(discord.ui.LayoutView):
         container = discord.ui.Container(
             discord.ui.TextDisplay(
                 "## 🏛️ Hierarquia\n"
-                "A configuração é feita do **cargo mais baixo para o mais alto**.\n\n"
+                "A configuração é feita do **cargo mais alto para o mais baixo**.\n\n"
                 "**1.** Informe a quantidade de cargos.\n"
                 "**2.** Selecione cada cargo ou informe seu ID.\n"
                 "**3.** Defina a abreviação de cada cargo.\n"

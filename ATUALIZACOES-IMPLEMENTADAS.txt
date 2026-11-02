@@ -1,13 +1,18 @@
 ATUALIZACOES DESTA VERSAO
 
-- O menu de cargos da hierarquia agora lista os cargos do servidor em paginas de ate 25 opcoes.
-- As setas esquerda/direita paginam a lista de cargos, nao os campos de preenchimento.
-- A selecao continua na ordem do cargo mais baixo para o mais alto.
-- Depois de selecionar todos os cargos, o fluxo avanca automaticamente para a configuracao das tags.
-- A etapa de selecao tem somente os botoes Voltar, Por ID e Recomeçar.
-- O painel principal nao exibe mais o botao Outras configuracoes.
-- A imagem assets/painel_configuracao.png fica anexada e exibida no painel principal.
-- Corrigido FarmItemConfigModal: respostas com LayoutView/Components V2 nao enviam mais o campo legado content.
+- O seletor de cargos apresenta a hierarquia do mais alto para o mais baixo.
+- A paginação pelas setas percorre todos os cargos do servidor, em páginas de até 25 opções.
+- A ordem escolhida é mantida entre a seleção dos cargos e a configuração das tags.
+- A prioridade salva considera o primeiro cargo configurado como o mais alto.
+- Ao salvar as tags de um bloco, a tela avança automaticamente para o próximo bloco.
+- Os botões da etapa de tags agora são somente: Definir tag, Voltar, Recomeçar e Próximo.
+- Voltar retorna ao bloco anterior; no primeiro bloco, retorna à seleção de cargos.
+- Próximo navega entre blocos e, no último, conclui as tags e avança para a etapa do canal.
+- Mantida a correção do erro Components V2: respostas que usam LayoutView não enviam o campo legado content.
+- Mantida a imagem fixa assets/painel_configuracao.png no painel principal.
+- Removido o botão Outras configurações do painel.
 
-VALIDACAO
-- bot.py passou na verificacao de sintaxe com python -m py_compile.
+VALIDACOES
+- bot.py compilado com sucesso usando compile(...).
+- Integridade do arquivo ZIP verificada após a geração.
+- As interações reais ainda precisam ser testadas no servidor Discord/Render.
