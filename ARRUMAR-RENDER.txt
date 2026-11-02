@@ -1,17 +1,12 @@
-CORREÇÃO DO ERRO HTTP 429 NO RENDER
+CORREÇÃO DO IndentationError NO RENDER
 
-Esta versão mantém o processo ativo quando o Discord responde HTTP 429 durante
- o login. As novas tentativas usam espera progressiva (30 s até 15 min), sem
-reiniciar o processo nem repetir chamadas em sequência.
+O bot.py desta pasta começa com o cabeçalho completo do bot. A linha
+'current_role = guild.get_role(...)' deve aparecer dentro da função add_warning,
+não na linha 1 do arquivo.
 
-CONFIGURAÇÃO NO RENDER
-- Tipo recomendado: Background Worker.
-- Build Command: pip install -r requirements.txt
-- Start Command: python bot.py
-- Configure DISCORD_TOKEN no Environment do Render.
-- Mantenha somente uma instância deste bot usando o token.
+No GitHub, substitua o arquivo bot.py inteiro pelo bot.py deste pacote e faça
+Commit changes na branch main. Confira depois que a linha 1 no GitHub é o texto
+inicial/documentação do bot, e não uma linha de dentro de uma função.
 
-Se o token real já apareceu em .env.example, GitHub, ZIP público ou mensagem,
-regenere-o no Discord Developer Portal imediatamente e atualize o Render.
-O tratamento de 429 não remove bloqueios impostos pelo Discord; ele apenas
-aguarda antes de tentar novamente.
+Build Command: pip install -r requirements.txt
+Start Command: python bot.py

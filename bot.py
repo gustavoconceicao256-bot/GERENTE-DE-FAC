@@ -2719,8 +2719,6 @@ _render_http_runner = None
 async def start_render_health_server() -> None:
     """Abre uma rota HTTP mínima quando o host fornece PORT (ex.: Render Web Service)."""
     global _render_http_runner
-    if _render_http_runner is not None:
-        return  # Evita abrir duas vezes a mesma porta durante uma recuperação.
     raw_port = os.getenv("PORT", "").strip()
     if not raw_port:
         return  # Background Worker: não precisa de uma porta HTTP.
@@ -3718,62 +3716,68 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except discord.HTTPException:
         pass
 
-async def run_bot_with_recovery() -> None:
-    """Mantém o processo vivo durante bloqueios 429 temporários no login.
+def _retry_after_seconds(exc: discord.HTTPException) -> float | None:
+    """Extrai Retry-After do cabeçalho ou do corpo, se o Discord o enviar."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            pass
+    # discord.py guarda o corpo textual em HTTPException.text.
+    try:
+        import json
+        payload = json.loads(getattr(exc, "text", "") or "{}")
+        value = payload.get("retry_after")
+        if value is not None:
+            return max(1.0, float(value))
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return None
 
-    Um 429 global pode ocorrer antes de o gateway conectar. Sem este laço,
-    bot.run() encerra o processo e o Render pode reiniciá-lo em sequência,
-    repetindo a tentativa enquanto o bloqueio ainda está ativo.
-    """
-    retry_delay = 30
-    max_retry_delay = 900  # 15 minutos; evita martelar a API durante bloqueios longos.
 
-    # Inicia o healthcheck antes do login para o Render não interpretar a
-    # espera por rate limit como um processo morto em Web Service.
-    await start_render_health_server()
-
-    while not bot.is_closed():
+async def run_bot_with_login_backoff() -> None:
+    """Evita martelar a API quando o Discord/Cloudflare bloqueia o login."""
+    delay_without_header = 600.0  # 10 min na primeira falha sem Retry-After
+    maximum_delay = 6 * 60 * 60.0
+    while True:
         try:
             await bot.start(TOKEN, reconnect=True)
-            return  # Saída normal (por exemplo, encerramento solicitado).
+            return
+        except discord.LoginFailure:
+            log.critical(
+                "Token recusado pelo Discord (401). Confira DISCORD_TOKEN no Render; "
+                "o bot não fará novas tentativas automáticas com credencial inválida."
+            )
+            raise
         except discord.HTTPException as exc:
             if exc.status != 429:
                 raise
+            server_wait = _retry_after_seconds(exc)
+            wait = server_wait if server_wait is not None else delay_without_header
+            # Margem curta para evitar nova tentativa exatamente no limite.
+            wait = min(maximum_delay, max(60.0, wait + 5.0))
             log.error(
-                "Discord recusou o login com HTTP 429 (limite global). "
-                "Nova tentativa em %s segundos. Não reinicie manualmente o serviço.",
-                retry_delay,
-            )
-            # Descarta a sessão HTTP da tentativa anterior antes de tentar de novo.
-            try:
-                await bot.http.close()
-            except Exception:
-                log.debug("Não foi possível fechar a sessão HTTP anterior.", exc_info=True)
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
-        except (OSError, asyncio.TimeoutError) as exc:
-            log.warning(
-                "Falha temporária de rede ao iniciar o bot (%s). Nova tentativa em %s segundos.",
-                exc, retry_delay,
+                "Discord retornou HTTP 429 durante o login. Nova tentativa em %.0f segundos. "
+                "O processo permanecerá ativo; não reinicie o serviço. Resposta: %s",
+                wait, str(exc)[:300],
             )
             try:
-                await bot.http.close()
+                await bot.close()
             except Exception:
-                log.debug("Não foi possível fechar a sessão HTTP anterior.", exc_info=True)
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
-
-
-async def main() -> None:
-    if not TOKEN or TOKEN == "SEU_TOKEN_AQUI":
-        raise SystemExit("Configure DISCORD_TOKEN nas variáveis de ambiente do Render ou no arquivo .env.")
-    init_db()
-    remove_legacy_gtt_branding()
-    await run_bot_with_recovery()
+                log.debug("Falha ao fechar sessão HTTP após 429", exc_info=True)
+            await asyncio.sleep(wait)
+            delay_without_header = min(maximum_delay, delay_without_header * 2)
 
 
 if __name__ == "__main__":
+    if not TOKEN or TOKEN in {"SEU_TOKEN_AQUI", "COLOQUE_SEU_TOKEN_NOVO_AQUI"}:
+        raise SystemExit("Configure DISCORD_TOKEN como variável de ambiente no Render (ou no .env local).")
+    init_db()
+    remove_legacy_gtt_branding()
     try:
-        asyncio.run(main())
+        asyncio.run(run_bot_with_login_backoff())
     except KeyboardInterrupt:
-        log.info("Encerramento solicitado pelo usuário.")
+        log.info("Encerramento solicitado pelo sistema.")
