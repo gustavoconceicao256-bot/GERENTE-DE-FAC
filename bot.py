@@ -644,21 +644,18 @@ class RegistrationApprovalView(View):
 
 
 def highest_configured_rank(member: discord.Member):
-    """Retorna o cargo configurado mais alto usando a posição real do Discord.
-
-    A ordem da hierarquia é: cargo de posição mais baixa = nº 1; posição mais alta = último.
-    Usar Role.position também corrige prioridades numéricas antigas que tenham sido salvas invertidas.
-    """
-    candidates = []
-    for role in member.roles:
-        raw = setting(f"rank_role_{role.id}", "")
-        if not raw:
-            continue
+    """Retorna o cargo de maior prioridade segundo a ordem configurada no painel."""
+    priorities = {}
+    with db() as con:
+        rows = con.execute("SELECT key,value FROM settings WHERE key LIKE 'rank_role_%'").fetchall()
+    for row in rows:
         try:
-            abbreviation = raw.split("|", 1)[0].strip()
-            candidates.append((role.position, role, abbreviation))
-        except (ValueError, TypeError):
+            rid = int(row["key"].replace("rank_role_", "", 1))
+            parts = row["value"].split("|")
+            priorities[rid] = (int(parts[1]) if len(parts) > 1 else 0, parts[0].strip())
+        except (ValueError, TypeError, IndexError):
             continue
+    candidates = [(priorities[r.id][0], r, priorities[r.id][1]) for r in member.roles if r.id in priorities]
     if candidates:
         _, role, abbreviation = max(candidates, key=lambda item: (item[0], item[1].id))
         return role, abbreviation
@@ -1783,6 +1780,404 @@ class HierarchyPublishChannelView(View):
         await publish_configured_panel(interaction, "hierarchy", channel_override=self.channel_id)
 
 
+
+
+# ---------------- HIERARQUIA CONFIGURÁVEL (FLUXO GUIADO) ----------------
+HIERARCHY_MAX_ROLES = 25
+HIERARCHY_FIELDS_PER_MODAL = 5
+
+
+def hierarchy_rows():
+    """Retorna a hierarquia na ordem configurada: topo primeiro."""
+    with db() as con:
+        rows = con.execute("SELECT key,value FROM settings WHERE key LIKE 'rank_role_%'").fetchall()
+    parsed = []
+    for row in rows:
+        try:
+            rid = int(row["key"].replace("rank_role_", "", 1))
+            parts = row["value"].split("|")
+            abbr = parts[0].strip()
+            priority = int(parts[1]) if len(parts) > 1 else 0
+            parsed.append((priority, rid, abbr))
+        except (ValueError, TypeError, IndexError):
+            continue
+    return sorted(parsed, reverse=True)
+
+
+def clear_hierarchy_settings():
+    with db() as con:
+        con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+        con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
+        for key in ("hierarchy_panel_channel_id", "hierarchy_role_count"):
+            con.execute("DELETE FROM settings WHERE key=?", (key,))
+
+
+class HierarchyGuideView(View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=900)
+        self.guild = guild
+
+    @discord.ui.button(label="Configurar hierarquia do zero", style=discord.ButtonStyle.success, emoji="⚙️")
+    async def configure(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HierarchyCountModal(self.guild))
+
+    @discord.ui.button(label="Apagar configuração anterior", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "⚠️ **Confirma a exclusão?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia no canal anteriormente configurado. Essa ação não pode ser desfeita.",
+            view=HierarchyResetConfirmView(self.guild), ephemeral=True
+        )
+
+
+class HierarchyResetConfirmView(View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=120)
+        self.guild = guild
+
+    @discord.ui.button(label="Sim, apagar tudo", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        raw = setting("hierarchy_panel_channel_id", "0")
+        channel = self.guild.get_channel(int(raw)) if raw.isdigit() and int(raw) else None
+        deleted = 0
+        if isinstance(channel, discord.TextChannel):
+            try:
+                async for message in channel.history(limit=None):
+                    try:
+                        await message.delete()
+                        deleted += 1
+                    except discord.Forbidden:
+                        raise
+                    except discord.HTTPException:
+                        continue
+            except discord.Forbidden:
+                await interaction.response.send_message("Não tenho permissão para limpar o canal anterior. Conceda Gerenciar mensagens e tente novamente.", ephemeral=True)
+                return
+        clear_hierarchy_settings()
+        await interaction.response.edit_message(content=f"✅ Configuração apagada. {deleted} mensagem(ns) removida(s) do canal anterior. Você pode começar do zero.", view=None)
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Operação cancelada. Nenhuma configuração foi alterada.", view=None)
+
+
+class HierarchyCountModal(Modal, title="Etapa 1 — Quantidade de cargos"):
+    count = TextInput(label="Quantos cargos terá a hierarquia? (1 a 25)", placeholder="Ex.: 10", max_length=2)
+
+    def __init__(self, guild):
+        super().__init__(timeout=300)
+        self.guild = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.count.value.strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= HIERARCHY_MAX_ROLES:
+            await interaction.response.send_message("Informe uma quantidade entre 1 e 25.", ephemeral=True)
+            return
+        count = int(raw)
+        save_config_value("hierarchy_role_count", str(count))
+        # A nova configuração substitui a lista anterior, mas mantém o canal até a publicação.
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+            con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
+        view = HierarchyRoleConfigView(self.guild, count)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+
+class HierarchyRoleIdsModal(Modal):
+    def __init__(self, parent, start: int, end: int):
+        super().__init__(title=f"Etapa 2 — IDs dos cargos {start + 1} a {end}", timeout=300)
+        self.parent_view = parent
+        self.start = start
+        self.end = end
+        self.inputs = []
+        for index in range(start, end):
+            field = TextInput(
+                label=f"Cargo {parent.count - index} — {'MAIS ALTO' if index == 0 else 'ID do cargo'}",
+                placeholder="Cole o ID do cargo do Discord",
+                required=True, max_length=25
+            )
+            current = parent.role_ids[index]
+            if current:
+                field.default = str(current)
+            self.inputs.append(field)
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        resolved = []
+        for offset, field in enumerate(self.inputs):
+            raw = field.value.strip()
+            role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
+            if not role or role == self.parent_view.guild.default_role:
+                await interaction.response.send_message(f"ID inválido no campo Cargo {self.parent_view.count - (self.start + offset)}. Confira se o cargo pertence a este servidor.", ephemeral=True)
+                return
+            if role.id in resolved or role.id in [x for i, x in enumerate(self.parent_view.role_ids) if x and not self.start <= i < self.end]:
+                await interaction.response.send_message("Você informou o mesmo cargo mais de uma vez. Cada posição precisa ter um cargo diferente.", ephemeral=True)
+                return
+            resolved.append(role.id)
+        for offset, rid in enumerate(resolved):
+            self.parent_view.role_ids[self.start + offset] = rid
+        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+
+
+class HierarchyRoleConfigView(View):
+    def __init__(self, guild, count):
+        super().__init__(timeout=900)
+        self.guild, self.count = guild, count
+        self.role_ids = [None] * count
+        self.page = 0
+
+    @property
+    def pages(self):
+        return (self.count + 4) // 5
+
+    def embed(self):
+        start = self.page * 5
+        end = min(start + 5, self.count)
+        lines = []
+        for idx in range(start, end):
+            role = self.guild.get_role(self.role_ids[idx]) if self.role_ids[idx] else None
+            label = f"Cargo {self.count - idx}"
+            lines.append(f"**{label}:** {role.mention if role else '— não preenchido —'}")
+        e = discord.Embed(title="Etapa 2 — IDs dos cargos", description=(
+            "Informe os IDs na ordem **do maior para o menor**. Após salvar, o bot mostrará a menção do cargo encontrado.\n\n"
+            + "\n".join(lines)
+        ), color=discord.Color.blurple())
+        e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(x is not None for x in self.role_ids)}/{self.count} cargos definidos")
+        return e
+
+    @discord.ui.button(label="Preencher / editar IDs deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    async def edit_block(self, interaction: discord.Interaction, button: discord.ui.Button):
+        start = self.page * 5
+        await interaction.response.send_modal(HierarchyRoleIdsModal(self, start, min(start + 5, self.count)))
+
+    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.pages - 1, self.page + 1)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Voltar à quantidade", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HierarchyCountModal(self.guild))
+
+    @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.role_ids = [None] * self.count
+        self.page = 0
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Confirmar cargos e continuar", style=discord.ButtonStyle.success, row=3)
+    async def continue_tags(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if any(x is None for x in self.role_ids):
+            await interaction.response.send_message("Preencha todos os IDs antes de continuar.", ephemeral=True)
+            return
+        if len(set(self.role_ids)) != self.count:
+            await interaction.response.send_message("Existem cargos repetidos. Corrija antes de continuar.", ephemeral=True)
+            return
+        view = HierarchyTagConfigView(self.guild, self.role_ids)
+        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
+
+
+class HierarchyTagsModal(Modal):
+    def __init__(self, parent, start, end):
+        super().__init__(title=f"Etapa 3 — Tags dos cargos {start + 1} a {end}", timeout=300)
+        self.parent_view, self.start = parent, start
+        self.inputs = []
+        for idx in range(start, end):
+            role = self.parent_view.guild.get_role(self.parent_view.role_ids[idx])
+            field = TextInput(
+                label=f"Tag para {role.name[:35] if role else f'Cargo {idx+1}'}",
+                placeholder="Ex.: M, REC, LT",
+                required=True, max_length=12
+            )
+            old = self.parent_view.tags[idx]
+            if old:
+                field.default = old
+            self.inputs.append(field)
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        for offset, field in enumerate(self.inputs):
+            tag = field.value.strip().replace("[", "").replace("]", "")
+            if not tag or any(ch in tag for ch in "\n\r"):
+                await interaction.response.send_message("Cada cargo precisa ter uma tag válida (até 12 caracteres).", ephemeral=True)
+                return
+            idx = self.start + offset
+            self.parent_view.tags[idx] = tag
+            rid = self.parent_view.role_ids[idx]
+            save_config_value(f"hierarchy_draft_tag_{rid}", tag)
+        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+
+
+class HierarchyTagConfigView(View):
+    def __init__(self, guild, role_ids):
+        super().__init__(timeout=900)
+        self.guild, self.role_ids = guild, list(role_ids)
+        with db() as con:
+            self.tags = [
+                (con.execute("SELECT value FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",)).fetchone() or {"value": ""})["value"]
+                for rid in self.role_ids
+            ]
+        self.page = 0
+
+    @property
+    def pages(self):
+        return (len(self.role_ids) + 4) // 5
+
+    def embed(self):
+        start, end = self.page * 5, min(self.page * 5 + 5, len(self.role_ids))
+        lines = []
+        for idx in range(start, end):
+            role = self.guild.get_role(self.role_ids[idx])
+            tag = self.tags[idx] or "— não definida —"
+            lines.append(f"{role.mention if role else f'Cargo {idx+1}'} → **[{tag}]**")
+        e = discord.Embed(
+            title="Etapa 3 — Tags / abreviações",
+            description=("Defina a tag que ficará antes do nome do membro. Exemplo: **[ M ] GUSTAVO BOBO - 1908**.\n"
+                         "A tag acompanha o cargo mais alto configurado que o membro possuir.\n\n" + "\n".join(lines)),
+            color=discord.Color.blurple()
+        )
+        e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {sum(bool(x) for x in self.tags)}/{len(self.tags)} tags definidas")
+        return e
+
+    @discord.ui.button(label="Preencher / editar tags deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    async def edit_block(self, interaction: discord.Interaction, button: discord.ui.Button):
+        start = self.page * 5
+        await interaction.response.send_modal(HierarchyTagsModal(self, start, min(start + 5, len(self.tags))))
+
+    @discord.ui.button(label="◀ Voltar bloco", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Próximo bloco ▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.pages - 1, self.page + 1)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Voltar aos IDs", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = HierarchyRoleConfigView(self.guild, len(self.role_ids))
+        view.role_ids = list(self.role_ids)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.tags = [""] * len(self.tags)
+        with db() as con:
+            for rid in self.role_ids:
+                con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
+        self.page = 0
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Confirmar tags e continuar", style=discord.ButtonStyle.success, row=3)
+    async def continue_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if any(not x for x in self.tags):
+            await interaction.response.send_message("Defina a tag de todos os cargos antes de continuar.", ephemeral=True)
+            return
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+            total = len(self.role_ids)
+            # A primeira posição é o cargo mais alto; prioridade maior = cargo mais alto.
+            for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
+                priority = total - idx
+                con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"rank_role_{rid}", f"{tag}|{priority}"))
+                con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
+        view = HierarchyFinalChannelView(self.guild)
+        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
+
+
+class HierarchyManualChannelModal(Modal, title="Canal da hierarquia"):
+    channel_id = TextInput(label="ID do canal de texto", placeholder="Cole o ID do canal", max_length=25)
+
+    def __init__(self, parent):
+        super().__init__(timeout=300)
+        self.parent_view = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.channel_id.value.strip()
+        channel = self.parent_view.guild.get_channel(int(raw)) if raw.isdigit() else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("Não encontrei um canal de texto com esse ID neste servidor.", ephemeral=True)
+            return
+        self.parent_view.channel_id = channel.id
+        save_config_value("hierarchy_panel_channel_id", str(channel.id))
+        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+
+
+class HierarchyFinalChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self, parent):
+        self.parent_view = parent
+        super().__init__(placeholder="Selecione o canal de publicação", channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.parent_view.channel_id = self.values[0].id
+        save_config_value("hierarchy_panel_channel_id", str(self.parent_view.channel_id))
+        await interaction.response.edit_message(embed=self.parent_view.embed(), view=self.parent_view)
+
+
+class HierarchyFinalChannelView(View):
+    def __init__(self, guild):
+        super().__init__(timeout=900)
+        self.guild = guild
+        raw = setting("hierarchy_panel_channel_id", "0")
+        self.channel_id = int(raw) if raw.isdigit() and int(raw) else None
+        self.add_item(HierarchyFinalChannelSelect(self))
+
+    def embed(self):
+        channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
+        e = discord.Embed(
+            title="Etapa 4 — Canal de publicação",
+            description="Escolha o canal pelo menu ou informe o ID manualmente. Ao publicar, o bot limpará as mensagens do canal escolhido e enviará a hierarquia atualizada.",
+            color=discord.Color.blurple()
+        )
+        e.add_field(name="Canal selecionado", value=channel.mention if channel else "Nenhum canal selecionado", inline=False)
+        e.set_footer(text="O bot precisa de Ver canal, Enviar mensagens, Incorporar links e Gerenciar mensagens.")
+        return e
+
+    @discord.ui.button(label="Informar ID manualmente", style=discord.ButtonStyle.secondary, row=1)
+    async def manual(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HierarchyManualChannelModal(self))
+
+    @discord.ui.button(label="Voltar às tags", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = HierarchyTagConfigView(self.guild, [rid for _priority, rid, _tag in hierarchy_rows()])
+        view.tags = [tag for _priority, _rid, tag in hierarchy_rows()]
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="Reiniciar esta etapa", style=discord.ButtonStyle.danger, row=2)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.channel_id = None
+        save_config_value("hierarchy_panel_channel_id", "0")
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="Limpar canal e publicar hierarquia", style=discord.ButtonStyle.success, emoji="🚀", row=3)
+    async def publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("Selecione um canal válido antes de publicar.", ephemeral=True)
+            return
+        if not hierarchy_rows():
+            await interaction.response.send_message("A configuração dos cargos não foi encontrada. Refaça as etapas anteriores.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            async for message in channel.history(limit=None):
+                try:
+                    await message.delete()
+                except discord.Forbidden:
+                    raise
+                except discord.HTTPException:
+                    continue
+        except discord.Forbidden:
+            await interaction.followup.send("Não tenho permissão para limpar esse canal. Conceda Gerenciar mensagens ao bot.", ephemeral=True)
+            return
+        await publish_configured_panel(interaction, "hierarchy", channel_override=channel.id)
+
+
 class ConfigPanelView(View):
     def __init__(self):
         super().__init__(timeout=900)
@@ -1802,7 +2197,23 @@ class ConfigPanelView(View):
 
     @discord.ui.button(label="Hierarquia", style=discord.ButtonStyle.primary, emoji="🏛️", row=0)
     async def hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(ConfigHierarchyModal())
+        if not interaction.guild:
+            await interaction.response.send_message("Use este painel dentro do servidor.", ephemeral=True)
+            return
+        guide = discord.Embed(
+            title="🏛️ Guia de configuração da hierarquia",
+            description=(
+                "Configure a hierarquia em quatro etapas: **1)** quantidade de cargos; "
+                "**2)** IDs dos cargos, do mais alto ao mais baixo; **3)** tag/abreviação de cada cargo; "
+                "**4)** canal de publicação.\\n\\n"
+                "O bot identifica o maior cargo configurado do membro e atualiza o nickname para "
+                "**[ TAG ] NOME - ID**. Os dados ficam salvos no SQLite.\\n\\n"
+                "Você também pode apagar a configuração anterior e limpar as mensagens do canal "
+                "da hierarquia para começar do zero."
+            ),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=guide, view=HierarchyGuideView(interaction.guild), ephemeral=True)
 
     @discord.ui.button(label="Farm", style=discord.ButtonStyle.primary, emoji="🌾", row=0)
     async def farm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1874,26 +2285,17 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
             except Exception as exc:
                 log.warning("Não consegui atualizar o cache de membros ao publicar a hierarquia: %s", exc)
 
-            with db() as con:
-                rank_rows = con.execute("SELECT key,value FROM settings WHERE key LIKE 'rank_role_%'").fetchall()
             configured = []
-            for row in rank_rows:
-                try:
-                    role_id = int(row["key"].replace("rank_role_", "", 1))
-                    abbreviation = row["value"].split("|", 1)[0].strip() or "RANK"
-                    role = interaction.guild.get_role(role_id)
-                    if role and role != interaction.guild.default_role:
-                        configured.append((role, abbreviation))
-                except (ValueError, TypeError, IndexError):
-                    continue
-            # Use the Discord role position as the canonical ranking, so legacy inverted
-            # numeric priorities cannot accidentally make the lowest role the highest.
-            configured.sort(key=lambda item: (item[0].position, item[0].name.casefold(), item[0].id))
+            for priority, role_id, abbreviation in hierarchy_rows():
+                role = interaction.guild.get_role(role_id)
+                if role and role != interaction.guild.default_role:
+                    configured.append((priority, role, abbreviation or "RANK"))
+            configured.sort(key=lambda item: item[0])
             if not configured:
                 await reply("Nenhum cargo está configurado para exibição. Abra `/config` > Hierarquia e selecione os cargos.", ephemeral=True)
                 return
 
-            ranks = [(priority, role.id, abbreviation, role) for priority, (role, abbreviation) in enumerate(configured, start=1)]
+            ranks = [(priority, role.id, abbreviation, role) for priority, role, abbreviation in configured]
             rank_priorities = {role_id: priority for priority, role_id, _, _ in ranks}
             members_by_highest_rank: dict[int, list[discord.Member]] = {role_id: [] for _, role_id, _, _ in ranks}
             configured_role_ids = set(rank_priorities)
@@ -1906,15 +2308,6 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                 # Higher priority number means higher rank. The member is listed in only one rank.
                 highest_role_id = max(owned_rank_ids, key=lambda rid: rank_priorities[rid])
                 members_by_highest_rank[highest_role_id].append(member)
-
-            # Normalize persisted priorities too, fixing any hierarchy saved with inverted values.
-            with db() as con:
-                con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-                for priority, role_id, abbreviation, _role in ranks:
-                    con.execute(
-                        "INSERT INTO settings(key,value) VALUES(?,?)",
-                        (f"rank_role_{role_id}", f"{abbreviation}|{priority}"),
-                    )
 
             panel_title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
             panel_description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização.")
@@ -1947,6 +2340,10 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                     )
                     await target.send(embed=role_embed)
                     sent_messages += 1
+            # Aplica as tags recém-configuradas também aos membros que já estavam no servidor.
+            for current_member in interaction.guild.members:
+                if not current_member.bot:
+                    await sync_configured_member_nickname(current_member, "Nova hierarquia publicada")
             await reply(
                 f"✅ Hierarquia publicada em {target.mention}: **{total_ranks} cargos**, cada um em mensagem separada. "
                 f"O cargo mais alto aparece primeiro; o nº 1 (mais baixo) aparece por último. ({sent_messages} mensagem(ns)).",
@@ -2075,6 +2472,40 @@ async def on_member_join(member: discord.Member) -> None:
             await member.add_roles(pending_role, reason="Cargo inicial antes da whitelist")
         except discord.Forbidden:
             log.warning("Sem permissão para aplicar o cargo pré-WL ao novo membro %s", member.id)
+    await sync_configured_member_nickname(member, "Membro entrou no servidor")
+
+
+async def sync_configured_member_nickname(member: discord.Member, reason: str = "Sincronização automática da hierarquia") -> None:
+    """Atualiza apenas membros com WL aprovada, preservando nome RP e ID cadastrados."""
+    with db() as con:
+        row = con.execute(
+            "SELECT character_name,game_id FROM members WHERE discord_id=? AND status='ACTIVE'",
+            (str(member.id),),
+        ).fetchone()
+    if not row:
+        return
+    rank_role, abbreviation = highest_configured_rank(member)
+    if not rank_role:
+        return
+    with db() as con:
+        con.execute("UPDATE members SET rank_name=? WHERE discord_id=?", (rank_role.name, str(member.id)))
+    nickname = f"[ {abbreviation or 'M'} ] {row['character_name'].upper()} - {row['game_id']}"[:32]
+    if member.nick == nickname:
+        return
+    try:
+        await member.edit(nick=nickname, reason=reason)
+    except discord.Forbidden:
+        log.warning("Sem permissão para atualizar nickname do membro %s; confira a posição do cargo do bot.", member.id)
+    except discord.HTTPException as exc:
+        log.warning("Falha ao sincronizar nickname do membro %s: %s", member.id, exc)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    before_roles = {role.id for role in before.roles}
+    after_roles = {role.id for role in after.roles}
+    if before_roles != after_roles:
+        await sync_configured_member_nickname(after, "Cargo da hierarquia alterado")
 
 
 @bot.event

@@ -196,3 +196,7 @@ No comando `/config`:
 - **Farm → Cargo autorizado a aprovar/recusar:** controla quem pode analisar comprovantes. Administradores também podem decidir.
 
 As escolhas são salvas no SQLite e permanecem após reiniciar o bot. O cargo temporário é aplicado automaticamente a novos membros; para membros que já estavam no servidor, também é aplicado quando enviam a solicitação de WL.
+
+
+### Hierarquia dinâmica
+Configure os cargos, suas tags e o canal de publicação em `/config` → `Hierarquia`. A configuração é salva no SQLite e os nicknames dos membros com WL aprovada são sincronizados automaticamente conforme o maior cargo configurado.

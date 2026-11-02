@@ -65,3 +65,19 @@ Nos painéis de configuração, use os menus do Discord quando o cargo/canal est
 A configuração não solicita mais uma quantidade de cargos. Selecione os cargos nas páginas, use **Remover cargo selecionado** para corrigir uma escolha, **Adicionar cargo por ID** quando o cargo não aparecer no menu, **Reiniciar configuração** para limpar a hierarquia e **Salvar hierarquia** para confirmar. A ordem de seleção define a hierarquia: primeiro cargo = base; último cargo = topo.
 
 A publicação cria uma mensagem limpa por cargo, com o nome do cargo, quantidade de membros, menções dos membros (ou aviso de que ninguém possui o cargo) e horário da última atualização.
+
+
+## Hierarquia dinâmica pelo Discord
+
+A configuração da hierarquia é feita em `/config` → **Hierarquia**. O fluxo guiado possui quatro etapas:
+
+1. Informe a quantidade de cargos (de 1 a 25).
+2. Informe os IDs dos cargos na ordem do mais alto para o mais baixo. Para respeitar o limite de cinco campos por modal do Discord, o preenchimento é dividido em blocos.
+3. Defina uma tag/abreviação para cada cargo. A tag é aplicada antes do nome RP e do ID do jogador.
+4. Selecione o canal de publicação pelo menu ou informe o ID manualmente.
+
+Exemplo de nickname: `[ LT ] GUSTAVO BOBO - 1908`. Quando o membro recebe ou perde um cargo configurado, o bot identifica o cargo de maior prioridade e atualiza o nickname. O nome RP e o ID são recuperados do cadastro aprovado da WL.
+
+A configuração é persistida no SQLite. O botão **Apagar configuração anterior** solicita confirmação e, após confirmado, remove os cargos/tags/canal salvos e limpa as mensagens do canal anteriormente configurado. O botão de publicação também limpa o canal escolhido antes de publicar a hierarquia nova.
+
+**Permissões necessárias:** habilite `Server Members Intent` no Developer Portal e conceda ao bot `View Channel`, `Send Messages`, `Embed Links`, `Read Message History` e `Manage Messages` no canal da hierarquia. O cargo do bot deve ficar acima dos cargos que ele precisa atribuir/gerenciar e ter `Manage Nicknames` para editar apelidos.
