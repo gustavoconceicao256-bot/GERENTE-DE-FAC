@@ -205,3 +205,7 @@ Configure os cargos, suas tags e o canal de publicação em `/config` → `Hiera
 ## Erro HTTP 429 no login
 
 Consulte [CORRECAO-429-RENDER.md](CORRECAO-429-RENDER.md). O bot respeita `Retry-After` e usa espera progressiva quando o Discord não informa prazo. Para hospedagem de bot, prefira Render Background Worker e mantenha uma única instância.
+
+## Atualização WL e hierarquia — novembro/2026
+
+A configuração da WL agora usa Components V2 em três etapas (cargos, canais e revisão), com paginação por setas nos menus. A hierarquia usa Cargo 1 como o mais alto, último cargo como o mais baixo, exige todas as tags antes de liberar a etapa de publicação e pagina os canais em blocos de 25. Consulte `ATUALIZACAO-WL-HIERARQUIA-2026-11.txt` para o resumo das alterações.

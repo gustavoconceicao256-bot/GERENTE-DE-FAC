@@ -1,0 +1,28 @@
+ATUALIZACAO — WL E HIERARQUIA (02/11/2026)
+
+HIERARQUIA
+- A seleção agora é apresentada do cargo mais alto para o mais baixo.
+- Cargo 1 representa o mais alto; se forem 3 cargos, o mais baixo fica na posição 3.
+- A ordem é normalizada pela posição real dos cargos no Discord antes de configurar as tags.
+- O painel publicado é ordenado do cargo mais alto para o mais baixo.
+- A identificação de cada membro continua considerando somente o maior cargo configurado que ele possui.
+- Na etapa 3, o botão de avanço para a etapa 4 só é criado depois que todas as tags estiverem preenchidas.
+- As setas da etapa 3 percorrem os blocos de até 5 tags sem avançar de etapa.
+- A etapa 4 usa menu de canais com paginação por setas (25 canais por página).
+- O botão Publicar hierarquia do painel principal também abre o seletor paginado da etapa 4.
+
+WHITELIST
+- A configuração foi reorganizada em Components V2 e três etapas:
+  1. Cargos: temporário (opcional), cargo após aprovação, cargo autorizador e cargo de recrutadores.
+  2. Canais: canal do painel e canal que recebe solicitações.
+  3. Revisão: resumo das escolhas e publicação.
+- O botão Próximo só aparece quando os campos obrigatórios da etapa atual estão configurados.
+- Menus de cargos e canais exibem até 25 opções por página, com setas para navegar.
+- A aparência do painel pode ser alterada na etapa de revisão.
+- A publicação direta da WL também verifica se os campos obrigatórios estão configurados.
+
+VALIDAÇÃO
+- bot.py passou por compilação sintática (py_compile) e análise AST.
+- O ZIP foi verificado estruturalmente.
+- Não foi feito login real no Discord nem teste de interação em servidor; valide no Render após atualizar o código.
+- Ao atualizar ou apagar a hierarquia, o bot remove apenas mensagens de hierarquia que ele próprio publicou (títulos começando com "📋 | "). Mensagens comuns do canal são preservadas.
