@@ -7,13 +7,17 @@ ATUALIZAÇÃO — CONFIGURAÇÃO FINAL DO FARM
   4. Canal de histórico final (opcional)
 - O resumo é atualizado após cada seleção.
 - O seletor permite escolher novamente qualquer campo, então uma configuração incorreta pode ser redefinida.
-- O formulário de ID manual retorna para a tela de configuração já atualizada.
+- A configuração de canais/cargos usa seletores paginados de até 25 opções.
+- O formulário de ID manual usa modal Components V2 (Label + TextInput) e retorna à tela atualizada.
 - O botão ENVIAR PAINEL aparece quando os três campos obrigatórios apontam para canais/cargo válidos do servidor.
 - Ao clicar, o painel Farm é publicado no canal público configurado.
-- IDs manuais de canais do Farm agora exigem canal de texto; @everyone não pode ser o cargo autorizador.
+- IDs manuais de canais do Farm exigem canal de texto; @everyone não pode ser o cargo autorizador.
+- Mensagens de análise, confirmação, pagamento e recusa usam Components V2; o comprovante fica anexado e visível no painel.
 
-Validação executada:
-- Compilação sintática de bot.py: aprovada.
-- Análise AST: aprovada.
-- Integridade do ZIP: verificada após empacotamento.
-- Não houve teste conectado a um servidor Discord nesta execução.
+Validação automatizada atual:
+- Auditoria de Components V2, botões, modais e paginação.
+- Testes de SQLite e migração de schema.
+- Testes do parser de Retry-After.
+- Compilação sintática e compileall.
+
+A homologação final de permissões, anexos, DMs e interações precisa ser feita em um servidor Discord de teste com o bot instalado.

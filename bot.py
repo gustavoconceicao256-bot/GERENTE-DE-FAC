@@ -4,6 +4,7 @@ Configure as variáveis de ambiente no arquivo .env antes de iniciar.
 from __future__ import annotations
 
 import os
+import copy
 import sqlite3
 import logging
 import asyncio
@@ -13,20 +14,387 @@ from urllib.parse import urlparse
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from types import SimpleNamespace
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-from discord.ui import Modal, TextInput, View
+from discord.ui import Modal, TextInput
 from dotenv import load_dotenv
 
-load_dotenv()
+
+class ComponentsV2Modal(Modal):
+    """Modal com campos TextInput sempre embrulhados em Label (modal Components V2).
+
+    Preserva os atributos TextInput já usados pelos handlers existentes, mas
+    serializa cada campo como Label + TextInput, padrão atual da API do Discord.
+    """
+    @staticmethod
+    def _wrap_text_input(item: TextInput):
+        # O label pertence ao componente Label em modais V2; TextInput.label
+        # é legado/depreciado e deve ser omitido no payload.
+        label_text = getattr(getattr(item, "_underlying", None), "label", None) or "Campo"
+        item._underlying.label = None
+        return discord.ui.Label(text=str(label_text)[:45], component=item)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Modal._init_children instancia os campos declarados na classe sem
+        # passar por add_item; convertemos esses campos após a inicialização.
+        for child in list(self.children):
+            if isinstance(child, TextInput):
+                self.remove_item(child)
+                super().add_item(self._wrap_text_input(child))
+
+    def add_item(self, item):
+        # Também cobre TextInputs criados dinamicamente em __init__.
+        if isinstance(item, TextInput):
+            item = self._wrap_text_input(item)
+        return super().add_item(item)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.exception("Erro em formulário Components V2", exc_info=error)
+        try:
+            message_view = v2_view(None, None, "O formulário encontrou um erro. Revise os dados e tente novamente.")
+            if interaction.response.is_done():
+                await interaction.followup.send(None, ephemeral=True, view=message_view)
+            else:
+                await interaction.response.send_message(None, ephemeral=True, view=message_view)
+        except discord.HTTPException:
+            log.exception("Não foi possível responder ao erro do formulário")
+
+
+class PanelMessage:
+    """Modelo interno de conteúdo para TextDisplay/MediaGallery (não é um Embed)."""
+
+    def __init__(self, title=None, description=None, *, color=None, timestamp=None):
+        self.title = str(title)[:256] if title is not None else None
+        self.description = str(description)[:4096] if description is not None else None
+        self.color = color
+        self.timestamp = timestamp
+        self.fields = []
+        self.author = SimpleNamespace(name=None, icon_url=None)
+        self.footer = SimpleNamespace(text=None, icon_url=None)
+        self.image = SimpleNamespace(url=None)
+        self.thumbnail = SimpleNamespace(url=None)
+
+    def add_field(self, name, value, inline=True):
+        self.fields.append(SimpleNamespace(name=str(name), value=str(value), inline=bool(inline)))
+        return self
+
+    def set_author(self, *, name=None, icon_url=None, url=None):
+        self.author = SimpleNamespace(name=name, icon_url=icon_url, url=url)
+        return self
+
+    def set_footer(self, text=None, *, icon_url=None):
+        self.footer = SimpleNamespace(text=text, icon_url=icon_url)
+        return self
+
+    def set_image(self, *, url=None):
+        self.image = SimpleNamespace(url=url)
+        return self
+
+    def set_thumbnail(self, *, url=None):
+        self.thumbnail = SimpleNamespace(url=url)
+        return self
+
+    def copy(self):
+        return copy.deepcopy(self)
+
+    def to_text(self) -> str:
+        parts = []
+        if self.author and self.author.name:
+            parts.append(f"**{self.author.name}**")
+        if self.title:
+            parts.append(f"# {self.title}")
+        if self.description:
+            parts.append(self.description)
+        for field in self.fields:
+            parts.append(f"**{field.name}**\n{field.value}")
+        if self.footer and self.footer.text:
+            parts.append(f"-# {self.footer.text}")
+        if self.timestamp:
+            parts.append(f"-# {self.timestamp.strftime('%d/%m/%Y %H:%M UTC')}")
+        return "\n\n".join(parts)[:4000] or "‎"
+
+
+# ---------------- DISCORD COMPONENTS V2 ----------------
+V2_SELECT_TYPES = (
+    discord.ui.Select,
+    discord.ui.ChannelSelect,
+    discord.ui.RoleSelect,
+    discord.ui.UserSelect,
+    discord.ui.MentionableSelect,
+)
+
+
+class ComponentsV2LayoutView(discord.ui.LayoutView):
+    """Base comum de LayoutView com tratamento de erro para todas as telas V2."""
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item):
+        log.exception(
+            "Erro em interação Components V2 (%s)",
+            type(item).__name__ if item is not None else "componente desconhecido",
+            exc_info=error,
+        )
+        try:
+            message_view = v2_view(
+                None, None,
+                "Essa ação encontrou um erro. Tente novamente; se persistir, avise a administração.",
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(None, ephemeral=True, view=message_view)
+            else:
+                await interaction.response.send_message(None, ephemeral=True, view=message_view)
+        except discord.HTTPException:
+            log.exception("Não foi possível responder ao erro da interação")
+
+
+class ComponentsV2View(ComponentsV2LayoutView):
+    """LayoutView compatível com a API antiga do projeto, mas publica somente componentes V2.
+
+    Botões e menus são agrupados em ActionRows dentro de um Container. O texto
+    substitui embeds e é renderizado como TextDisplay; assim o Discord recebe
+    exclusivamente componentes V2 (flag IS_COMPONENTS_V2).
+    """
+    def __init__(self, *, timeout: Optional[float] = 180.0):
+        super().__init__(timeout=timeout)
+        self._v2_text = discord.ui.TextDisplay("‎")
+        self._v2_container = discord.ui.Container(self._v2_text)
+        self._v2_rows: dict[int, discord.ui.ActionRow] = {}
+        self._v2_media_gallery = None
+        super().add_item(self._v2_container)
+        self._install_decorated_callbacks()
+
+    def _install_decorated_callbacks(self):
+        """Adapta @discord.ui.button/@select tradicionais para ActionRows V2."""
+        installed = set()
+        for base in type(self).__mro__:
+            for name, member in base.__dict__.items():
+                model_type = getattr(member, "__discord_ui_model_type__", None)
+                model_kwargs = getattr(member, "__discord_ui_model_kwargs__", None)
+                if model_type is None or model_kwargs is None or name in installed:
+                    continue
+                item = model_type(**model_kwargs)
+                bound_callback = getattr(self, name)
+
+                # LayoutView não cria o wrapper de callback que View tradicional
+                # instalava para métodos @discord.ui.button. O wrapper abaixo
+                # encaminha explicitamente (interaction, componente).
+                async def _dispatch(interaction, callback=bound_callback, component=item):
+                    await callback(interaction, component)
+
+                item.callback = _dispatch
+
+                # Preserva a API usada pelo restante do projeto:
+                # self.next.disabled, self.approve.label etc.
+                setattr(self, name, item)
+                self.add_item(item)
+                installed.add(name)
+
+    @staticmethod
+    def _row_key(item) -> int:
+        row = getattr(item, "row", None)
+        return int(row) if row is not None else 99
+
+    def _sync_action_row_order(self):
+        # Métodos @button são instalados durante super().__init__, antes de
+        # alguns menus adicionados no __init__ da subclasse. Reordenamos os
+        # ActionRows pelo índice lógico para não mostrar botões antes dos menus.
+        for row in self._v2_rows.values():
+            self._v2_container.remove_item(row)
+        for _key, row in sorted(self._v2_rows.items(), key=lambda pair: pair[0]):
+            self._v2_container.add_item(row)
+
+    def add_item(self, item):
+        # Layout primitives and containers are already valid V2 children.
+        if isinstance(item, (discord.ui.Container, discord.ui.TextDisplay,
+                             discord.ui.Separator, discord.ui.Section,
+                             discord.ui.MediaGallery, discord.ui.File)):
+            self._v2_container.add_item(item)
+            return self
+
+        # Interactive components must be placed in ActionRows.
+        if isinstance(item, discord.ui.Button) or isinstance(item, V2_SELECT_TYPES):
+            key = self._row_key(item)
+            row = self._v2_rows.get(key)
+            item_is_select = isinstance(item, V2_SELECT_TYPES)
+            row_has_select = bool(row and row.children and isinstance(row.children[0], V2_SELECT_TYPES))
+            incompatible = row is not None and (
+                len(row.children) >= 5
+                or (item_is_select and len(row.children) > 0)
+                or row_has_select
+            )
+            if row is None or incompatible:
+                key = max(self._v2_rows.keys(), default=-1) + 1
+                row = discord.ui.ActionRow()
+                self._v2_rows[key] = row
+                self._v2_container.add_item(row)
+            row.add_item(item)
+            self._sync_action_row_order()
+            return self
+
+        # Preserve support for existing code that adds ActionRows directly.
+        if isinstance(item, discord.ui.ActionRow):
+            key = max(self._v2_rows.keys(), default=-1) + 1
+            self._v2_rows[key] = item
+            self._sync_action_row_order()
+            return self
+        raise TypeError(f"Componente não suportado em Components V2: {type(item).__name__}")
+
+    def remove_item(self, item):
+        for key, row in list(self._v2_rows.items()):
+            if item in row.children:
+                row.remove_item(item)
+                if not row.children:
+                    self._v2_container.remove_item(row)
+                    self._v2_rows.pop(key, None)
+                break
+        return self
+
+    def clear_items(self):
+        for row in list(self._v2_rows.values()):
+            self._v2_container.remove_item(row)
+        self._v2_rows.clear()
+        return self
+
+    def set_text(self, text: str):
+        text = str(text or "").strip() or "‎"
+        # TextDisplay content can be updated in place, preserving component order.
+        if self._v2_text is None:
+            self._v2_text = discord.ui.TextDisplay(text[:4000])
+            self._v2_container.add_item(self._v2_text)
+        else:
+            self._v2_text.content = text[:4000]
+        return self
+
+    def set_panel_message(self, panel_message: Optional[PanelMessage]):
+        if panel_message is None:
+            return self
+        self.set_text(panel_message.to_text())
+        if panel_message.color:
+            self._v2_container.accent_colour = panel_message.color
+        media_urls = []
+        if panel_message.image and panel_message.image.url:
+            media_urls.append(panel_message.image.url)
+        if panel_message.thumbnail and panel_message.thumbnail.url:
+            media_urls.append(panel_message.thumbnail.url)
+        if self._v2_media_gallery is not None:
+            self._v2_container.remove_item(self._v2_media_gallery)
+            self._v2_media_gallery = None
+        if media_urls:
+            self._v2_media_gallery = discord.ui.MediaGallery(
+                *(discord.MediaGalleryItem(url) for url in media_urls[:10])
+            )
+            self._v2_container.add_item(self._v2_media_gallery)
+        self._sync_action_row_order()
+        return self
+
+    def set_message_content(self, content: Optional[str]):
+        if content:
+            current = getattr(self._v2_text, "content", "") if self._v2_text else ""
+            return self.set_text((str(content) + ("\n\n" + current if current else ""))[:4000])
+        return self
+
+
+
+
+def v2_view(panel_message=None, view=None, content=None):
+    """Monta uma mensagem Components V2 a partir do conteúdo textual e mídia."""
+    if isinstance(view, ComponentsV2View):
+        view.set_panel_message(panel_message)
+        view.set_message_content(content)
+        return view
+    if isinstance(view, discord.ui.LayoutView):
+        # LayoutViews já construídas permanecem intactas; o conteúdo adicional
+        # é anexado em um Container independente, sem payload de embed/content.
+        if panel_message is not None or content:
+            text_parts = []
+            if content:
+                text_parts.append(str(content))
+            if panel_message is not None:
+                text_parts.append(panel_message.to_text())
+            block = discord.ui.Container(
+                discord.ui.TextDisplay("\n\n".join(text_parts)[:4000] or "‎")
+            )
+            media_urls = []
+            if panel_message is not None:
+                if panel_message.image and panel_message.image.url:
+                    media_urls.append(panel_message.image.url)
+                if panel_message.thumbnail and panel_message.thumbnail.url:
+                    media_urls.append(panel_message.thumbnail.url)
+                if panel_message.color:
+                    block.accent_colour = panel_message.color
+            if media_urls:
+                block.add_item(discord.ui.MediaGallery(
+                    *(discord.MediaGalleryItem(url) for url in media_urls[:10])
+                ))
+            view.add_item(block)
+        return view
+    result = ComponentsV2View(timeout=getattr(view, "timeout", 180.0))
+    result.set_panel_message(panel_message)
+    result.set_message_content(content)
+    if view is not None:
+        for child in list(getattr(view, "children", [])):
+            result.add_item(child)
+    return result
+
+
+def add_v2_containers(view: discord.ui.LayoutView, components: list, *, limit: int = 10):
+    """Adiciona os blocos em containers válidos (máximo de 10 filhos por container)."""
+    if limit < 1 or limit > 10:
+        raise ValueError("O limite de filhos por Container deve ficar entre 1 e 10.")
+    for offset in range(0, len(components), limit):
+        view.add_item(discord.ui.Container(*components[offset:offset + limit]))
+    return view
+
+
+def message_component_text(message: Optional[discord.Message]) -> str:
+    """Extrai textos de TextDisplay/Container V2 e mantém compatibilidade com mensagens antigas."""
+    if message is None:
+        return ""
+    parts: list[str] = []
+
+    def walk(component):
+        content = getattr(component, "content", None)
+        if isinstance(content, str) and content:
+            parts.append(content)
+        for child in getattr(component, "children", ()) or ():
+            walk(child)
+
+    try:
+        for component in getattr(message, "components", ()) or ():
+            walk(component)
+    except (AttributeError, TypeError):
+        pass
+    # Compatibilidade com mensagens legadas que ainda estejam no histórico.
+    for embed in getattr(message, "embeds", ()) or ():
+        if embed.title:
+            parts.append(embed.title)
+        if embed.description:
+            parts.append(embed.description)
+        for field in embed.fields:
+            parts.append(f"{field.name}\n{field.value}")
+        if embed.footer and embed.footer.text:
+            parts.append(embed.footer.text)
+    return "\n".join(parts)
+
+
+def message_marker_id(message: Optional[discord.Message], marker: str) -> Optional[int]:
+    text = message_component_text(message)
+    match = re.search(re.escape(marker) + r"(\d+)", text)
+    return int(match.group(1)) if match else None
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 # ---------------- CONFIGURAÇÃO ----------------
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID", "0") or 0)
 FACTION_NAME = re.sub(r"\bGTT\b", "", os.getenv("FACTION_NAME", "Facção RP"), flags=re.IGNORECASE).strip(" -—|") or "Facção RP"
-DB_PATH = os.getenv("DATABASE_PATH", "fac_control.sqlite3")
+DB_PATH = os.getenv("DATABASE_PATH", "").strip() or os.path.join(BASE_DIR, "fac_control.sqlite3")
+if not os.path.isabs(DB_PATH):
+    DB_PATH = os.path.join(BASE_DIR, DB_PATH)
 
 MEMBER_ROLE_ID = int(os.getenv("MEMBER_ROLE_ID", "1523371849487220828") or 1523371849487220828)
 RECRUIT_ROLE_ID = int(os.getenv("RECRUIT_ROLE_ID", "1461194746235195525") or 1461194746235195525)
@@ -53,6 +421,7 @@ log = logging.getLogger("fac-control")
 # ---------------- BANCO DE DADOS ----------------
 @contextmanager
 def db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -348,7 +717,7 @@ def is_active_member(discord_id: int) -> bool:
 
 async def deny_unless_config_access(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Use este painel dentro do servidor.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este painel dentro do servidor."))
         return False
     member = interaction.user
     allowed = member.guild_permissions.administrator or has_leadership(interaction) or any(
@@ -356,8 +725,8 @@ async def deny_unless_config_access(interaction: discord.Interaction) -> bool:
     )
     if not allowed:
         await interaction.response.send_message(
-            "Você precisa do cargo de desenvolvedor, liderança ou permissão de administrador para acessar o painel.",
-            ephemeral=True,
+            None,
+            ephemeral=True, view=v2_view(None, None, "Você precisa do cargo de desenvolvedor, liderança ou permissão de administrador para acessar o painel."),
         )
         return False
     return True
@@ -367,9 +736,9 @@ async def deny_unless_leader(interaction: discord.Interaction) -> bool:
     if not has_leadership(interaction):
         msg = "Você precisa do cargo de liderança ou permissão de administrador para usar isso."
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, msg))
         else:
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, msg))
         return False
     return True
 
@@ -389,9 +758,9 @@ async def send_channel_log(guild: discord.Guild, title: str, description: str,
     channel = guild.get_channel(channel_id) if channel_id else None
     if not isinstance(channel, discord.TextChannel):
         return
-    embed = discord.Embed(title=title, description=description[:4000], color=color, timestamp=datetime.now(timezone.utc))
+    embed = PanelMessage(title=title, description=description[:4000], color=color, timestamp=datetime.now(timezone.utc))
     try:
-        await channel.send(embed=embed)
+        await channel.send(view=v2_view(embed, None, None))
     except discord.HTTPException as exc:
         log.warning("Não foi possível enviar log no canal %s: %s", channel_id, exc)
 
@@ -417,7 +786,7 @@ def invite_url() -> str:
     return setting("server_invite_url", os.getenv("SERVER_INVITE_URL", "https://discord.com"))
 
 
-class RegistrationModal(Modal, title="Whitelist da facção"):
+class RegistrationModal(ComponentsV2Modal, title="Whitelist da facção"):
     character_name = TextInput(label="Seu nome no RP", placeholder="Ex.: Gustavo", max_length=32)
     game_id = TextInput(label="Seu ID no FiveM", placeholder="Somente números", max_length=8)
 
@@ -427,31 +796,38 @@ class RegistrationModal(Modal, title="Whitelist da facção"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Use este formulário dentro do servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este formulário dentro do servidor."))
             return
         gid = self.game_id.value.strip()
         name = self.character_name.value.strip()
         if not gid.isdigit():
-            await interaction.response.send_message("O ID do FiveM precisa conter somente números.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O ID do FiveM precisa conter somente números."))
             return
         role_id = recruiter_role_id()
         recruiter = interaction.guild.get_member(self.recruiter_id)
         if not recruiter or not role_id or not any(role.id == role_id for role in recruiter.roles):
-            await interaction.response.send_message("Esse recrutador não possui mais o cargo autorizado. Inicie a WL novamente.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse recrutador não possui mais o cargo autorizado. Inicie a WL novamente."))
             return
         with db() as con:
             pending = con.execute("SELECT id FROM registration_requests WHERE discord_id=? AND status='PENDING'", (str(interaction.user.id),)).fetchone()
             existing = con.execute("SELECT discord_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
             blacklisted = con.execute("SELECT game_id FROM blacklist WHERE game_id=?", (gid,)).fetchone()
-            duplicate_game_id = con.execute("SELECT discord_id FROM members WHERE game_id=? AND status='ACTIVE'", (gid,)).fetchone()
+            duplicate_game_id = con.execute(
+                "SELECT discord_id FROM members WHERE game_id=? AND discord_id<>?",
+                (gid, str(interaction.user.id)),
+            ).fetchone()
+            pending_game_id = con.execute(
+                "SELECT id FROM registration_requests WHERE game_id=? AND discord_id<>? AND status='PENDING'",
+                (gid, str(interaction.user.id)),
+            ).fetchone()
             if pending:
-                await interaction.response.send_message("Você já tem uma WL aguardando decisão.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você já tem uma WL aguardando decisão.")); return
             if existing:
-                await interaction.response.send_message("Você já está cadastrado como membro.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você já está cadastrado como membro.")); return
             if blacklisted:
-                await interaction.response.send_message("Esse ID está na blacklist da organização.", ephemeral=True); return
-            if duplicate_game_id:
-                await interaction.response.send_message("Esse ID do FiveM já está vinculado a outro membro.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse ID está na blacklist da organização.")); return
+            if duplicate_game_id or pending_game_id:
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse ID do FiveM já está vinculado a outro membro ou aguardando outra WL.")); return
             deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
             cur = con.execute("""INSERT INTO registration_requests
                 (discord_id,discord_name,character_name,game_id,recruiter,status,created_at,selected_recruiter_id,deadline_at)
@@ -463,9 +839,11 @@ class RegistrationModal(Modal, title="Whitelist da facção"):
         if not isinstance(channel, discord.TextChannel):
             with db() as con:
                 con.execute("UPDATE registration_requests SET status='ERROR' WHERE id=?", (request_id,))
-            await interaction.response.send_message("O canal de WL não está configurado no painel/arquivo. Avise a administração.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O canal de WL não está configurado no painel/arquivo. Avise a administração."))
             return
-        embed = discord.Embed(title=f"📋 Solicitação de WL #{request_id}", color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = PanelMessage(title=f"📋 Solicitação de WL #{request_id}", color=discord.Color.gold(), timestamp=datetime.now(timezone.utc))
         embed.description = "A solicitação poderá ser aprovada ou recusada por membros com o cargo autorizado configurado em **/config → WL**. Prazo: **5 minutos**."
         embed.add_field(name="Solicitante", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
         embed.add_field(name="Nome no RP", value=name, inline=True)
@@ -475,54 +853,130 @@ class RegistrationModal(Modal, title="Whitelist da facção"):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.set_footer(text=f"request_id={request_id}")
         try:
-            msg = await channel.send(content=recruiter.mention, embed=embed, view=RegistrationApprovalView())
-            with db() as con:
-                con.execute("UPDATE registration_requests SET message_id=? WHERE id=?", (str(msg.id), request_id))
-            pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
-            pending_role = interaction.guild.get_role(pending_role_id) if pending_role_id else None
-            if pending_role:
-                try:
-                    await interaction.user.add_roles(pending_role, reason=f"WL #{request_id} enviada; cargo temporário")
-                except discord.Forbidden:
-                    log.warning("Sem permissão para aplicar o cargo temporário de WL ao membro %s", interaction.user.id)
-            await interaction.response.send_message("Sua solicitação foi enviada. Você receberá o resultado no privado.", ephemeral=True)
+            msg = await channel.send(view=v2_view(embed, RegistrationApprovalView(), recruiter.mention))
         except discord.HTTPException:
             with db() as con:
                 con.execute("UPDATE registration_requests SET status='ERROR' WHERE id=?", (request_id,))
-            await interaction.response.send_message("Não consegui publicar sua WL. Confira as permissões do bot e tente novamente.", ephemeral=True)
+            await interaction.followup.send(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Não consegui publicar sua WL. Confira as permissões do bot e tente novamente."),
+            )
+            return
+
+        with db() as con:
+            con.execute("UPDATE registration_requests SET message_id=? WHERE id=?", (str(msg.id), request_id))
+        pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
+        pending_role = interaction.guild.get_role(pending_role_id) if pending_role_id else None
+        if pending_role:
+            try:
+                await interaction.user.add_roles(pending_role, reason=f"WL #{request_id} enviada; cargo temporário")
+            except discord.HTTPException:
+                log.warning("Não foi possível aplicar o cargo temporário de WL ao membro %s", interaction.user.id, exc_info=True)
+        await interaction.followup.send(
+            None, ephemeral=True,
+            view=v2_view(None, None, "Sua solicitação foi enviada. Você receberá o resultado no privado."),
+        )
 
 class RecruiterSelect(discord.ui.Select):
-    def __init__(self, guild: discord.Guild):
-        rid = recruiter_role_id()
-        role = guild.get_role(rid) if rid else None
-        members = sorted((m for m in (role.members if role else []) if not m.bot), key=lambda m: m.display_name.casefold())
-        options = [discord.SelectOption(label=m.display_name[:100], value=str(m.id), description=f"Recrutador autorizado · {m.name}"[:100]) for m in members[:25]]
+    def __init__(self, parent_view: "RecruiterSelectView"):
+        self.parent_view = parent_view
+        start = parent_view.page * 25
+        page_members = parent_view.members[start:start + 25]
+        options = [
+            discord.SelectOption(
+                label=member.display_name[:100],
+                value=str(member.id),
+                description=f"Recrutador autorizado · {member.name}"[:100],
+            )
+            for member in page_members
+        ]
         if not options:
-            options = [discord.SelectOption(label="Nenhum recrutador configurado", value="none", description="A administração precisa configurar o cargo")]
-        super().__init__(placeholder="Escolha seu recrutador...", min_values=1, max_values=1, options=options, custom_id="fac:wl:recruiter")
+            options = [discord.SelectOption(
+                label="Nenhum recrutador configurado",
+                value="none",
+                description="A administração precisa configurar o cargo",
+            )]
+        super().__init__(
+            placeholder=f"Escolha seu recrutador • página {parent_view.page + 1}/{parent_view.page_count}",
+            min_values=1, max_values=1, options=options, custom_id="fac:wl:recruiter",
+        )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if self.values[0] == "none":
-            await interaction.response.send_message("Não há recrutadores disponíveis. Avise a administração.", ephemeral=True)
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Não há recrutadores disponíveis. Avise a administração."),
+            )
             return
         await interaction.response.send_modal(RegistrationModal(int(self.values[0])))
 
-class RecruiterSelectView(View):
+
+class RecruiterSelectView(ComponentsV2View):
+    """Seleciona recrutadores em páginas, sem truncar servidores com mais de 25 pessoas."""
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=180)
-        self.add_item(RecruiterSelect(guild))
+        self.guild = guild
+        rid = recruiter_role_id()
+        role = guild.get_role(rid) if rid else None
+        self.members = sorted(
+            (member for member in (role.members if role else []) if not member.bot),
+            key=lambda member: member.display_name.casefold(),
+        )
+        self.page = 0
+        self.selector = RecruiterSelect(self)
+        self.add_item(self.selector)
+        self.previous_button = discord.ui.Button(label="◀ Anterior", style=discord.ButtonStyle.secondary, row=1, disabled=True)
+        self.next_button = discord.ui.Button(label="Próxima ▶", style=discord.ButtonStyle.secondary, row=1)
+        self.previous_button.callback = self.previous_page
+        self.next_button.callback = self.next_page
+        self.add_item(self.previous_button)
+        self.add_item(self.next_button)
+        self._sync()
+        self.set_text(f"# Selecionar recrutador\nEscolha quem realizou seu recrutamento. Página {self.page + 1}/{self.page_count}.")
 
-class RegistrationPanelView(View):
+    @property
+    def page_count(self):
+        return max(1, math.ceil(len(self.members) / 25))
+
+    def _sync(self):
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.page_count - 1
+
+    def refresh(self):
+        self.remove_item(self.selector)
+        self.selector = RecruiterSelect(self)
+        self.add_item(self.selector)
+        self._sync()
+        self.set_text(f"# Selecionar recrutador\nEscolha quem realizou seu recrutamento. Página {self.page + 1}/{self.page_count}.")
+
+    async def previous_page(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.refresh()
+        await interaction.response.edit_message(
+            view=self, content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+    async def next_page(self, interaction: discord.Interaction):
+        self.page = min(self.page_count - 1, self.page + 1)
+        self.refresh()
+        await interaction.response.edit_message(
+            view=self, content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+
+class RegistrationPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Fazer WL", style=discord.ButtonStyle.primary, emoji="📋", custom_id="fac:register")
     async def register(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Use este botão no servidor.", ephemeral=True); return
-        await interaction.response.send_message("Primeiro, selecione um recrutador disponível e depois preencha seus dados. A aprovação ou recusa será feita por quem possuir o cargo autorizado em /config → WL.", view=RecruiterSelectView(interaction.guild), ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este botão no servidor.")); return
+        await interaction.response.send_message(None, view=v2_view(None, RecruiterSelectView(interaction.guild), "Primeiro, selecione um recrutador disponível e depois preencha seus dados. A aprovação ou recusa será feita por quem possuir o cargo autorizado em /config → WL."), ephemeral=True)
 
-class RegistrationRejectModal(Modal, title="Motivo da recusa"):
+class RegistrationRejectModal(ComponentsV2Modal, title="Motivo da recusa"):
     reason = TextInput(label="Motivo obrigatório", placeholder="Explique por que a WL foi recusada", style=discord.TextStyle.paragraph, min_length=3, max_length=500)
     def __init__(self, request_id: int):
         super().__init__(timeout=180)
@@ -533,52 +987,64 @@ class RegistrationRejectModal(Modal, title="Motivo da recusa"):
 
 async def finish_registration(interaction: discord.Interaction, request_id: int, *, approve: bool, reason: str = "") -> None:
     if not interaction.guild:
-        await interaction.response.send_message("Essa ação só pode ser feita no servidor.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa ação só pode ser feita no servidor.")); return
     with db() as con:
         request = con.execute("SELECT * FROM registration_requests WHERE id=?", (request_id,)).fetchone()
         if not request or request["status"] != "PENDING":
-            await interaction.response.send_message("Essa solicitação já foi encerrada.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa solicitação já foi encerrada.")); return
         deadline_text = request["deadline_at"] or ""
         try:
             deadline = datetime.fromisoformat(deadline_text)
         except ValueError:
             deadline = datetime.now(timezone.utc)
         if datetime.now(timezone.utc) > deadline:
-            await interaction.response.send_message("O prazo de 5 minutos já expirou; a WL será reprovada automaticamente.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O prazo de 5 minutos já expirou; a WL será reprovada automaticamente.")); return
         if not can_decide_wl(interaction):
-            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar WL.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo configurado para aprovar ou recusar WL.")); return
         # Atualização condicional impede que dois cliques processem a mesma WL.
         cur = con.execute("UPDATE registration_requests SET status=?,processed_by=?,processed_at=?,reason=? WHERE id=? AND status='PENDING'",
                           ("APPROVED" if approve else "REJECTED", str(interaction.user.id), now_iso(), reason, request_id))
         if cur.rowcount != 1:
-            await interaction.response.send_message("Essa solicitação já foi processada.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa solicitação já foi processada.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     member = await fetch_member(interaction.guild, int(request["discord_id"]))
+    rank_role = None
     if member:
         pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
         pending_role = interaction.guild.get_role(pending_role_id) if pending_role_id else None
         approved_role_id = int(setting("member_role_id", str(MEMBER_ROLE_ID)) or 0)
         approved_role = interaction.guild.get_role(approved_role_id) if approved_role_id else None
         try:
-            if approve and pending_role and pending_role in member.roles:
-                await member.remove_roles(pending_role, reason=f"WL #{request_id} aprovada")
+            if pending_role and pending_role in member.roles:
+                await member.remove_roles(pending_role, reason=f"WL #{request_id} processada")
             if approve and approved_role:
                 await member.add_roles(approved_role, reason="WL aprovada")
-        except discord.Forbidden:
-            log.warning("Sem permissão para atualizar os cargos da WL do membro %s", member.id)
-    if approve and member:
-        try:
-            # Patente mais alta e abreviação configurável por cargo; fallback seguro para M.
-            rank_role, abbreviation = highest_configured_rank(member)
-            prefix = abbreviation or "M"
-            nickname = build_member_nickname(request["character_name"], request["game_id"], prefix)
-            await member.edit(nick=nickname, reason=f"WL aprovada por recrutador {interaction.user}")
-        except discord.Forbidden:
-            log.warning("Sem permissão para atualizar cargo/nickname do membro %s", member.id)
+        except discord.HTTPException:
+            log.exception("Não foi possível atualizar os cargos da WL do membro %s", member.id)
+
+        if approve:
+            try:
+                rank_role, abbreviation = highest_configured_rank(member)
+                nickname = build_member_nickname(request["character_name"], request["game_id"], abbreviation or "M")
+                await member.edit(nick=nickname, reason=f"WL aprovada por {interaction.user}")
+            except discord.HTTPException:
+                log.exception("Não foi possível atualizar o nickname do membro %s", member.id)
+
+    if approve:
         with db() as con:
             con.execute("""INSERT INTO members(discord_id,discord_name,character_name,game_id,recruiter,rank_name,joined_at,status)
                 VALUES(?,?,?,?,?,?,?,'ACTIVE') ON CONFLICT(discord_id) DO UPDATE SET discord_name=excluded.discord_name,
                 character_name=excluded.character_name,game_id=excluded.game_id,recruiter=excluded.recruiter,rank_name=excluded.rank_name,status='ACTIVE'""",
-                (request["discord_id"], request["discord_name"], request["character_name"], request["game_id"], str(request["selected_recruiter_id"]), rank_role.name if rank_role else "Membro", now_iso()))
+                (
+                    request["discord_id"],
+                    request["discord_name"],
+                    request["character_name"],
+                    request["game_id"],
+                    str(request["selected_recruiter_id"] or request["recruiter"] or ""),
+                    rank_role.name if rank_role else "Membro",
+                    now_iso(),
+                ))
         log_action(interaction.user.id, "WL_APROVADA", int(request["discord_id"]), "Aprovada por usuário com cargo autorizado", f"Solicitação #{request_id}")
         result_title = "✅ WHITELIST APROVADA!"
         result_text = f"Parabéns! Sua entrada em **{FACTION_NAME}** foi aprovada.\n**Nome:** {request['character_name']}\n**ID:** {request['game_id']}\n**Recrutador:** <@{request['selected_recruiter_id'] or request['recruiter']}>\n**Decisão por:** {interaction.user.mention}"
@@ -588,14 +1054,21 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
         result_title = "❌ WHITELIST REPROVADA"
         result_text = f"Sua WL para **{FACTION_NAME}** foi recusada.\n**Motivo:** {reason or 'O prazo de 5 minutos expirou sem aprovação.'}"
         color = discord.Color.red()
-    if member:
+
+    target_user = member
+    if target_user is None:
+        try:
+            target_user = await bot.fetch_user(int(request["discord_id"]))
+        except discord.HTTPException:
+            target_user = None
+    if target_user:
         try:
             invite = invite_url()
-            dm_embed = discord.Embed(title=result_title, description=result_text, color=color, timestamp=datetime.now(timezone.utc))
-            dm_embed.set_footer(text="Resultado automático da whitelist")
-            dm_view = View(timeout=None)
+            dm_message = PanelMessage(title=result_title, description=result_text, color=color, timestamp=datetime.now(timezone.utc))
+            dm_message.set_footer(text="Resultado automático da whitelist")
+            dm_view = ComponentsV2View(timeout=None)
             dm_view.add_item(discord.ui.Button(label="IR PARA O SERVIDOR", style=discord.ButtonStyle.link, url=invite))
-            await member.send(embed=dm_embed, view=dm_view)
+            await target_user.send(view=v2_view(dm_message, dm_view, None))
         except discord.HTTPException:
             log.info("Não foi possível enviar DM de WL para %s", request["discord_id"])
     # Atualiza a mensagem original também quando a decisão veio do modal de recusa.
@@ -609,7 +1082,7 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
             except discord.HTTPException:
                 original_message = None
     if original_message:
-        compact_result = discord.Embed(
+        compact_result = PanelMessage(
             title=f"{'✅ WL APROVADA' if approve else '❌ WL REPROVADA'} · #{request_id}",
             description=(
                 f"**Solicitante:** {request['discord_name'] or request['character_name']} (<@{request['discord_id']}>)\n"
@@ -624,41 +1097,36 @@ async def finish_registration(interaction: discord.Interaction, request_id: int,
         )
         compact_result.set_footer(text=f"Registro de WL • request_id={request_id}")
         try:
-            await original_message.edit(embed=compact_result, view=None, content=None)
+            await original_message.edit(view=v2_view(compact_result, None, None), content=None, embeds=[], attachments=original_message.attachments)
         except discord.HTTPException:
             pass
-    if not interaction.response.is_done():
-        await interaction.response.send_message("WL processada e registrada.", ephemeral=True)
+    await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "WL processada e registrada."))
 
-class RegistrationApprovalView(View):
+class RegistrationApprovalView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
 
     def request_id_from(self, interaction: discord.Interaction) -> Optional[int]:
-        if not interaction.message or not interaction.message.embeds:
-            return None
-        footer = interaction.message.embeds[0].footer.text or ""
-        try: return int(footer.split("request_id=")[-1])
-        except (ValueError, IndexError): return None
+        return message_marker_id(interaction.message, "request_id=")
 
     @discord.ui.button(label="Aprovar", style=discord.ButtonStyle.success, emoji="✅", custom_id="fac:approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         request_id = self.request_id_from(interaction)
         if request_id is None:
-            await interaction.response.send_message("ID da WL inválido.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID da WL inválido.")); return
         await finish_registration(interaction, request_id, approve=True)
 
     @discord.ui.button(label="Recusar", style=discord.ButtonStyle.danger, emoji="❌", custom_id="fac:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         request_id = self.request_id_from(interaction)
         if request_id is None:
-            await interaction.response.send_message("ID da WL inválido.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID da WL inválido.")); return
         with db() as con:
             row = con.execute("SELECT status,selected_recruiter_id FROM registration_requests WHERE id=?", (request_id,)).fetchone()
         if not row or row["status"] != "PENDING":
-            await interaction.response.send_message("Essa WL já foi encerrada.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa WL já foi encerrada.")); return
         if not can_decide_wl(interaction):
-            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar WL.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo configurado para aprovar ou recusar WL.")); return
         await interaction.response.send_modal(RegistrationRejectModal(request_id))
 
 
@@ -703,22 +1171,31 @@ async def expire_pending_wls() -> None:
                     if datetime.now(timezone.utc) >= deadline:
                         cur = con.execute("UPDATE registration_requests SET status='REJECTED',processed_by='SYSTEM',processed_at=?,reason=? WHERE id=? AND status='PENDING'", (now_iso(), "Prazo de 5 minutos expirado sem aprovação", row["id"]))
                         if cur.rowcount:
+                            guild = bot.get_guild(GUILD_ID) if GUILD_ID else (bot.guilds[0] if len(bot.guilds) == 1 else None)
+                            if guild:
+                                expired_member = await fetch_member(guild, int(row["discord_id"]))
+                                pending_role_id = int(setting("wl_pending_role_id", "0") or 0)
+                                pending_role = guild.get_role(pending_role_id) if pending_role_id else None
+                                if expired_member and pending_role and pending_role in expired_member.roles:
+                                    try:
+                                        await expired_member.remove_roles(pending_role, reason=f"WL #{row['id']} expirada")
+                                    except discord.HTTPException:
+                                        log.exception("Não foi possível remover o cargo temporário da WL expirada #%s", row["id"])
                             try:
                                 user = await bot.fetch_user(int(row["discord_id"]))
-                                dm_embed = discord.Embed(title="⏱️ WHITELIST REPROVADA", description=f"Sua WL para **{FACTION_NAME}** foi reprovada automaticamente porque ninguém com o cargo autorizado decidiu dentro de 5 minutos.\n**Nome:** {row['character_name']}\n**ID:** {row['game_id']}", color=discord.Color.red())
-                                view = View(timeout=None)
+                                dm_embed = PanelMessage(title="⏱️ WHITELIST REPROVADA", description=f"Sua WL para **{FACTION_NAME}** foi reprovada automaticamente porque ninguém com o cargo autorizado decidiu dentro de 5 minutos.\n**Nome:** {row['character_name']}\n**ID:** {row['game_id']}", color=discord.Color.red())
+                                view = ComponentsV2View(timeout=None)
                                 view.add_item(discord.ui.Button(label="IR PARA O SERVIDOR", style=discord.ButtonStyle.link, url=invite_url()))
-                                await user.send(embed=dm_embed, view=view)
+                                await user.send(view=v2_view(dm_embed, view, None))
                             except discord.HTTPException:
                                 pass
-                            guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
                             channel_id = int(setting("wl_channel_id", str(APPROVAL_CHANNEL_ID)) or 0)
                             channel = guild.get_channel(channel_id) if guild and channel_id else None
                             if isinstance(channel, discord.TextChannel) and row["message_id"]:
                                 try:
                                     msg = await channel.fetch_message(int(row["message_id"]))
-                                    if msg.embeds:
-                                        embed = discord.Embed(
+                                    if msg.embeds or msg.components:
+                                        embed = PanelMessage(
                                             title=f"⏱️ WL REPROVADA AUTOMATICAMENTE · #{row['id']}",
                                             description=(f"**Solicitante:** <@{row['discord_id']}>\n"
                                                          f"**Nome no RP:** {row['character_name']}\n"
@@ -728,7 +1205,7 @@ async def expire_pending_wls() -> None:
                                             color=discord.Color.red(), timestamp=datetime.now(timezone.utc),
                                         )
                                         embed.set_footer(text=f"Registro de WL • request_id={row['id']}")
-                                        await msg.edit(embed=embed, view=None, content=None)
+                                        await msg.edit(view=v2_view(embed, None, None), content=None, embeds=[], attachments=msg.attachments)
                                 except discord.HTTPException:
                                     pass
                             if guild:
@@ -737,19 +1214,21 @@ async def expire_pending_wls() -> None:
             log.exception("Erro ao verificar expiração das WLs")
         await asyncio.sleep(10)
 
-class ActionModal(Modal, title="Registrar ação da liderança"):
+class ActionModal(ComponentsV2Modal, title="Registrar ação da liderança"):
     target_id = TextInput(label="ID do membro no Discord", placeholder="Ex.: 123456789012345678", max_length=20)
     action_type = TextInput(label="Tipo de ação", placeholder="Advertência, suspensão, observação...", max_length=40)
     reason = TextInput(label="Motivo / detalhes", style=discord.TextStyle.paragraph, max_length=500)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not has_leadership(interaction):
-            await interaction.response.send_message("Você precisa de permissão de liderança.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você precisa de permissão de liderança."))
             return
         raw_id = self.target_id.value.strip().replace("<@", "").replace("!", "").replace(">", "")
         if not raw_id.isdigit():
-            await interaction.response.send_message("Informe um ID numérico válido do Discord.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe um ID numérico válido do Discord."))
             return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         target_id = int(raw_id)
         member = await fetch_member(interaction.guild, target_id) if interaction.guild else None
         action_name = self.action_type.value.strip()[:40]
@@ -760,39 +1239,39 @@ class ActionModal(Modal, title="Registrar ação da liderança"):
             await send_channel_log(interaction.guild, f"📌 Ação administrativa: {action_name}",
                                    f"Aplicada por: {interaction.user.mention}\nMembro: {target_label}\nMotivo: {reason_text}",
                                    color=discord.Color.orange())
-        await interaction.response.send_message(f"Ação **{action_name}** registrada para `{target_id}`.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"Ação **{action_name}** registrada para `{target_id}`."))
 
-class LeadershipPanelView(View):
+class LeadershipPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Registrar ação", style=discord.ButtonStyle.primary, emoji="📌", custom_id="fac:leadership:register-action")
     async def register_action(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not has_leadership(interaction):
-            await interaction.response.send_message("Você precisa de permissão de liderança.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você precisa de permissão de liderança."))
             return
         await interaction.response.send_modal(ActionModal())
 
     @discord.ui.button(label="Ver logs recentes", style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="fac:leadership:recent-logs")
     async def recent_logs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not has_leadership(interaction):
-            await interaction.response.send_message("Você precisa de permissão de liderança.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você precisa de permissão de liderança."))
             return
         with db() as con:
             rows = con.execute("SELECT * FROM actions ORDER BY id DESC LIMIT 10").fetchall()
         if not rows:
-            await interaction.response.send_message("Ainda não há ações registradas.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há ações registradas."))
             return
         lines = []
         for row in rows:
             target = f" · alvo <@{row['target_id']}>" if row["target_id"] else ""
             reason = f" · {row['reason']}" if row["reason"] else ""
             lines.append(f"`#{row['id']}` **{row['action']}** por <@{row['actor_id']}>{target}{reason}")
-        embed = discord.Embed(title="🧾 Últimas ações da liderança", description="\n".join(lines), color=discord.Color.blurple())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed = PanelMessage(title="🧾 Últimas ações da liderança", description="\n".join(lines), color=discord.Color.blurple())
+        await interaction.response.send_message(view=v2_view(embed, None, None), ephemeral=True)
 
 # ---------------- REGISTRO DE FARM COM IDENTIFICAÇÃO PELA WL ----------------
-class FarmQuantityModal(Modal, title="Quantidade do farm"):
+class FarmQuantityModal(ComponentsV2Modal, title="Quantidade do farm"):
     quantity = TextInput(label="Quantidade farmada", placeholder="Digite somente números", max_length=9)
 
     def __init__(self, item_id: int, item_name: str, points_per_unit: int, channel_id: int):
@@ -805,22 +1284,22 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         raw = self.quantity.value.strip()
         if not raw.isdigit() or int(raw) < 1 or int(raw) > 100000:
-            await interaction.response.send_message("Informe uma quantidade numérica entre 1 e 100.000.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe uma quantidade numérica entre 1 e 100.000."))
             return
         if not is_active_member(interaction.user.id):
-            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado. Não é possível registrar farm.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Seu cadastro ativo da WL não foi encontrado. Não é possível registrar farm."))
             return
         with db() as con:
             member = con.execute("SELECT discord_id, character_name, game_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
             item = con.execute("SELECT name, points, unit_price_cents FROM farm_items WHERE id=? AND active=1", (self.item_id,)).fetchone()
             if not member:
-                await interaction.response.send_message("Não encontrei seu cadastro ativo da WL. Procure a liderança.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não encontrei seu cadastro ativo da WL. Procure a liderança."))
                 return
             if not item:
-                await interaction.response.send_message("Esse item de farm foi desativado. Inicie um novo registro.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse item de farm foi desativado. Inicie um novo registro."))
                 return
             if int(item["unit_price_cents"] or 0) <= 0:
-                await interaction.response.send_message("A liderança ainda não definiu o valor por unidade desse item. Avise a liderança para configurar `/farm-preco`.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "A liderança ainda não definiu o valor por unidade desse item. Avise a liderança para configurar `/farm-preco`."))
                 return
             quantity = int(raw)
             day_prefix = local_day_prefix()
@@ -828,7 +1307,7 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
             daily_pending = con.execute("SELECT COUNT(*) AS n FROM farm_proofs WHERE discord_id=? AND status='PENDING' AND substr(created_at,1,10)=?", (str(interaction.user.id), day_prefix)).fetchone()["n"]
             daily = int(daily_entries) + int(daily_pending)
             if daily >= MAX_FARM_ENTRIES_PER_DAY:
-                await interaction.response.send_message(f"Você atingiu o limite de {MAX_FARM_ENTRIES_PER_DAY} registros de farm hoje.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Você atingiu o limite de {MAX_FARM_ENTRIES_PER_DAY} registros de farm hoje."))
                 return
             last_entry = con.execute("SELECT created_at FROM farm_entries WHERE discord_id=? ORDER BY id DESC LIMIT 1", (str(interaction.user.id),)).fetchone()
             last_pending = con.execute("SELECT created_at FROM farm_proofs WHERE discord_id=? AND status='PENDING' ORDER BY id DESC LIMIT 1", (str(interaction.user.id),)).fetchone()
@@ -838,7 +1317,7 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
                     latest = max(datetime.fromisoformat(value) for value in timestamps)
                     elapsed = (datetime.now(timezone.utc) - latest).total_seconds()
                     if elapsed < FARM_COOLDOWN_SECONDS:
-                        await interaction.response.send_message(f"Aguarde {int(FARM_COOLDOWN_SECONDS-elapsed)+1}s antes de iniciar outro registro.", ephemeral=True)
+                        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Aguarde {int(FARM_COOLDOWN_SECONDS-elapsed)+1}s antes de iniciar outro registro."))
                         return
                 except ValueError:
                     pass
@@ -850,62 +1329,146 @@ class FarmQuantityModal(Modal, title="Quantidade do farm"):
                 (str(interaction.user.id), member["character_name"], member["game_id"], now_iso(), item["name"], quantity,
                  quantity * int(item["points"]), str(self.channel_id), int(item["unit_price_cents"] or 0)))
         await interaction.response.send_message(
-            (f"🌾 **Farm selecionado:** {item['name']}\n**Quantidade:** {quantity}\n" + (f"**Valor estimado:** R$ {(quantity * int(item['unit_price_cents'] or 0))/100:,.2f}\n\n" if int(item['unit_price_cents'] or 0) else "**Valor:** ainda não definido pela liderança\n\n") + "Agora envie a **imagem de prova como anexo neste mesmo canal**. O bot já identificou seu nome e ID pela WL; não precisa informar novamente."),
-            ephemeral=True)
+            (None),
+            ephemeral=True, view=v2_view(None, None, f"🌾 **Farm selecionado:** {item['name']}\n**Quantidade:** {quantity}\n" + (f"**Valor estimado:** R$ {(quantity * int(item['unit_price_cents'] or 0))/100:,.2f}\n\n" if int(item['unit_price_cents'] or 0) else "**Valor:** ainda não definido pela liderança\n\n") + "Agora envie a **imagem de prova como anexo neste mesmo canal**. O bot já identificou seu nome e ID pela WL; não precisa informar novamente."))
 
 
 class FarmItemSelect(discord.ui.Select):
+    def __init__(self, parent_view: "FarmItemSelectView"):
+        self.parent_view = parent_view
+        start = parent_view.page * 25
+        page_items = parent_view.items[start:start + 25]
+        options = [
+            discord.SelectOption(
+                label=row["name"][:100],
+                value=str(row["id"]),
+                description=(
+                    f"R$ {int(row['unit_price_cents'] or 0)/100:.2f} por unidade · {row['points']} pts"
+                    if int(row['unit_price_cents'] or 0)
+                    else f"{row['points']} ponto(s) por unidade"
+                )[:100],
+            )
+            for row in page_items
+        ]
+        super().__init__(
+            placeholder=f"Selecione o farm • página {parent_view.page + 1}/{parent_view.page_count}",
+            min_values=1, max_values=1,
+            options=options or [discord.SelectOption(label="Nenhum item ativo", value="none")],
+            disabled=not options,
+        )
+        self.items_by_id = {
+            int(row["id"]): (row["name"], int(row["points"]))
+            for row in page_items
+        }
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.parent_view.requester_id:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Somente a pessoa que iniciou o registro pode selecionar o farm."),
+            )
+            return
+        if not is_active_member(interaction.user.id):
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Seu cadastro ativo da WL não foi encontrado."),
+            )
+            return
+        raw = self.values[0]
+        item = self.items_by_id.get(int(raw)) if raw.isdigit() else None
+        if not item:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Item inválido. Abra um novo registro."),
+            )
+            return
+        await interaction.response.send_modal(
+            FarmQuantityModal(int(raw), item[0], item[1], self.parent_view.channel_id)
+        )
+
+
+class FarmItemSelectView(ComponentsV2View):
+    """Menu paginado para qualquer quantidade de itens de farm ativos."""
     def __init__(self, interaction: discord.Interaction):
+        super().__init__(timeout=180)
         self.requester_id = interaction.user.id
         self.channel_id = interaction.channel_id
         with db() as con:
-            items = con.execute("SELECT id,name,points,unit_price_cents FROM farm_items WHERE active=1 ORDER BY name LIMIT 25").fetchall()
-        options = [discord.SelectOption(label=row["name"][:100], value=str(row["id"]), description=(f"R$ {int(row['unit_price_cents'] or 0)/100:.2f} por unidade · {row['points']} pts" if int(row['unit_price_cents'] or 0) else f"{row['points']} ponto(s) por unidade")[:100]) for row in items]
-        super().__init__(placeholder="Selecione o farm configurado...", min_values=1, max_values=1, options=options, disabled=not options)
-        self.items = {int(row["id"]): (row["name"], int(row["points"])) for row in items}
+            self.items = con.execute(
+                "SELECT id,name,points,unit_price_cents FROM farm_items WHERE active=1 ORDER BY name"
+            ).fetchall()
+        self.page = 0
+        self.selector = FarmItemSelect(self)
+        self.add_item(self.selector)
+        self.previous_button = discord.ui.Button(label="◀ Anterior", style=discord.ButtonStyle.secondary, row=1, disabled=True)
+        self.next_button = discord.ui.Button(label="Próxima ▶", style=discord.ButtonStyle.secondary, row=1)
+        self.previous_button.callback = self.previous_page
+        self.next_button.callback = self.next_page
+        self.add_item(self.previous_button)
+        self.add_item(self.next_button)
+        self._sync()
 
-    async def callback(self, interaction: discord.Interaction) -> None:
+    @property
+    def page_count(self):
+        return max(1, math.ceil(len(self.items) / 25))
+
+    def _sync(self):
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.page_count - 1
+
+    def refresh(self):
+        self.remove_item(self.selector)
+        self.selector = FarmItemSelect(self)
+        self.add_item(self.selector)
+        self._sync()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("Somente a pessoa que iniciou o registro pode selecionar o farm.", ephemeral=True)
-            return
-        if not is_active_member(interaction.user.id):
-            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado.", ephemeral=True)
-            return
-        item_id = int(self.values[0])
-        item = self.items.get(item_id)
-        if not item:
-            await interaction.response.send_message("Item inválido. Abra um novo registro.", ephemeral=True)
-            return
-        await interaction.response.send_modal(FarmQuantityModal(item_id, item[0], item[1], self.channel_id))
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Somente a pessoa que iniciou o registro pode navegar nesta lista."),
+            )
+            return False
+        return True
+
+    async def previous_page(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.refresh()
+        await interaction.response.edit_message(
+            view=self, content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+    async def next_page(self, interaction: discord.Interaction):
+        self.page = min(self.page_count - 1, self.page + 1)
+        self.refresh()
+        await interaction.response.edit_message(
+            view=self, content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
 
-class FarmItemSelectView(View):
-    def __init__(self, interaction: discord.Interaction):
-        super().__init__(timeout=180)
-        self.add_item(FarmItemSelect(interaction))
-
-
-class FarmPanelView(View):
+class FarmPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="REGISTRAR FARM", style=discord.ButtonStyle.success, emoji="🌾", custom_id="fac:farm:start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Faça o registro pelo servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Faça o registro pelo servidor."))
             return
         with db() as con:
             member = con.execute("SELECT character_name,game_id FROM members WHERE discord_id=? AND status='ACTIVE'", (str(interaction.user.id),)).fetchone()
             items = con.execute("SELECT COUNT(*) AS n FROM farm_items WHERE active=1").fetchone()["n"]
         if not member:
-            await interaction.response.send_message("Seu cadastro ativo da WL não foi encontrado. Faça/regularize sua WL antes de registrar farm.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Seu cadastro ativo da WL não foi encontrado. Faça/regularize sua WL antes de registrar farm."))
             return
         if not items:
-            await interaction.response.send_message("Nenhum tipo de farm está configurado/ativo no painel. Avise a liderança.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Nenhum tipo de farm está configurado/ativo no painel. Avise a liderança."))
             return
         await interaction.response.send_message(
-            f"Cadastro identificado: **{member['character_name']}** · ID **{member['game_id']}**.\nSelecione o farm que deseja registrar:",
-            view=FarmItemSelectView(interaction), ephemeral=True)
+            None,
+            view=v2_view(None, FarmItemSelectView(interaction), f"Cadastro identificado: **{member['character_name']}** · ID **{member['game_id']}**.\nSelecione o farm que deseja registrar:"), ephemeral=True)
 
 
 async def store_farm_proof(message: discord.Message) -> bool:
@@ -918,7 +1481,7 @@ async def store_farm_proof(message: discord.Message) -> bool:
         if pending_age > 900:
             with db() as con:
                 con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
-            await message.reply("O prazo de 15 minutos para enviar a prova expirou. Inicie um novo registro pelo painel.")
+            await message.reply(None, view=v2_view(None, None, "O prazo de 15 minutos para enviar a prova expirou. Inicie um novo registro pelo painel."))
             return True
     except (TypeError, ValueError):
         pass
@@ -927,31 +1490,31 @@ async def store_farm_proof(message: discord.Message) -> bool:
     if not is_active_member(message.author.id):
         with db() as con:
             con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
-        await message.reply("Seu cadastro ativo da WL não foi localizado. O registro de farm foi cancelado.")
+        await message.reply(None, view=v2_view(None, None, "Seu cadastro ativo da WL não foi localizado. O registro de farm foi cancelado."))
         return True
     image_attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
     if not image_attachment:
-        await message.reply("Envie a imagem de prova como anexo nesta mensagem. Links e mensagens sem imagem não concluem o registro.")
+        await message.reply(None, view=v2_view(None, None, "Envie a imagem de prova como anexo nesta mensagem. Links e mensagens sem imagem não concluem o registro."))
         return True
     if image_attachment.size > 8 * 1024 * 1024:
-        await message.reply("A imagem excede o limite de 8 MB. Envie uma imagem menor.")
+        await message.reply(None, view=v2_view(None, None, "A imagem excede o limite de 8 MB. Envie uma imagem menor."))
         return True
     try:
         image_bytes = await image_attachment.read(use_cached=False)
     except discord.HTTPException:
-        await message.reply("Não consegui baixar a imagem. Envie novamente.")
+        await message.reply(None, view=v2_view(None, None, "Não consegui baixar a imagem. Envie novamente."))
         return True
     filename = image_attachment.filename[:200]
     mime = image_attachment.content_type or "application/octet-stream"
     signatures = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"RIFF")
     if not image_bytes.startswith(signatures):
-        await message.reply("O arquivo não parece ser uma imagem PNG, JPG, GIF ou WEBP válida.")
+        await message.reply(None, view=v2_view(None, None, "O arquivo não parece ser uma imagem PNG, JPG, GIF ou WEBP válida."))
         return True
     guild = message.guild
     private_channel_id = int(setting("farm_private_channel_id", "0") or 0)
     review_channel = guild.get_channel(private_channel_id) if guild and private_channel_id else None
     if not isinstance(review_channel, discord.TextChannel):
-        await message.reply("O canal privado de cobranças ainda não foi configurado. A prova não foi registrada. Avise a liderança em `/config` → Farm.")
+        await message.reply(None, view=v2_view(None, None, "O canal privado de cobranças ainda não foi configurado. A prova não foi registrada. Avise a liderança em `/config` → Farm."))
         return True
     log_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
     log_channel = guild.get_channel(log_channel_id) if guild and log_channel_id else None
@@ -966,7 +1529,7 @@ async def store_farm_proof(message: discord.Message) -> bool:
         con.execute("DELETE FROM farm_proof_pending WHERE discord_id=?", (str(message.author.id),))
     log_action(message.author.id, "FARM_COMPROVANTE_ENVIADO", message.author.id, "", f"Comprovante #{proof_id}; {pending['item_name']}; quantidade={pending['quantity']}; {filename}; status={proof_status}")
     total_cents = int(pending["unit_price_cents"] or 0) * int(pending["quantity"])
-    embed = discord.Embed(
+    embed = PanelMessage(
         title=f"🧾 COBRANÇA DE FARM #{proof_id} — AGUARDANDO DECISÃO",
         description=(f"**Membro:** {pending['character_name']} · <@{message.author.id}>\n"
                      f"**ID FiveM:** {pending['game_id']}\n**Item:** {pending['item_name']}\n"
@@ -979,7 +1542,7 @@ async def store_farm_proof(message: discord.Message) -> bool:
     embed.set_image(url=f"attachment://{safe_filename}")
     try:
         import io
-        invoice_message = await review_channel.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), filename=safe_filename), view=FarmInvoiceView())
+        invoice_message = await review_channel.send(file=discord.File(io.BytesIO(image_bytes), filename=safe_filename), view=v2_view(embed, FarmInvoiceView(), None))
         with db() as con:
             con.execute("UPDATE farm_proofs SET review_channel_id=?,review_message_id=? WHERE id=?", (str(review_channel.id), str(invoice_message.id), proof_id))
         try:
@@ -987,12 +1550,12 @@ async def store_farm_proof(message: discord.Message) -> bool:
         except discord.HTTPException:
             log.warning("Não consegui apagar a mensagem de prova do membro %s", message.author.id)
         try:
-            await message.channel.send(f"📨 Sua solicitação de farm **#{proof_id}** foi enviada para a liderança. A decisão chegará por mensagem privada.", delete_after=20)
+            await message.channel.send(None, delete_after=20, view=v2_view(None, None, f"📨 Sua solicitação de farm **#{proof_id}** foi enviada para a liderança. A decisão chegará por mensagem privada."))
         except discord.HTTPException:
             pass
     except (discord.Forbidden, discord.HTTPException):
         log.exception("Não foi possível publicar cobrança #%s", proof_id)
-        await message.reply(f"⚠️ A prova #{proof_id} foi salva, mas a cobrança não pôde ser publicada. Avise a liderança; não envie outra prova.")
+        await message.reply(None, view=v2_view(None, None, f"⚠️ A prova #{proof_id} foi salva, mas a cobrança não pôde ser publicada. Avise a liderança; não envie outra prova."))
     return True
 
 # ---------------- PAINEL INTERATIVO DE CONFIGURAÇÃO ----------------
@@ -1024,7 +1587,7 @@ def valid_asset_url(raw: str) -> bool:
     return parsed.scheme == "https" and bool(parsed.netloc)
 
 
-def apply_panel_media(embed: discord.Embed, kind: str) -> discord.Embed:
+def apply_panel_media(embed: PanelMessage, kind: str) -> PanelMessage:
     photo_url = panel_setting(f"{kind}_panel_photo_url", "").strip()
     banner_url = panel_setting(f"{kind}_panel_banner_url", "").strip()
     if photo_url and valid_asset_url(photo_url):
@@ -1034,7 +1597,7 @@ def apply_panel_media(embed: discord.Embed, kind: str) -> discord.Embed:
     return embed
 
 
-def panel_embed(kind: str) -> discord.Embed:
+def panel_embed(kind: str) -> PanelMessage:
     if kind == "wl":
         title = panel_setting("wl_panel_title", f"📋 WHITELIST — {FACTION_NAME}")
         description = panel_setting(
@@ -1042,7 +1605,7 @@ def panel_embed(kind: str) -> discord.Embed:
             "Clique em **Fazer WL**, escolha o recrutador e informe seu nome no RP e ID do FiveM. "
             "A aprovação ou recusa é feita por quem possuir o cargo autorizado configurado em /config → WL.",
         )
-        return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple()), "wl")
+        return apply_panel_media(PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.blurple()), "wl")
     if kind == "farm":
         title = panel_setting("farm_panel_title", f"🌾 REGISTRO DE FARM — {FACTION_NAME}")
         description = panel_setting(
@@ -1054,28 +1617,28 @@ def panel_embed(kind: str) -> discord.Embed:
             description = ("1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
                            "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL.")
             save_config_value("farm_panel_description", description)
-        return apply_panel_media(discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
+        return apply_panel_media(PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
     if kind == "hierarchy":
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
         description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do cargo mais alto ao mais baixo.")
-        return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
+        return PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.blurple())
     # Os demais painéis continuam disponíveis pelos comandos existentes, mas não são apresentados no /config simplificado.
     if kind == "members":
         title = panel_setting("members_panel_title", f"👥 MEMBROS — {FACTION_NAME}")
         description = panel_setting("members_panel_description", "Lista de membros cadastrados e ativos da organização.")
-        return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
+        return PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.blurple())
     if kind == "leader":
         title = panel_setting("leader_panel_title", f"👑 PAINEL DA LIDERANÇA — {FACTION_NAME}")
         description = panel_setting("leader_panel_description", "Use os botões para registrar uma ação administrativa ou consultar os logs recentes.")
-        return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.dark_gold())
+        return PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.dark_gold())
     title = panel_setting("main_panel_title", f"🎛️ PAINEL PRINCIPAL — {FACTION_NAME}")
     description = panel_setting("main_panel_description", "Acesse os recursos da facção: perfil, farm, ranking, histórico e ações administrativas.")
-    return discord.Embed(title=title[:256], description=description[:4096], color=discord.Color.blurple())
+    return PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.blurple())
 
 
-def config_embed(guild: Optional[discord.Guild] = None) -> discord.Embed:
+def config_embed(guild: Optional[discord.Guild] = None) -> PanelMessage:
     """Resumo visual das configurações, organizado por módulos (sem menu de logs)."""
-    embed = discord.Embed(
+    embed = PanelMessage(
         title=f"⚙️ Central de configuração · {FACTION_NAME}",
         description=(
             "Personalize os painéis da facção pelos botões abaixo.\n"
@@ -1175,10 +1738,10 @@ class ConfigTextChannelSelect(discord.ui.ChannelSelect):
     async def callback(self, interaction: discord.Interaction) -> None:
         channel = self.values[0]
         save_config_value(self.setting_key, str(channel.id))
-        await interaction.response.send_message(f"✅ Canal salvo: {channel.mention}", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"✅ Canal salvo: {channel.mention}"))
 
 
-class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
+class ConfigManualIdModal(ComponentsV2Modal, title="Configurar ID manualmente"):
     setting_key = TextInput(label="Chave da configuração", max_length=80, required=True, placeholder="Ex.: farm_log_channel_id")
     object_id = TextInput(label="ID do cargo ou canal", max_length=25, required=True, placeholder="Cole o ID numérico")
 
@@ -1197,38 +1760,38 @@ class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
             "farm_approver_role_id", "leader_role_id", "adv1_role_id", "adv2_role_id", "adv3_role_id",
         }
         if key not in allowed or not raw.isdigit():
-            await interaction.response.send_message("Chave inválida ou ID não numérico. Confira a chave e cole somente o ID.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Chave inválida ou ID não numérico. Confira a chave e cole somente o ID."))
             return
         object_id = int(raw)
         if key.endswith("channel_id"):
             obj = interaction.guild.get_channel(object_id) if interaction.guild else None
             if obj is None or not isinstance(obj, (discord.TextChannel, discord.Thread, discord.ForumChannel)):
-                await interaction.response.send_message("Esse ID não corresponde a um canal de texto válido deste servidor.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse ID não corresponde a um canal de texto válido deste servidor."))
                 return
             label = f"canal {obj.mention}"
         else:
             obj = interaction.guild.get_role(object_id) if interaction.guild else None
             if obj is None:
-                await interaction.response.send_message("Esse ID não corresponde a um cargo deste servidor.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse ID não corresponde a um cargo deste servidor."))
                 return
             label = f"cargo {obj.mention}"
         if self.farm_return and key in FARM_CONFIG_FIELDS:
             field_kind = FARM_CONFIG_FIELDS[key][1]
             if field_kind == "channel" and not isinstance(obj, discord.TextChannel):
                 await interaction.response.send_message(
-                    "Para o Farm, informe um canal de texto deste servidor.", ephemeral=True
+                    None, ephemeral=True, view=v2_view(None, None, "Para o Farm, informe um canal de texto deste servidor.")
                 )
                 return
             if field_kind == "role" and obj.is_default():
                 await interaction.response.send_message(
-                    "O cargo @everyone não pode ser usado como cargo autorizador do Farm.", ephemeral=True
+                    None, ephemeral=True, view=v2_view(None, None, "O cargo @everyone não pode ser usado como cargo autorizador do Farm.")
                 )
                 return
         save_config_value(key, str(object_id))
         if self.farm_return and key in FARM_CONFIG_FIELDS:
             if interaction.guild is None:
                 await interaction.response.send_message(
-                    "Use este formulário dentro do servidor.", ephemeral=True
+                    None, ephemeral=True, view=v2_view(None, None, "Use este formulário dentro do servidor.")
                 )
                 return
             await interaction.response.send_message(
@@ -1240,7 +1803,7 @@ class ConfigManualIdModal(Modal, title="Configurar ID manualmente"):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message(f"✅ Configuração **{key}** salva usando {label}.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"✅ Configuração **{key}** salva usando {label}."))
 
 
 class ConfigManualIdButton(discord.ui.Button):
@@ -1255,7 +1818,7 @@ class ConfigManualIdButton(discord.ui.Button):
         )
 
 
-class ConfigWLChannelsView(View):
+class ConfigWLChannelsView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigTextChannelSelect("wl_panel_channel_id", "Canal onde o painel WL será publicado", row=0))
@@ -1263,7 +1826,7 @@ class ConfigWLChannelsView(View):
         self.add_item(ConfigManualIdButton(preset_key="wl_panel_channel_id"))
 
 
-class ConfigWLRoleView(View):
+class ConfigWLRoleView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigSingleRoleSelect("wl_pending_role_id", "Cargo temporário antes da aprovação da WL", row=0))
@@ -1273,7 +1836,7 @@ class ConfigWLRoleView(View):
         self.add_item(ConfigManualIdButton(preset_key="member_role_id"))
 
 
-class ConfigFarmChannelsView(View):
+class ConfigFarmChannelsView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigTextChannelSelect("farm_panel_channel_id", "Canal público do painel Farm", row=0))
@@ -1292,10 +1855,10 @@ class ConfigSingleRoleSelect(discord.ui.RoleSelect):
         role = self.values[0] if self.values else None
         save_config_value(self.setting_key, str(role.id if role else 0))
         role_name = role.mention if role else "(desconfigurado)"
-        await interaction.response.send_message(f"✅ Cargo salvo: {role_name}", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"✅ Cargo salvo: {role_name}"))
 
 
-class ConfigRolesSelectView(View):
+class ConfigRolesSelectView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=600)
         self.add_item(ConfigSingleRoleSelect("member_role_id", "Selecionar cargo padrão dos membros", row=0))
@@ -1318,7 +1881,7 @@ class ConfigHierarchyChannelSelect(discord.ui.ChannelSelect):
     async def callback(self, interaction: discord.Interaction) -> None:
         channel = self.values[0]
         self.parent_view.channel_id = channel.id
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class ConfigHierarchyRolePageSelect(discord.ui.Select):
@@ -1339,7 +1902,7 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
         if not options:
             options = [discord.SelectOption(label="Nenhum cargo disponível", value="none")]
         super().__init__(
-            placeholder=f"② Cargos {start + 1}–{start + len(self.page_roles)} • lista crescente",
+            placeholder=f"② Cargos {start + 1}–{start + len(self.page_roles)} • maior → menor",
             min_values=0,
             max_values=max(1, len(options)),
             options=options,
@@ -1348,7 +1911,7 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         visible_ids = {role.id for role in self.page_roles}
-        # Mantém a ordem de seleção: primeiro é o cargo mais baixo; o último é o mais alto.
+        # A ordem é sempre normalizada pela posição do Discord: maior primeiro.
         self.parent_view.selected_role_ids = [
             rid for rid in self.parent_view.selected_role_ids if rid not in visible_ids
         ]
@@ -1366,14 +1929,19 @@ class ConfigHierarchyRolePageSelect(discord.ui.Select):
                 if self.parent_view.guild.get_role(rid) else -1,
                 self.parent_view.guild.get_role(rid).name.casefold()
                 if self.parent_view.guild.get_role(rid) else "",
-            )
+            ),
+            reverse=True,
+        )
+        self.parent_view.remove_page_index = min(
+            self.parent_view.remove_page_index,
+            max(0, math.ceil(len(self.parent_view.selected_role_ids) / 25) - 1),
         )
         self.parent_view._persist_selected_roles()
         self.parent_view._refresh_remove_selector()
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class ConfigHierarchyAddRoleModal(Modal, title="Adicionar cargo por ID"):
+class ConfigHierarchyAddRoleModal(ComponentsV2Modal, title="Adicionar cargo por ID"):
     role_id_input = TextInput(label="ID do cargo", max_length=25, required=True, placeholder="Cole o ID do cargo")
     def __init__(self, parent_view):
         super().__init__(timeout=300)
@@ -1381,18 +1949,19 @@ class ConfigHierarchyAddRoleModal(Modal, title="Adicionar cargo por ID"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         raw = self.role_id_input.value.strip()
         role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
-        if role is None or role == self.parent_view.guild.default_role:
-            await interaction.response.send_message("ID inválido: não encontrei esse cargo neste servidor.", ephemeral=True)
+        if role is None or role.id not in {item.id for item in selectable_hierarchy_roles(self.parent_view.guild)}:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID inválido: use um cargo não gerenciado e abaixo do cargo do bot."))
             return
         if role.id not in self.parent_view.selected_role_ids:
             self.parent_view.selected_role_ids.append(role.id)
         self.parent_view.selected_role_ids.sort(
             key=lambda rid: self.parent_view.guild.get_role(rid).position
-            if self.parent_view.guild.get_role(rid) else -1
+            if self.parent_view.guild.get_role(rid) else -1,
+            reverse=True,
         )
         self.parent_view._persist_selected_roles()
         self.parent_view._refresh_role_page()
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 class ConfigHierarchyAddRoleButton(discord.ui.Button):
     def __init__(self):
@@ -1405,10 +1974,16 @@ class ConfigHierarchyRemoveSelect(discord.ui.Select):
         self.parent_view = parent_view
         roles = [parent_view.guild.get_role(rid) for rid in parent_view.selected_role_ids]
         roles = [r for r in roles if r]
-        options = [discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in roles[:25]]
+        start = parent_view.remove_page_index * 25
+        self.page_roles = roles[start:start + 25]
+        pages = max(1, math.ceil(len(roles) / 25))
+        options = [discord.SelectOption(label=r.name[:100], value=str(r.id)) for r in self.page_roles]
         if not options:
             options = [discord.SelectOption(label="Nenhum cargo selecionado", value="none")]
-        super().__init__(placeholder="❌ Remover cargo selecionado", min_values=0, max_values=1, options=options, row=2)
+        super().__init__(
+            placeholder=f"❌ Remover cargo • página {parent_view.remove_page_index + 1}/{pages}",
+            min_values=0, max_values=1, options=options, row=2,
+        )
     async def callback(self, interaction: discord.Interaction) -> None:
         raw = self.values[0] if self.values else "none"
         if raw != "none":
@@ -1416,35 +1991,34 @@ class ConfigHierarchyRemoveSelect(discord.ui.Select):
             self.parent_view.selected_role_ids = [x for x in self.parent_view.selected_role_ids if x != rid]
         self.parent_view._persist_selected_roles()
         self.parent_view._refresh_remove_selector()
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class ConfigHierarchySetupView(View):
+class ConfigHierarchySetupView(ComponentsV2View):
     """Configuração em lote: seleciona vários cargos por página, sem confirmar um a um."""
     def __init__(self, guild: discord.Guild, required_count: Optional[int] = None):
         super().__init__(timeout=900)
         self.guild = guild
         self.required_count = required_count
-        # @everyone não é patente. Todos os demais cargos são incluídos, inclusive cargos gerenciados.
-        self.roles = sorted(
-            (role for role in guild.roles if role != guild.default_role),
-            key=lambda role: (role.position, role.name.casefold()),
-            reverse=False,
-        )
+        # Usa somente cargos que o bot pode administrar; @everyone e cargos
+        # gerenciados/fora da hierarquia do bot não são opções válidas.
+        self.roles = selectable_hierarchy_roles(guild)
         self.page_index = 0
+        self.remove_page_index = 0
         with db() as con:
             rows = con.execute("SELECT key,value FROM settings WHERE key LIKE 'rank_role_%'").fetchall()
         saved_roles = []
+        selectable_ids = {role.id for role in self.roles}
         for row in rows:
             try:
                 role_id = int(row["key"].replace("rank_role_", "", 1))
                 _abbr, priority = row["value"].split("|", 1)
-                if guild.get_role(role_id):
+                if role_id in selectable_ids:
                     saved_roles.append((int(priority), role_id))
             except (ValueError, TypeError):
                 continue
         self.selected_role_ids: list[int] = [
-            role_id for _priority, role_id in sorted(saved_roles)
+            role_id for _priority, role_id in sorted(saved_roles, reverse=True)
         ]
         self.role_selector = ConfigHierarchyRolePageSelect(self)
         self.add_item(self.role_selector)
@@ -1456,9 +2030,16 @@ class ConfigHierarchySetupView(View):
     def total_pages(self) -> int:
         return max(1, math.ceil(len(self.roles) / HIERARCHY_ROLES_PER_PAGE))
 
+    @property
+    def remove_total_pages(self) -> int:
+        return max(1, math.ceil(len(self.selected_role_ids) / 25))
+
     def _update_pager_buttons(self) -> None:
-        self.previous_page.disabled = self.page_index <= 0
-        self.next_page.disabled = self.page_index >= self.total_pages - 1
+        self.previous_page.disabled = self.page_index <= 0 and self.remove_page_index <= 0
+        self.next_page.disabled = (
+            self.page_index >= self.total_pages - 1
+            and self.remove_page_index >= self.remove_total_pages - 1
+        )
 
     def _persist_selected_roles(self) -> None:
         """Salva a seleção atual para não perder cargos ao voltar ou fechar o painel."""
@@ -1467,7 +2048,7 @@ class ConfigHierarchySetupView(View):
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             for idx, role in enumerate(selected_roles):
-                priority = idx + 1
+                priority = len(selected_roles) - idx
                 words = [part for part in re.split(r"[^A-Za-z0-9À-ÿ]+", role.name.upper()) if part]
                 abbreviation = ("".join(word[0] for word in words) if len(words) > 1 else (words[0][:3] if words else "RANK"))[:12]
                 con.execute(
@@ -1488,12 +2069,11 @@ class ConfigHierarchySetupView(View):
         self.remove_selector = ConfigHierarchyRemoveSelect(self)
         self.add_item(self.remove_selector)
 
-    def build_embed(self, *, saved: bool = False) -> discord.Embed:
+    def build_embed(self, *, saved: bool = False) -> PanelMessage:
         selected_roles = [self.guild.get_role(rid) for rid in self.selected_role_ids]
         selected_roles = [role for role in selected_roles if role is not None]
-        # Exibição visual de cima para baixo: topo primeiro e cargo-base por último.
-        # A prioridade gravada continua sendo 1 = base, último = topo.
-        display_roles = list(reversed(selected_roles))
+        # A lista selecionada e publicada usa sempre topo primeiro e base por último.
+        display_roles = selected_roles
         selected_text = "\n".join(
             f"`{index + 1}.` {role.mention}"
             for index, role in enumerate(display_roles[:18])
@@ -1502,12 +2082,12 @@ class ConfigHierarchySetupView(View):
             selected_text += f"\n… e mais {len(selected_roles) - 18} cargo(s) selecionado(s)."
         if not selected_text:
             selected_text = "Nenhum cargo selecionado ainda."
-        embed = discord.Embed(
+        embed = PanelMessage(
             title="🏛️ Configurar hierarquia",
             description=(
                 "Selecione os cargos no menu. Não existe limite de quantidade pré-definida. "
                 "Use o menu **Remover cargo** para retirar uma seleção incorreta; o botão Reiniciar limpa tudo.\n\n"
-                "A ordem de seleção define a hierarquia: selecione primeiro o cargo mais baixo e termine no cargo mais alto."
+                "A ordem é automática pela posição real do Discord: o cargo mais alto fica primeiro e o mais baixo por último."
             ),
             color=discord.Color.from_rgb(76, 86, 180),
         )
@@ -1515,24 +2095,24 @@ class ConfigHierarchySetupView(View):
         embed.add_field(name="✅ Selecionados", value=f"**{len(selected_roles)} cargo(s)**", inline=True)
         embed.add_field(name="📋 Hierarquia (topo → base)", value=selected_text[:1024], inline=False)
         if saved:
-            embed.set_footer(text="Configuração salva • nº 1 é o cargo mais alto; último é o mais baixo")
+            embed.set_footer(text="Configuração salva • maior cargo primeiro; menor cargo por último")
         else:
-            embed.set_footer(text="A seleção é salva automaticamente • Use as setas para ver todos os cargos")
+            embed.set_footer(text="A seleção é salva automaticamente • maior cargo primeiro; menor por último")
         return embed
 
     @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", row=3)
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.page_index > 0:
-            self.page_index -= 1
+        self.page_index = max(0, self.page_index - 1)
+        self.remove_page_index = max(0, self.remove_page_index - 1)
         self._refresh_role_page()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.build_embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Próxima ▶", style=discord.ButtonStyle.secondary, emoji="➡️", row=3)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.page_index < self.total_pages - 1:
-            self.page_index += 1
+        self.page_index = min(self.total_pages - 1, self.page_index + 1)
+        self.remove_page_index = min(self.remove_total_pages - 1, self.remove_page_index + 1)
         self._refresh_role_page()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.build_embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, emoji="⬅️", row=4)
     async def back_to_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1549,7 +2129,7 @@ class ConfigHierarchySetupView(View):
         with db() as con:
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
         self._refresh_role_page()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.build_embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 WL_CONFIG_FIELDS = {
@@ -1573,7 +2153,7 @@ class WLFieldSelect(discord.ui.Select):
         self.parent_view.selected_key = self.values[0]
         self.parent_view.page = 0
         self.parent_view.refresh()
-        await interaction.response.edit_message(view=self.parent_view)
+        await interaction.response.edit_message(view=self.parent_view, content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class WLTargetSelect(discord.ui.Select):
@@ -1590,14 +2170,14 @@ class WLTargetSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         raw = self.values[0]
         if raw == "none":
-            await interaction.response.send_message("Não há opções disponíveis nesta página.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não há opções disponíveis nesta página."))
             return
         save_config_value(self.parent_view.selected_key, raw)
         obj = self.parent_view.guild.get_role(int(raw)) if self.parent_view.kind == "role" else self.parent_view.guild.get_channel(int(raw))
         shown = obj.mention if obj else f"`{raw}`"
         self.parent_view.success_message = f"✅ **{WL_CONFIG_FIELDS[self.parent_view.selected_key][0]}** salvo: {shown}"
         self.parent_view.refresh()
-        await interaction.response.edit_message(view=self.parent_view)
+        await interaction.response.edit_message(view=self.parent_view, content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class WLPageButton(discord.ui.Button):
@@ -1608,7 +2188,7 @@ class WLPageButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         self.parent_view.page = max(0, min(self.parent_view.page_count - 1, self.parent_view.page + self.delta))
         self.parent_view.refresh()
-        await interaction.response.edit_message(view=self.parent_view)
+        await interaction.response.edit_message(view=self.parent_view, content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class WLStageButton(discord.ui.Button):
@@ -1618,10 +2198,10 @@ class WLStageButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         if self.parent_view.stage == 0 and self.delta > 0 and not self.parent_view.roles_ready():
-            await interaction.response.send_message("Defina os cargos obrigatórios antes de avançar. O cargo temporário é opcional.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Defina os cargos obrigatórios antes de avançar. O cargo temporário é opcional."))
             return
         if self.parent_view.stage == 1 and self.delta > 0 and not self.parent_view.channels_ready():
-            await interaction.response.send_message("Defina os dois canais da WL antes de avançar.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Defina os dois canais da WL antes de avançar."))
             return
         if self.parent_view.stage == 2 and self.delta > 0:
             await publish_configured_panel(interaction, "wl")
@@ -1630,10 +2210,10 @@ class WLStageButton(discord.ui.Button):
         self.parent_view.selected_key = self.parent_view.stage_keys[0]
         self.parent_view.page = 0
         self.parent_view.refresh()
-        await interaction.response.edit_message(view=self.parent_view)
+        await interaction.response.edit_message(view=self.parent_view, content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class WLConfigV2(discord.ui.LayoutView):
+class WLConfigV2(ComponentsV2LayoutView):
     """Assistente WL compacto em Components V2, com menus e paginação por setas."""
     def __init__(self, guild, success_message="", *, stage=0, selected_key=None, page=0):
         super().__init__(timeout=900)
@@ -1739,7 +2319,7 @@ class WLConfigV2(discord.ui.LayoutView):
         await interaction.response.send_modal(ConfigWLPanelModal())
 
 
-class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
+class ConfigWLPanelModal(ComponentsV2Modal, title="Configurar painel de WL"):
     title_input = TextInput(label="Título do painel WL", max_length=256, required=True)
     description_input = TextInput(label="Descrição do painel WL", style=discord.TextStyle.paragraph, max_length=3500, required=True)
     photo_url = TextInput(label="URL da foto / miniatura (opcional)", max_length=500, required=False, placeholder="https://.../foto.png")
@@ -1757,14 +2337,14 @@ class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         photo, banner = self.photo_url.value.strip(), self.banner_url.value.strip()
         if not valid_asset_url(photo) or not valid_asset_url(banner):
-            await interaction.response.send_message("Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem."))
             return
         save_config_value("wl_panel_title", self.title_input.value.strip() or f"WL — {FACTION_NAME}")
         save_config_value("wl_panel_description", self.description_input.value.strip())
         save_config_value("wl_panel_photo_url", photo)
         save_config_value("wl_panel_banner_url", banner)
         if not interaction.guild:
-            await interaction.response.send_message("Use esta configuração dentro do servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use esta configuração dentro do servidor."))
             return
         await interaction.response.send_message(
             view=WLConfigV2(interaction.guild, success_message="✅ Aparência salva. Continue configurando a WL por etapas."),
@@ -1772,7 +2352,7 @@ class ConfigWLPanelModal(Modal, title="Configurar painel de WL"):
         )
 
 
-class ConfigHierarchyModal(Modal, title="Aparência da hierarquia"):
+class ConfigHierarchyModal(ComponentsV2Modal, title="Aparência da hierarquia"):
     title_input = TextInput(label="Título da hierarquia", max_length=256, required=True)
     description_input = TextInput(label="Descrição da hierarquia", style=discord.TextStyle.paragraph, max_length=1500, required=True)
 
@@ -1785,17 +2365,17 @@ class ConfigHierarchyModal(Modal, title="Aparência da hierarquia"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Use este formulário dentro do servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este formulário dentro do servidor."))
             return
         save_config_value("hierarchy_panel_title", self.title_input.value.strip() or f"HIERARQUIA — {FACTION_NAME}")
         save_config_value("hierarchy_panel_description", self.description_input.value.strip())
         setup_view = ConfigHierarchySetupView(interaction.guild)
-        await interaction.response.send_message(embed=setup_view.build_embed(), view=setup_view, ephemeral=True)
+        await interaction.response.send_message(view=v2_view(setup_view.build_embed(), setup_view, None), ephemeral=True)
 
 
 # O fluxo antigo de seleção cargo-por-cargo foi removido: agora a hierarquia é configurada em lote por páginas.
 
-class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm"):
+class ConfigFarmPanelModal(ComponentsV2Modal, title="Configurar painel e aprovação de farm"):
     title_input = TextInput(label="Título do painel farm", max_length=256, required=True)
     description_input = TextInput(label="Descrição/instruções do farm", style=discord.TextStyle.paragraph, max_length=2500, required=True)
     photo_url = TextInput(label="URL da foto / miniatura (opcional)", max_length=500, required=False, placeholder="https://.../foto.png")
@@ -1813,12 +2393,12 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             await interaction.response.send_message(
-                "Use este formulário dentro de um servidor.", ephemeral=True
+                None, ephemeral=True, view=v2_view(None, None, "Use este formulário dentro de um servidor.")
             )
             return
         photo, banner = self.photo_url.value.strip(), self.banner_url.value.strip()
         if not valid_asset_url(photo) or not valid_asset_url(banner):
-            await interaction.response.send_message("Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem."))
             return
         save_config_value("farm_panel_title", self.title_input.value.strip() or f"FARM — {FACTION_NAME}")
         save_config_value("farm_panel_description", self.description_input.value.strip())
@@ -1835,7 +2415,7 @@ class ConfigFarmPanelModal(Modal, title="Configurar painel e aprovação de farm
 
 
 
-class ConfigLogsModal(Modal, title="Canais de logs"):
+class ConfigLogsModal(ComponentsV2Modal, title="Canais de logs"):
     admin_channel = TextInput(label="ID do canal de logs administrativos", max_length=22, required=True)
     public_channel = TextInput(label="ID do canal de logs públicos", max_length=22, required=True)
     farm_channel = TextInput(label="ID do canal de logs de farm", max_length=22, required=True)
@@ -1847,41 +2427,44 @@ class ConfigLogsModal(Modal, title="Canais de logs"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         vals = {"admin_log_channel_id": self.admin_channel.value.strip(), "public_log_channel_id": self.public_channel.value.strip(), "farm_log_channel_id": self.farm_channel.value.strip()}
         if any(not v.isdigit() for v in vals.values()):
-            await interaction.response.send_message("Todos os IDs devem ser numéricos. Use 0 para desativar.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Todos os IDs devem ser numéricos. Use 0 para desativar.")); return
         for k, v in vals.items(): save_config_value(k, v)
-        await interaction.response.send_message("✅ Canais de logs administrativos, públicos e de farm salvos.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "✅ Canais de logs administrativos, públicos e de farm salvos."))
 
 
 
 
-class FarmProofRejectModal(Modal, title="Recusar comprovante de farm"):
+class FarmProofRejectModal(ComponentsV2Modal, title="Recusar comprovante de farm"):
     reason = TextInput(label="Motivo obrigatório", style=discord.TextStyle.paragraph, min_length=3, max_length=500, required=True)
     def __init__(self, proof_id: int):
         super().__init__(timeout=300)
         self.proof_id = proof_id
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.")); return
         with db() as con:
             row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (self.proof_id,)).fetchone()
             if not row or row["status"] != "PENDING":
-                await interaction.response.send_message("Esse comprovante já foi analisado ou não existe.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse comprovante já foi analisado ou não existe.")); return
             cur = con.execute("UPDATE farm_proofs SET status='REJECTED',reviewed_by=?,reviewed_at=?,review_reason=? WHERE id=? AND status='PENDING'", (str(interaction.user.id), now_iso(), self.reason.value.strip(), self.proof_id))
             if not cur.rowcount:
-                await interaction.response.send_message("Esse comprovante já foi analisado.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse comprovante já foi analisado.")); return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         log_action(interaction.user.id, "FARM_COMPROVANTE_RECUSADO", int(row["discord_id"]), self.reason.value.strip(), f"Comprovante #{self.proof_id}")
         if interaction.guild:
             await send_channel_log(interaction.guild, "🌾 Comprovante de farm recusado", f"Comprovante: `#{self.proof_id}`\nMembro: <@{row['discord_id']}>\nMotivo: {self.reason.value.strip()}", color=discord.Color.red())
         await update_farm_review_message(row, status="REJECTED", reviewer=interaction.user.mention, reason=self.reason.value.strip())
         try:
             user = await bot.fetch_user(int(row["discord_id"]))
-            await user.send(f"❌ Seu comprovante de farm **#{self.proof_id}** foi recusado. Motivo: {self.reason.value.strip()}")
+            await user.send(None, view=v2_view(None, None, f"❌ Seu comprovante de farm **#{self.proof_id}** foi recusado. Motivo: {self.reason.value.strip()}"))
         except discord.HTTPException:
             pass
-        await interaction.response.send_message(f"Comprovante #{self.proof_id} recusado e registrado.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"Comprovante #{self.proof_id} recusado e registrado."))
 
 
 async def update_farm_review_message(row, *, status: str, reviewer: str, reason: str = "") -> None:
+    """Atualiza o cartão V2 de análise e remove os botões após a decisão."""
     channel_id = int(row["review_channel_id"] or 0)
     message_id = int(row["review_message_id"] or 0)
     channel = bot.get_channel(channel_id) if channel_id else None
@@ -1897,92 +2480,108 @@ async def update_farm_review_message(row, *, status: str, reviewer: str, reason:
         return
     try:
         msg = await channel.fetch_message(message_id)
-        if msg.embeds:
-            embed = msg.embeds[0]
-            embed.title = f"{'✅ APROVADO' if status == 'APPROVED' else '❌ RECUSADO'} · COMPROVANTE DE FARM #{row['id']}"
-            embed.color = discord.Color.green() if status == "APPROVED" else discord.Color.red()
-            embed.add_field(name="Analisado por", value=reviewer, inline=True)
-            if reason: embed.add_field(name="Motivo", value=reason[:1024], inline=False)
-            await msg.edit(embed=embed, view=None)
+        approved = status == "APPROVED"
+        embed = PanelMessage(
+            title=f"{'✅ APROVADO' if approved else '❌ RECUSADO'} · COMPROVANTE DE FARM #{row['id']}",
+            description=(
+                f"**Membro:** <@{row['discord_id']}> · **{row['character_name']}**\n"
+                f"**ID FiveM:** `{row['game_id']}`\n"
+                f"**Item:** {row['item_name'] or 'Não informado'}\n"
+                f"**Quantidade:** {row['quantity'] or 0}\n"
+                f"**Pontos:** {row['points'] or 0}\n"
+                f"**Valor total:** R$ {int(row['total_cents'] or 0) / 100:.2f}\n"
+                f"**Analisado por:** {reviewer}"
+                + (f"\n**Motivo:** {reason[:900]}" if reason else "")
+            ),
+            color=discord.Color.green() if approved else discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if msg.attachments:
+            embed.set_image(url=f"attachment://{msg.attachments[0].filename}")
+        await msg.edit(
+            content=None,
+            embeds=[],
+            attachments=msg.attachments,
+            view=v2_view(embed, None, None),
+        )
     except discord.HTTPException:
         log.exception("Não foi possível atualizar a mensagem do comprovante #%s", row["id"])
 
 
-class FarmInvoiceRejectModal(Modal, title="Recusar cobrança de farm"):
+class FarmInvoiceRejectModal(ComponentsV2Modal, title="Recusar cobrança de farm"):
     reason = TextInput(label="Motivo da recusa", style=discord.TextStyle.paragraph, min_length=5, max_length=500, required=True)
     def __init__(self, proof_id: int):
         super().__init__(timeout=300)
         self.proof_id = proof_id
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo autorizado para decidir cobranças de farm.")); return
         with db() as con:
             row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (self.proof_id,)).fetchone()
             if not row or row["status"] != "PENDING":
-                await interaction.response.send_message("Essa cobrança já foi finalizada ou não existe.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa cobrança já foi finalizada ou não existe.")); return
             cur = con.execute("UPDATE farm_proofs SET status='REJECTED',reviewed_by=?,reviewed_at=?,review_reason=? WHERE id=? AND status='PENDING'", (str(interaction.user.id), now_iso(), self.reason.value.strip(), self.proof_id))
             if not cur.rowcount:
-                await interaction.response.send_message("Essa cobrança já foi decidida por outra pessoa.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa cobrança já foi decidida por outra pessoa.")); return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         log_action(interaction.user.id, "FARM_COBRANCA_RECUSADA", int(row["discord_id"]), self.reason.value.strip(), f"Cobrança #{self.proof_id}")
         await finalize_farm_invoice(row, "REJECTED", interaction.user, reason=self.reason.value.strip())
-        await interaction.response.send_message(f"Cobrança #{self.proof_id} recusada e registrada.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"Cobrança #{self.proof_id} recusada e registrada."))
 
 
-class FarmInvoiceConfirmView(View):
+class FarmInvoiceConfirmView(ComponentsV2View):
     def __init__(self, proof_id: int):
         super().__init__(timeout=300)
         self.proof_id = proof_id
     @discord.ui.button(label="SIM, pagar", style=discord.ButtonStyle.success, emoji="✅")
     async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo autorizado para decidir cobranças de farm.")); return
         with db() as con:
             row = con.execute("SELECT * FROM farm_proofs WHERE id=? AND status='PENDING'", (self.proof_id,)).fetchone()
         if not row:
-            await interaction.response.send_message("Essa cobrança já foi finalizada.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa cobrança já foi finalizada.")); return
         with db() as con:
             con.execute("INSERT INTO farm_receipt_pending(reviewer_id,proof_id,channel_id,created_at) VALUES(?,?,?,?) ON CONFLICT(reviewer_id) DO UPDATE SET proof_id=excluded.proof_id,channel_id=excluded.channel_id,created_at=excluded.created_at", (str(interaction.user.id), self.proof_id, str(interaction.channel_id), now_iso()))
-        await interaction.response.send_message(f"Envie agora, neste canal privado, a **foto do comprovante de pagamento** da cobrança #{self.proof_id}. A imagem será salva no banco e enviada ao membro por DM. Prazo: 10 minutos.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Envie agora, neste canal privado, a **foto do comprovante de pagamento** da cobrança #{self.proof_id}. A imagem será salva no banco e enviada ao membro por DM. Prazo: 10 minutos."))
     @discord.ui.button(label="NÃO, não pagar", style=discord.ButtonStyle.danger, emoji="✖️")
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo autorizado para decidir cobranças de farm.")); return
         await interaction.response.send_modal(FarmInvoiceRejectModal(self.proof_id))
 
 
-class FarmInvoiceView(View):
+class FarmInvoiceView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
     def proof_id_from(self, interaction: discord.Interaction) -> Optional[int]:
-        if not interaction.message or not interaction.message.embeds: return None
-        footer = interaction.message.embeds[0].footer.text or ""
-        try: return int(footer.split("farm_proof_id=")[-1])
-        except (ValueError, IndexError): return None
+        return message_marker_id(interaction.message, "farm_proof_id=")
     @discord.ui.button(label="Registrar pagamento", style=discord.ButtonStyle.success, emoji="💸", custom_id="fac:farm:invoice-pay")
     async def pay(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo autorizado para decidir cobranças de farm.")); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
-            await interaction.response.send_message("Não consegui identificar essa cobrança.", ephemeral=True); return
-        await interaction.response.send_message(f"Confirma o pagamento da cobrança **#{proof_id}**?", view=FarmInvoiceConfirmView(proof_id), ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não consegui identificar essa cobrança.")); return
+        await interaction.response.send_message(None, view=v2_view(None, FarmInvoiceConfirmView(proof_id), f"Confirma o pagamento da cobrança **#{proof_id}**?"), ephemeral=True)
     @discord.ui.button(label="Recusar cobrança", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="fac:farm:invoice-reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo autorizado para decidir cobranças de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo autorizado para decidir cobranças de farm.")); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
-            await interaction.response.send_message("Não consegui identificar essa cobrança.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não consegui identificar essa cobrança.")); return
         await interaction.response.send_modal(FarmInvoiceRejectModal(proof_id))
 
 
-async def finalize_farm_invoice(row, status: str, reviewer: discord.abc.User, *, reason: str = "", receipt: bytes = b"", receipt_filename: str = "", receipt_mime: str = "") -> None:
+async def finalize_farm_invoice(row, status: str, reviewer: discord.abc.User, *, reason: str = "", receipt: bytes = b"", receipt_filename: str = "", receipt_mime: str = "") -> bool:
     proof_id = int(row["id"])
     with db() as con:
         expected_status = "PENDING" if status == "APPROVED" else "REJECTED"
         cur = con.execute("UPDATE farm_proofs SET status=?,reviewed_by=?,reviewed_at=?,review_reason=?,paid_by=?,paid_at=?,receipt_data=?,receipt_filename=?,receipt_mime=? WHERE id=? AND status=?", (status, str(reviewer.id), now_iso(), reason, str(reviewer.id) if status == "APPROVED" else "", now_iso() if status == "APPROVED" else "", sqlite3.Binary(receipt) if receipt else None, receipt_filename, receipt_mime, proof_id, expected_status))
         if not cur.rowcount:
-            return
+            return False
         if status == "APPROVED":
             con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)", (str(row["discord_id"]), row["item_name"], int(row["quantity"] or 0), int(row["points"] or 0), now_iso()))
     channel_id = int(row["review_channel_id"] or 0); message_id = int(row["review_message_id"] or 0)
@@ -1993,29 +2592,44 @@ async def finalize_farm_invoice(row, status: str, reviewer: discord.abc.User, *,
     if isinstance(channel, discord.TextChannel) and message_id:
         try:
             msg = await channel.fetch_message(message_id)
-            final_embed = discord.Embed(title=f"{'✅ PAGAMENTO CONFIRMADO' if status == 'APPROVED' else '❌ COBRANÇA RECUSADA'} · FARM #{proof_id}", color=discord.Color.green() if status == 'APPROVED' else discord.Color.red(), timestamp=datetime.now(timezone.utc))
+            final_embed = PanelMessage(title=f"{'✅ PAGAMENTO CONFIRMADO' if status == 'APPROVED' else '❌ COBRANÇA RECUSADA'} · FARM #{proof_id}", color=discord.Color.green() if status == 'APPROVED' else discord.Color.red(), timestamp=datetime.now(timezone.utc))
             final_embed.description = (
                 f"**Membro:** <@{row['discord_id']}> · {row['character_name']}\n"
                 f"**ID:** {row['game_id']}\n**Item:** {row['item_name']} × {row['quantity']}\n"
                 f"**Total:** R$ {int(row['total_cents'] or 0)/100:.2f}\n**Decidido por:** {reviewer.mention}"
                 + (f"\n**Motivo:** {reason}" if reason else "")
             )
-            await msg.edit(embed=final_embed, view=None)
+            if msg.attachments:
+                final_embed.set_image(url=f"attachment://{msg.attachments[0].filename}")
+            await msg.edit(
+                view=v2_view(final_embed, None, None),
+                content=None,
+                embeds=[],
+                attachments=msg.attachments,
+            )
             history_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
             history_channel = bot.get_channel(history_channel_id) if history_channel_id else None
             if isinstance(history_channel, discord.TextChannel) and history_channel.id != channel.id:
-                await history_channel.send(embed=final_embed)
+                import io
+                history_embed = final_embed.copy()
+                safe_filename = os.path.basename(row["image_filename"] or f"farm-{proof_id}.png").replace("\n", "_")[:100]
+                history_embed.set_image(url=f"attachment://{safe_filename}")
+                await history_channel.send(
+                    file=discord.File(io.BytesIO(row["image_data"]), filename=safe_filename),
+                    view=v2_view(history_embed, None, None),
+                )
         except discord.HTTPException: log.exception("Falha ao atualizar cobrança finalizada #%s", proof_id)
     try:
         user = await bot.fetch_user(int(row["discord_id"]))
         if status == "APPROVED" and receipt:
             import io
-            await user.send(f"✅ Seu farm #{proof_id} foi pago! Valor: **R$ {int(row['total_cents'] or 0)/100:.2f}**. Comprovante anexado.", file=discord.File(io.BytesIO(receipt), filename=receipt_filename or f"pagamento-{proof_id}.png"))
+            await user.send(None, file=discord.File(io.BytesIO(receipt), filename=receipt_filename or f"pagamento-{proof_id}.png"), view=v2_view(None, None, f"✅ Seu farm #{proof_id} foi pago! Valor: **R$ {int(row['total_cents'] or 0)/100:.2f}**. Comprovante anexado."))
         elif status == "REJECTED":
-            await user.send(f"❌ Sua cobrança de farm #{proof_id} foi recusada. Motivo: **{reason}**")
+            await user.send(None, view=v2_view(None, None, f"❌ Sua cobrança de farm #{proof_id} foi recusada. Motivo: **{reason}**"))
     except discord.HTTPException:
         log.info("Não foi possível enviar DM para o membro da cobrança #%s", proof_id)
     log_action(reviewer.id, "FARM_PAGAMENTO_CONFIRMADO" if status == "APPROVED" else "FARM_COBRANCA_FINALIZADA_COM_RECUSA", int(row["discord_id"]), reason, f"Cobrança #{proof_id}; total={int(row['total_cents'] or 0)} centavos")
+    return True
 
 
 async def store_farm_payment_receipt(message: discord.Message) -> bool:
@@ -2026,29 +2640,37 @@ async def store_farm_payment_receipt(message: discord.Message) -> bool:
     try:
         if (datetime.now(timezone.utc) - datetime.fromisoformat(pending["created_at"])).total_seconds() > 600:
             with db() as con: con.execute("DELETE FROM farm_receipt_pending WHERE reviewer_id=?", (str(message.author.id),))
-            await message.reply("O prazo para enviar o comprovante expirou. Inicie a confirmação novamente."); return True
+            await message.reply(None, view=v2_view(None, None, "O prazo para enviar o comprovante expirou. Inicie a confirmação novamente.")); return True
     except (TypeError, ValueError): pass
     if not isinstance(message.author, discord.Member) or not can_decide_farm_for_member(message.author):
-        await message.reply("Somente o cargo configurado para decidir Farm pode anexar esse comprovante."); return True
+        await message.reply(None, view=v2_view(None, None, "Somente o cargo configurado para decidir Farm pode anexar esse comprovante.")); return True
     attachment = next((a for a in message.attachments if (a.content_type or "").startswith("image/") or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
     if not attachment:
-        await message.reply("Anexe a imagem do comprovante de pagamento nesta mensagem."); return True
+        await message.reply(None, view=v2_view(None, None, "Anexe a imagem do comprovante de pagamento nesta mensagem.")); return True
     if attachment.size > 8 * 1024 * 1024:
-        await message.reply("A imagem excede 8 MB. Envie uma menor."); return True
+        await message.reply(None, view=v2_view(None, None, "A imagem excede 8 MB. Envie uma menor.")); return True
     try: data = await attachment.read(use_cached=False)
     except discord.HTTPException:
-        await message.reply("Não consegui baixar o comprovante. Envie novamente."); return True
+        await message.reply(None, view=v2_view(None, None, "Não consegui baixar o comprovante. Envie novamente.")); return True
     if not data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"RIFF")):
-        await message.reply("O arquivo não parece ser uma imagem válida."); return True
+        await message.reply(None, view=v2_view(None, None, "O arquivo não parece ser uma imagem válida.")); return True
     with db() as con:
         row = con.execute("SELECT * FROM farm_proofs WHERE id=? AND status='PENDING'", (int(pending["proof_id"]),)).fetchone()
         con.execute("DELETE FROM farm_receipt_pending WHERE reviewer_id=?", (str(message.author.id),))
     if not row:
-        await message.reply("Essa cobrança já foi finalizada ou não existe."); return True
-    await finalize_farm_invoice(row, "APPROVED", message.author, receipt=data, receipt_filename=attachment.filename[:150], receipt_mime=attachment.content_type or "application/octet-stream")
+        await message.reply(None, view=v2_view(None, None, "Essa cobrança já foi finalizada ou não existe.")); return True
+    finalized = await finalize_farm_invoice(
+        row, "APPROVED", message.author,
+        receipt=data,
+        receipt_filename=attachment.filename[:150],
+        receipt_mime=attachment.content_type or "application/octet-stream",
+    )
+    if not finalized:
+        await message.reply(None, view=v2_view(None, None, "Essa cobrança foi decidida por outra pessoa antes do registro do pagamento."))
+        return True
     try: await message.delete()
     except discord.HTTPException: pass
-    try: await message.channel.send(f"✅ Pagamento da cobrança **#{row['id']}** registrado e comprovante salvo.", delete_after=15)
+    try: await message.channel.send(None, delete_after=15, view=v2_view(None, None, f"✅ Pagamento da cobrança **#{row['id']}** registrado e comprovante salvo."))
     except discord.HTTPException: pass
     return True
 
@@ -2060,43 +2682,41 @@ def can_decide_farm_for_member(member: discord.Member) -> bool:
     return bool(role_id and any(role.id == role_id for role in member.roles))
 
 
-class FarmProofReviewView(View):
+class FarmProofReviewView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
 
     def proof_id_from(self, interaction: discord.Interaction) -> Optional[int]:
-        if not interaction.message or not interaction.message.embeds:
-            return None
-        footer = interaction.message.embeds[0].footer.text or ""
-        try: return int(footer.split("farm_proof_id=")[-1])
-        except (ValueError, IndexError): return None
+        return message_marker_id(interaction.message, "farm_proof_id=")
 
     @discord.ui.button(label="Aprovar comprovante", style=discord.ButtonStyle.success, emoji="✅", custom_id="fac:farm:approve-proof")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.")); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
-            await interaction.response.send_message("Não consegui identificar esse comprovante.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não consegui identificar esse comprovante.")); return
         expected_channel = int(panel_setting("farm_approval_channel_id", "0") or 0)
         if expected_channel and interaction.channel_id != expected_channel:
-            await interaction.response.send_message("A aprovação precisa ser feita no canal de análise configurado.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "A aprovação precisa ser feita no canal de análise configurado.")); return
         with db() as con:
             row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (proof_id,)).fetchone()
             if not row or row["status"] != "PENDING":
-                await interaction.response.send_message("Esse comprovante já foi analisado ou não existe.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse comprovante já foi analisado ou não existe.")); return
             cur = con.execute("UPDATE farm_proofs SET status='APPROVED',reviewed_by=?,reviewed_at=?,review_reason='' WHERE id=? AND status='PENDING'", (str(interaction.user.id), now_iso(), proof_id))
             if not cur.rowcount:
-                await interaction.response.send_message("Esse comprovante já foi analisado.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse comprovante já foi analisado.")); return
             con.execute("INSERT INTO farm_entries(discord_id,item_name,quantity,points,created_at) VALUES(?,?,?,?,?)",
                 (str(row["discord_id"]), row["item_name"], int(row["quantity"] or 0), int(row["points"] or 0), now_iso()))
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         log_action(interaction.user.id, "FARM_COMPROVANTE_APROVADO", int(row["discord_id"]), "", f"Comprovante #{proof_id}; {row['item_name']} x{row['quantity']}")
         await update_farm_review_message(row, status="APPROVED", reviewer=interaction.user.mention)
         guild = interaction.guild
         log_channel_id = int(setting("farm_log_channel_id", str(FARM_LOG_CHANNEL_ID)) or 0)
         log_channel = guild.get_channel(log_channel_id) if guild and log_channel_id else None
         if isinstance(log_channel, discord.TextChannel):
-            approved_embed = discord.Embed(title=f"🌾 REGISTRO DE FARM #{proof_id}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
+            approved_embed = PanelMessage(title=f"🌾 REGISTRO DE FARM #{proof_id}", color=discord.Color.green(), timestamp=datetime.now(timezone.utc))
             approved_embed.add_field(name="Jogador", value=row["character_name"], inline=True)
             approved_embed.add_field(name="ID", value=row["game_id"], inline=True)
             approved_embed.add_field(name="Farm", value=row["item_name"] or "Não informado", inline=True)
@@ -2107,24 +2727,24 @@ class FarmProofReviewView(View):
             import io
             safe_log_filename = os.path.basename(row["image_filename"] or f"farm-{proof_id}.png").replace("\n", "_")[:100]
             approved_embed.set_image(url=f"attachment://{safe_log_filename}")
-            await log_channel.send(embed=approved_embed, file=discord.File(io.BytesIO(row["image_data"]), filename=safe_log_filename))
+            await log_channel.send(view=v2_view(approved_embed, None, None), file=discord.File(io.BytesIO(row["image_data"]), filename=safe_log_filename))
         try:
             user = await bot.fetch_user(int(row["discord_id"]))
-            await user.send(f"✅ Seu comprovante de farm **#{proof_id}** foi aprovado pela liderança.")
+            await user.send(None, view=v2_view(None, None, f"✅ Seu comprovante de farm **#{proof_id}** foi aprovado pela liderança."))
         except discord.HTTPException:
             pass
-        await interaction.response.send_message(f"Comprovante #{proof_id} aprovado.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"Comprovante #{proof_id} aprovado."))
 
     @discord.ui.button(label="Recusar comprovante", style=discord.ButtonStyle.danger, emoji="❌", custom_id="fac:farm:reject-proof")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not can_decide_farm(interaction):
-            await interaction.response.send_message("Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não possui o cargo configurado para aprovar ou recusar comprovantes de farm.")); return
         proof_id = self.proof_id_from(interaction)
         if not proof_id:
-            await interaction.response.send_message("Não consegui identificar esse comprovante.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não consegui identificar esse comprovante.")); return
         expected_channel = int(panel_setting("farm_approval_channel_id", "0") or 0)
         if expected_channel and interaction.channel_id != expected_channel:
-            await interaction.response.send_message("A recusa precisa ser feita no canal de análise configurado.", ephemeral=True); return
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "A recusa precisa ser feita no canal de análise configurado.")); return
         await interaction.response.send_modal(FarmProofRejectModal(proof_id))
 
 
@@ -2137,10 +2757,10 @@ class HierarchyPublishChannelSelect(discord.ui.ChannelSelect):
         channel = self.values[0]
         self.parent_view.channel_id = channel.id
         self.parent_view.publish_now.disabled = False
-        await interaction.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class HierarchyPublishChannelView(View):
+class HierarchyPublishChannelView(ComponentsV2View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=600)
         self.guild = guild
@@ -2151,15 +2771,15 @@ class HierarchyPublishChannelView(View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not has_leadership(interaction):
-            await interaction.response.send_message("Somente liderança ou administradores podem publicar a hierarquia.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente liderança ou administradores podem publicar a hierarquia."))
             return False
         return True
 
-    def build_embed(self) -> discord.Embed:
+    def build_embed(self) -> PanelMessage:
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
         description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização, do mais alto ao mais baixo.")
         channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
-        embed = discord.Embed(
+        embed = PanelMessage(
             title="📣 Publicar hierarquia",
             description=f"**{title[:180]}**\n{description[:700]}\n\nSelecione o canal de destino. A hierarquia será publicada em seções por cargo, do mais alto ao mais baixo.",
             color=discord.Color.from_rgb(76, 86, 180),
@@ -2170,11 +2790,15 @@ class HierarchyPublishChannelView(View):
 
     @discord.ui.button(label="Publicar neste canal", style=discord.ButtonStyle.success, emoji="🚀", row=1)
     async def publish_now(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        issue = hierarchy_configuration_issue(interaction.guild) if interaction.guild else "Use este recurso dentro do servidor."
+        if issue:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, issue))
+            return
         if not self.channel_id:
             raw = setting("hierarchy_panel_channel_id", "0")
             self.channel_id = int(raw) if raw.isdigit() and int(raw) else None
         if not self.channel_id:
-            await interaction.response.send_message("Selecione o canal ou informe o ID manualmente.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Selecione o canal ou informe o ID manualmente."))
             return
         save_config_value("hierarchy_panel_channel_id", str(self.channel_id))
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -2184,7 +2808,7 @@ class HierarchyPublishChannelView(View):
 
 
 # ---------------- HIERARQUIA CONFIGURÁVEL (FLUXO GUIADO) ----------------
-HIERARCHY_MAX_ROLES = 25
+HIERARCHY_MAX_ROLES = 100
 HIERARCHY_FIELDS_PER_MODAL = 5
 
 
@@ -2209,11 +2833,11 @@ def clear_hierarchy_settings():
     with db() as con:
         con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
         con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
-        for key in ("hierarchy_panel_channel_id", "hierarchy_role_count"):
+        for key in ("hierarchy_panel_channel_id", "hierarchy_role_count", "hierarchy_setup_in_progress"):
             con.execute("DELETE FROM settings WHERE key=?", (key,))
 
 
-class HierarchyGuideView(View):
+class HierarchyGuideView(ComponentsV2View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=900)
         self.guild = guild
@@ -2225,18 +2849,20 @@ class HierarchyGuideView(View):
     @discord.ui.button(label="Apagar configuração anterior", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "⚠️ **Confirma a exclusão?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia no canal anteriormente configurado. Essa ação não pode ser desfeita.",
-            view=HierarchyResetConfirmView(self.guild), ephemeral=True
+            None,
+            view=v2_view(None, HierarchyResetConfirmView(self.guild), "⚠️ **Confirma a exclusão?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia no canal anteriormente configurado. Essa ação não pode ser desfeita."), ephemeral=True
         )
 
 
-class HierarchyResetConfirmView(View):
+class HierarchyResetConfirmView(ComponentsV2View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=120)
         self.guild = guild
 
     @discord.ui.button(label="Sim, apagar tudo", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         raw = setting("hierarchy_panel_channel_id", "0")
         channel = self.guild.get_channel(int(raw)) if raw.isdigit() and int(raw) else None
         deleted = 0
@@ -2246,7 +2872,10 @@ class HierarchyResetConfirmView(View):
                     is_hierarchy_post = (
                         bot.user is not None
                         and message.author.id == bot.user.id
-                        and any((embed.title or "").startswith("📋 | ") for embed in message.embeds)
+                        and any(
+                            line.lstrip("# ").startswith("📋 | ")
+                            for line in message_component_text(message).splitlines()
+                        )
                     )
                     if not is_hierarchy_post:
                         continue
@@ -2258,18 +2887,23 @@ class HierarchyResetConfirmView(View):
                     except discord.HTTPException:
                         continue
             except discord.Forbidden:
-                await interaction.response.send_message("Não tenho permissão para limpar o canal anterior. Conceda Gerenciar mensagens e tente novamente.", ephemeral=True)
+                await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Não tenho permissão para limpar o canal anterior. Conceda Gerenciar mensagens e tente novamente."))
                 return
         clear_hierarchy_settings()
-        await interaction.response.edit_message(content=f"✅ Configuração apagada. {deleted} mensagem(ns) removida(s) do canal anterior. Você pode começar do zero.", view=None)
+        await interaction.edit_original_response(
+            content=None,
+            view=v2_view(None, None, f"✅ Configuração apagada. {deleted} mensagem(ns) removida(s) do canal anterior. Você pode começar do zero."),
+            embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
     @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Operação cancelada. Nenhuma configuração foi alterada.", view=None)
+        await interaction.response.edit_message(content=None, view=v2_view(None, None, "Operação cancelada. Nenhuma configuração foi alterada."), embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class HierarchyCountModal(Modal, title="Etapa 1 — Quantidade de cargos"):
-    count = TextInput(label="Quantos cargos terá a hierarquia? (1 a 25)", placeholder="Ex.: 10", max_length=2)
+class HierarchyCountModal(ComponentsV2Modal, title="Etapa 1 — Quantidade de cargos"):
+    count = TextInput(label="Quantos cargos terá a hierarquia? (1 a 100)", placeholder="Ex.: 10", max_length=3)
 
     def __init__(self, guild):
         super().__init__(timeout=300)
@@ -2278,20 +2912,50 @@ class HierarchyCountModal(Modal, title="Etapa 1 — Quantidade de cargos"):
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.count.value.strip()
         if not raw.isdigit() or not 1 <= int(raw) <= HIERARCHY_MAX_ROLES:
-            await interaction.response.send_message("Informe uma quantidade entre 1 e 25.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe uma quantidade entre 1 e 100."))
             return
         count = int(raw)
+        available_role_count = len(selectable_hierarchy_roles(self.guild))
+        if count > available_role_count:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(
+                    None, None,
+                    f"Você pediu {count} cargos, mas este servidor tem apenas {available_role_count} cargos selecionáveis. Ajuste a quantidade.",
+                ),
+            )
+            return
         save_config_value("hierarchy_role_count", str(count))
-        # A nova configuração substitui a lista anterior, mas mantém o canal até a publicação.
-        with db() as con:
-            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
+        save_config_value("hierarchy_setup_in_progress", "1")
+        # Reaproveita cargos/tags já configurados; só solicita o que ainda falta.
+        selectable_ids = {role.id for role in selectable_hierarchy_roles(self.guild)}
+        existing = []
+        for _priority, role_id, _abbr in hierarchy_rows():
+            role = self.guild.get_role(role_id)
+            if role and role.id in selectable_ids:
+                existing.append(role)
+        existing = sorted(existing, key=lambda role: (role.position, role.name.casefold()), reverse=True)
         view = HierarchyRoleConfigView(self.guild, count)
         view.owner_id = interaction.user.id
-        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        view.role_ids = [role.id for role in existing[:count]] + [None] * max(0, count - len(existing))
+        if all(role_id is not None for role_id in view.role_ids):
+            tags_view = HierarchyTagConfigView(self.guild, view.role_ids, view.owner_id)
+            if all(tags_view.tags):
+                tags_view.persist_tags()
+                final_view = HierarchyFinalChannelView(self.guild)
+                await interaction.response.send_message(
+                    view=v2_view(final_view.embed(), final_view, None), ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    view=v2_view(tags_view.embed(), tags_view, None), ephemeral=True
+                )
+            return
+        view._refresh_role_picker()
+        await interaction.response.send_message(view=v2_view(view.embed(), view, None), ephemeral=True)
 
 
-class HierarchyRoleIdsModal(Modal):
+class HierarchyRoleIdsModal(ComponentsV2Modal):
     def __init__(self, parent, start: int, end: int):
         super().__init__(title=f"Etapa 2 — IDs dos cargos {start + 1} a {end}", timeout=300)
         self.parent_view = parent
@@ -2315,16 +2979,16 @@ class HierarchyRoleIdsModal(Modal):
         for offset, field in enumerate(self.inputs):
             raw = field.value.strip()
             role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
-            if not role or role == self.parent_view.guild.default_role:
-                await interaction.response.send_message(f"ID inválido no campo Cargo {self.start + offset + 1}. Confira se o cargo pertence a este servidor.", ephemeral=True)
+            if not role or role.id not in {item.id for item in selectable_hierarchy_roles(self.parent_view.guild)}:
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"ID inválido no campo Cargo {self.start + offset + 1}. Use um cargo não gerenciado e abaixo do cargo do bot."))
                 return
             if role.id in resolved or role.id in [x for i, x in enumerate(self.parent_view.role_ids) if x and not self.start <= i < self.end]:
-                await interaction.response.send_message("Você informou o mesmo cargo mais de uma vez. Cada posição precisa ter um cargo diferente.", ephemeral=True)
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você informou o mesmo cargo mais de uma vez. Cada posição precisa ter um cargo diferente."))
                 return
             resolved.append(role.id)
         for offset, rid in enumerate(resolved):
             self.parent_view.role_ids[self.start + offset] = rid
-        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+        await interaction.response.send_message(view=v2_view(self.parent_view.embed(), self.parent_view, None), ephemeral=True)
 
 
 
@@ -2354,26 +3018,26 @@ class HierarchyRolePicker(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.parent_view.owner_id:
-            await interaction.response.send_message("Somente quem iniciou a configuração pode selecionar os cargos.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode selecionar os cargos."))
             return
         raw = self.values[0]
         role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
-        if role is None or role == self.parent_view.guild.default_role:
-            await interaction.response.send_message("Cargo inválido. Selecione um cargo deste servidor.", ephemeral=True)
+        if role is None or role.id not in {item.id for item in selectable_hierarchy_roles(self.parent_view.guild)}:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Cargo inválido ou fora da hierarquia administrável pelo bot."))
             return
         if role.id in [rid for rid in self.parent_view.role_ids if rid]:
-            await interaction.response.send_message("Esse cargo já foi selecionado. Escolha outro.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse cargo já foi selecionado. Escolha outro."))
             return
         try:
             index = self.parent_view.role_ids.index(None)
         except ValueError:
-            await interaction.response.send_message("Todos os cargos já foram preenchidos.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Todos os cargos já foram preenchidos."))
             return
         self.parent_view.role_ids[index] = role.id
         await self.parent_view.refresh_after_role_change(interaction)
 
 
-class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
+class HierarchyRoleIdModal(ComponentsV2Modal, title="Adicionar cargo por ID"):
     role_id_input = TextInput(label="ID do cargo", max_length=25, required=True, placeholder="Cole o ID do cargo do servidor")
 
     def __init__(self, parent_view):
@@ -2382,32 +3046,88 @@ class HierarchyRoleIdModal(Modal, title="Adicionar cargo por ID"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if interaction.user.id != self.parent_view.owner_id:
-            await interaction.response.send_message("Somente quem iniciou a configuração pode informar os IDs.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode informar os IDs."))
             return
         raw = self.role_id_input.value.strip()
         role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
         if role is None or role == self.parent_view.guild.default_role:
-            await interaction.response.send_message("ID inválido: não encontrei esse cargo neste servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID inválido: não encontrei esse cargo neste servidor."))
             return
         if role.id in [rid for rid in self.parent_view.role_ids if rid]:
-            await interaction.response.send_message("Esse cargo já foi selecionado. Informe outro ID.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse cargo já foi selecionado. Informe outro ID."))
             return
         try:
             index = self.parent_view.role_ids.index(None)
         except ValueError:
-            await interaction.response.send_message("Todos os cargos já foram preenchidos.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Todos os cargos já foram preenchidos."))
             return
         self.parent_view.role_ids[index] = role.id
         if all(rid is not None for rid in self.parent_view.role_ids):
             self.parent_view.role_ids.sort(key=lambda rid: self.parent_view.guild.get_role(rid).position if self.parent_view.guild.get_role(rid) else -1, reverse=True)
             next_view = HierarchyTagConfigView(self.parent_view.guild, self.parent_view.role_ids, self.parent_view.owner_id)
-            await interaction.response.send_message(embed=next_view.embed(), view=next_view, ephemeral=True)
+            await interaction.response.send_message(view=v2_view(next_view.embed(), next_view, None), ephemeral=True)
         else:
             self.parent_view._refresh_role_picker()
-            await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+            await interaction.response.send_message(view=v2_view(self.parent_view.embed(), self.parent_view, None), ephemeral=True)
 
 
-class HierarchyRoleConfigView(View):
+def selectable_hierarchy_roles(guild: discord.Guild) -> list[discord.Role]:
+    """Cargos válidos para a hierarquia e administráveis pelo bot."""
+    bot_member = guild.me
+    roles = [
+        role for role in guild.roles
+        if role != guild.default_role
+        and not role.managed
+        and (bot_member is None or role < bot_member.top_role)
+    ]
+    return sorted(
+        roles,
+        key=lambda role: (role.position, role.name.casefold()),
+        reverse=True,
+    )
+
+
+def hierarchy_configuration_issue(guild: discord.Guild) -> Optional[str]:
+    """Retorna o motivo pelo qual a hierarquia ainda não pode ser publicada."""
+    if setting("hierarchy_setup_in_progress", "0") == "1":
+        return "A configuração da hierarquia ainda está em andamento. Termine de selecionar todos os cargos e definir todas as tags antes de publicar."
+
+    rows = hierarchy_rows()
+    if not rows:
+        return "Nenhum cargo está configurado para exibição. Abra `/config` → Hierarquia e selecione os cargos."
+
+    try:
+        expected_count = int(setting("hierarchy_role_count", "0") or 0)
+    except (TypeError, ValueError):
+        expected_count = 0
+    if expected_count and len(rows) != expected_count:
+        return (
+            f"A hierarquia ainda não está completa: existem **{len(rows)} de {expected_count} cargos** salvos. "
+            "Conclua a seleção dos cargos e das tags em `/config` → Hierarquia antes de publicar."
+        )
+
+    missing_tags = [str(role_id) for _priority, role_id, abbreviation in rows if not (abbreviation or "").strip()]
+    if missing_tags:
+        return (
+            "Ainda faltam tags para os cargos de ID " + ", ".join(f"`{role_id}`" for role_id in missing_tags[:10]) +
+            ". Conclua a etapa de tags em `/config` → Hierarquia antes de publicar."
+        )
+
+    selectable_ids = {role.id for role in selectable_hierarchy_roles(guild)}
+    invalid_roles = []
+    for _priority, role_id, _abbreviation in rows:
+        role = guild.get_role(role_id)
+        if role is None or role_id not in selectable_ids:
+            invalid_roles.append(role.name if role else str(role_id))
+    if invalid_roles:
+        return (
+            "O cargo do bot precisa ficar acima destes cargos, e eles não podem ser gerenciados por integrações: " +
+            ", ".join(f"**{name}**" for name in invalid_roles[:10]) + "."
+        )
+    return None
+
+
+class HierarchyRoleConfigView(ComponentsV2View):
     """Seleciona cargos do servidor em páginas, do cargo mais alto ao mais baixo."""
     def __init__(self, guild, count):
         super().__init__(timeout=900)
@@ -2415,11 +3135,7 @@ class HierarchyRoleConfigView(View):
         self.role_ids = [None] * count
         self.owner_id = 0
         # Ordem de seleção: primeiro o cargo mais alto; último o mais baixo.
-        self.available_roles = sorted(
-            (role for role in guild.roles if role != guild.default_role),
-            key=lambda role: (role.position, role.name.casefold()),
-            reverse=True,
-        )
+        self.available_roles = selectable_hierarchy_roles(guild)
         self.role_page = 0
         self.role_picker = HierarchyRolePicker(self)
         self.add_item(self.role_picker)
@@ -2442,16 +3158,32 @@ class HierarchyRoleConfigView(View):
     async def refresh_after_role_change(self, interaction):
         if all(rid is not None for rid in self.role_ids):
             # Normaliza pela posição real dos cargos: maior primeiro, menor por último.
-            self.role_ids.sort(key=lambda rid: self.guild.get_role(rid).position if self.guild.get_role(rid) else -1, reverse=True)
+            self.role_ids.sort(
+                key=lambda rid: self.guild.get_role(rid).position if self.guild.get_role(rid) else -1,
+                reverse=True,
+            )
             tags_view = HierarchyTagConfigView(self.guild, self.role_ids, self.owner_id)
-            await interaction.response.edit_message(embed=tags_view.embed(), view=tags_view)
+            if all(tags_view.tags):
+                tags_view.persist_tags()
+                final_view = HierarchyFinalChannelView(self.guild)
+                await interaction.response.edit_message(
+                    view=v2_view(final_view.embed(), final_view, None),
+                    content=None, embeds=[],
+                    attachments=(interaction.message.attachments if interaction.message else []),
+                )
+            else:
+                await interaction.response.edit_message(
+                    view=v2_view(tags_view.embed(), tags_view, None),
+                    content=None, embeds=[],
+                    attachments=(interaction.message.attachments if interaction.message else []),
+                )
             return
         self._refresh_role_picker()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Somente quem iniciou a configuração pode alterar os cargos.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode alterar os cargos."))
             return False
         return True
 
@@ -2460,7 +3192,7 @@ class HierarchyRoleConfigView(View):
         for idx, rid in enumerate(self.role_ids):
             role = self.guild.get_role(rid) if rid else None
             lines.append(f"**Cargo {idx + 1}:** {role.mention if role else '— não preenchido —'}")
-        e = discord.Embed(
+        e = PanelMessage(
             title="Etapa 2 — Seleção de cargos",
             description=(
                 "Use o menu para selecionar os cargos na ordem **do mais alto para o mais baixo**. "
@@ -2476,13 +3208,13 @@ class HierarchyRoleConfigView(View):
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.role_page = max(0, self.role_page - 1)
         self._refresh_role_picker()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.role_page = min(self.role_pages - 1, self.role_page + 1)
         self._refresh_role_picker()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2497,62 +3229,147 @@ class HierarchyRoleConfigView(View):
         self.role_ids = [None] * self.count
         self.role_page = 0
         self._refresh_role_picker()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class HierarchyTagsModal(Modal):
-    def __init__(self, parent, start, end):
-        super().__init__(title=f"Etapa 3 — Tags dos cargos {start + 1} a {end}", timeout=300)
-        self.parent_view, self.start = parent, start
+class HierarchyTagsModal(ComponentsV2Modal):
+    """Modal para preencher apenas as tags que ainda faltam no bloco atual."""
+    def __init__(self, parent, indices: list[int]):
+        start = min(indices) + 1 if indices else 1
+        end = max(indices) + 1 if indices else start
+        super().__init__(title=f"Etapa 3 — Tags dos cargos {start} a {end}", timeout=300)
+        self.parent_view = parent
+        self.indices = list(indices)
         self.inputs = []
-        for idx in range(start, end):
+        for idx in self.indices:
             role = self.parent_view.guild.get_role(self.parent_view.role_ids[idx])
             field = TextInput(
-                label=f"Tag para {role.name[:35] if role else f'Cargo {idx+1}'}",
+                label=f"Tag · {role.name[:35] if role else f'Cargo {idx + 1}'}",
                 placeholder="Ex.: M, REC, LT",
-                required=True, max_length=12
+                required=True,
+                max_length=12,
             )
-            old = self.parent_view.tags[idx]
-            if old:
-                field.default = old
             self.inputs.append(field)
             self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction):
-        for offset, field in enumerate(self.inputs):
+        if self.parent_view.owner_id and interaction.user.id != self.parent_view.owner_id:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Somente quem iniciou a configuração pode definir as tags."),
+            )
+            return
+
+        new_tags = []
+        for field in self.inputs:
             tag = field.value.strip().replace("[", "").replace("]", "")
             if not tag or any(ch in tag for ch in "\n\r"):
-                await interaction.response.send_message("Cada cargo precisa ter uma tag válida (até 12 caracteres).", ephemeral=True)
+                await interaction.response.send_message(
+                    None, ephemeral=True,
+                    view=v2_view(None, None, "Cada cargo precisa ter uma tag válida (até 12 caracteres)."),
+                )
                 return
-            idx = self.start + offset
+            new_tags.append(tag)
+
+        # Valida o bloco inteiro antes de persistir para evitar progresso parcial.
+        for idx, tag in zip(self.indices, new_tags):
             self.parent_view.tags[idx] = tag
             rid = self.parent_view.role_ids[idx]
             save_config_value(f"hierarchy_draft_tag_{rid}", tag)
-        # Salva as tags deste bloco sem avançar sozinho; o usuário navega pelas setas.
-        self.parent_view._sync_buttons()
-        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+
+        if all(self.parent_view.tags):
+            self.parent_view.persist_tags()
+            final_view = HierarchyFinalChannelView(self.parent_view.guild)
+            await interaction.response.send_message(
+                view=v2_view(final_view.embed(), final_view, None),
+                ephemeral=True,
+            )
+            return
+
+        next_page = self.parent_view.find_next_incomplete_page(self.parent_view.page + 1)
+        if next_page is None:
+            next_page = self.parent_view.find_next_incomplete_page(0)
+        next_view = HierarchyTagConfigView(
+            self.parent_view.guild,
+            self.parent_view.role_ids,
+            self.parent_view.owner_id,
+        )
+        next_view.page = next_page if next_page is not None else self.parent_view.page
+        next_view._sync_buttons()
+        await interaction.response.send_message(
+            view=v2_view(next_view.embed(), next_view, None),
+            ephemeral=True,
+        )
 
 
-class HierarchyTagConfigView(View):
+class HierarchyTagConfigView(ComponentsV2View):
+    """Tags sequenciais: pula o que já está configurado e avança após cada bloco."""
     def __init__(self, guild, role_ids, owner_id=0):
         super().__init__(timeout=900)
         self.guild, self.role_ids = guild, list(role_ids)
         self.owner_id = owner_id
+        self.tags = []
         with db() as con:
-            self.tags = [
-                (con.execute("SELECT value FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",)).fetchone() or {"value": ""})["value"]
-                for rid in self.role_ids
-            ]
-        self.page = 0
+            for rid in self.role_ids:
+                draft = con.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (f"hierarchy_draft_tag_{rid}",),
+                ).fetchone()
+                saved = con.execute(
+                    "SELECT value FROM settings WHERE key=?",
+                    (f"rank_role_{rid}",),
+                ).fetchone()
+                tag = str(draft["value"] if draft else "").strip()
+                if not tag and saved:
+                    tag = str(saved["value"]).split("|", 1)[0].strip()
+                self.tags.append(tag)
+        self.page = self.find_next_incomplete_page(0) or 0
         self._sync_buttons()
 
     @property
     def pages(self):
         return max(1, (len(self.role_ids) + 4) // 5)
 
+    def find_next_incomplete_page(self, start_page: int = 0):
+        for page in range(max(0, start_page), self.pages):
+            start = page * 5
+            end = min(start + 5, len(self.tags))
+            if any(not tag for tag in self.tags[start:end]):
+                return page
+        return None
+
+    def persist_tags(self):
+        total = len(self.role_ids)
+        with db() as con:
+            # Remove cargos/tags que pertenciam a uma configuração anterior
+            # e não fazem mais parte da hierarquia atual.
+            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
+            con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
+            for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
+                if not tag:
+                    continue
+                # Primeiro cargo é o mais alto; prioridade maior publica primeiro.
+                priority = total - idx
+                con.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"rank_role_{rid}", f"{tag}|{priority}"),
+                )
+                con.execute(
+                    "DELETE FROM settings WHERE key=?",
+                    (f"hierarchy_draft_tag_{rid}",),
+                )
+            con.execute(
+                "INSERT INTO settings(key,value) VALUES('hierarchy_setup_in_progress','0') "
+                "ON CONFLICT(key) DO UPDATE SET value='0'"
+            )
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.owner_id and interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Somente quem iniciou a configuração pode alterar as tags.", ephemeral=True)
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Somente quem iniciou a configuração pode alterar as tags."),
+            )
             return False
         return True
 
@@ -2561,34 +3378,75 @@ class HierarchyTagConfigView(View):
         lines = []
         for idx in range(start, end):
             role = self.guild.get_role(self.role_ids[idx])
-            tag = self.tags[idx] or "— não definida —"
-            lines.append(f"**Cargo {idx + 1}** · {role.mention if role else 'Cargo removido'} → **[{tag}]**")
+            tag = self.tags[idx] or "— pendente —"
+            state = "✅" if self.tags[idx] else "⏳"
+            lines.append(f"{state} **Cargo {idx + 1}** · {role.mention if role else 'Cargo removido'} → **[{tag}]**")
         done = sum(bool(x) for x in self.tags)
-        e = discord.Embed(
+        e = PanelMessage(
             title="Etapa 3 — Tags / abreviações",
-            description=("Defina a tag que ficará antes do nome do membro. Exemplo: **[ M ] GUSTAVO BOBO - 1908**.\n"
-                         "Cargo 1 é o mais alto. Use as setas para percorrer todos os blocos de cargos.\n\n" + "\n".join(lines)),
-            color=discord.Color.blurple()
+            description=(
+                "As tags são configuradas em sequência. Cargos que já possuem tag são ignorados automaticamente. "
+                "Após salvar um bloco, o painel avança para o próximo bloco pendente.\n\n"
+                + "\n".join(lines)
+            ),
+            color=discord.Color.blurple(),
         )
-        e.set_footer(text=f"Bloco {self.page + 1}/{self.pages} • {done}/{len(self.tags)} tags definidas")
+        e.set_footer(text=f"Progresso: {done}/{len(self.tags)} tags • Bloco {self.page + 1}/{self.pages}")
         return e
 
-    @discord.ui.button(label="Definir tags deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    def _sync_buttons(self):
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.pages - 1
+        start, end = self.page * 5, min(self.page * 5 + 5, len(self.tags))
+        self.define_tag.disabled = all(self.tags[start:end])
+        self.next_stage.disabled = not all(self.tags)
+
+    @discord.ui.button(label="Definir tags pendentes deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
     async def define_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
         start = self.page * 5
-        await interaction.response.send_modal(HierarchyTagsModal(self, start, min(start + 5, len(self.tags))))
+        end = min(start + 5, len(self.tags))
+        indices = [idx for idx in range(start, end) if not self.tags[idx]]
+        if not indices:
+            next_page = self.find_next_incomplete_page(self.page + 1)
+            if next_page is not None:
+                self.page = next_page
+                self._sync_buttons()
+                await interaction.response.edit_message(
+                    view=v2_view(self.embed(), self, None),
+                    content=None, embeds=[],
+                    attachments=(interaction.message.attachments if interaction.message else []),
+                )
+            else:
+                self.persist_tags()
+                final_view = HierarchyFinalChannelView(self.guild)
+                await interaction.response.edit_message(
+                    view=v2_view(final_view.embed(), final_view, None),
+                    content=None, embeds=[],
+                    attachments=(interaction.message.attachments if interaction.message else []),
+                )
+            return
+        await interaction.response.send_modal(HierarchyTagsModal(self, indices))
 
     @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, row=1)
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.page = max(0, self.page - 1)
         self._sync_buttons()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(
+            view=v2_view(self.embed(), self, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
     @discord.ui.button(label="Próxima página ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = min(self.pages - 1, self.page + 1)
+        next_page = self.find_next_incomplete_page(self.page + 1)
+        self.page = next_page if next_page is not None else min(self.pages - 1, self.page + 1)
         self._sync_buttons()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(
+            view=v2_view(self.embed(), self, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
     @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2596,48 +3454,45 @@ class HierarchyTagConfigView(View):
         view.role_ids = list(self.role_ids)
         view.owner_id = self.owner_id or interaction.user.id
         view._refresh_role_picker()
-        await interaction.response.edit_message(embed=view.embed(), view=view)
+        await interaction.response.edit_message(
+            view=v2_view(view.embed(), view, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+    @discord.ui.button(label="Continuar para canal", style=discord.ButtonStyle.success, emoji="➡️", row=3)
+    async def next_stage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not all(self.tags):
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Defina todas as tags antes de avançar."),
+            )
+            return
+        self.persist_tags()
+        final_view = HierarchyFinalChannelView(self.guild)
+        await interaction.response.edit_message(
+            view=v2_view(final_view.embed(), final_view, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
     @discord.ui.button(label="Recomeçar tags", style=discord.ButtonStyle.danger, emoji="🔄", row=2)
     async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.tags = [""] * len(self.tags)
         with db() as con:
             for rid in self.role_ids:
                 con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
+                con.execute("DELETE FROM settings WHERE key=?", (f"rank_role_{rid}",))
+        self.tags = [""] * len(self.role_ids)
         self.page = 0
         self._sync_buttons()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    async def next_stage(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if any(not x for x in self.tags):
-            await interaction.response.send_message("Defina todas as tags dos cargos antes de avançar.", ephemeral=True)
-            return
-        with db() as con:
-            con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
-            total = len(self.role_ids)
-            for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
-                priority = total - idx  # Cargo 1 = maior prioridade.
-                con.execute("INSERT INTO settings(key,value) VALUES(?,?)", (f"rank_role_{rid}", f"{tag}|{priority}"))
-                con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
-        view = HierarchyFinalChannelView(self.guild)
-        await interaction.response.edit_message(content=None, embed=view.embed(), view=view)
-
-    def _sync_buttons(self):
-        self.previous_page.disabled = self.page <= 0
-        self.next_page.disabled = self.page >= self.pages - 1
-        # O botão de avanço só existe quando todas as tags foram preenchidas.
-        has_button = any(isinstance(item, discord.ui.Button) and item.custom_id == "fac:hierarchy:next-tags" for item in self.children)
-        if all(self.tags):
-            if not has_button:
-                self.add_item(discord.ui.Button(label="Próximo — canal de publicação", emoji="➡️", style=discord.ButtonStyle.success, row=3, custom_id="fac:hierarchy:next-tags"))
-                self.children[-1].callback = self.next_stage
-        elif has_button:
-            for item in list(self.children):
-                if isinstance(item, discord.ui.Button) and item.custom_id == "fac:hierarchy:next-tags":
-                    self.remove_item(item)
+        await interaction.response.edit_message(
+            view=v2_view(self.embed(), self, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
 
-class HierarchyManualChannelModal(Modal, title="Canal da hierarquia"):
+class HierarchyManualChannelModal(ComponentsV2Modal, title="Canal da hierarquia"):
     channel_id = TextInput(label="ID do canal de texto", placeholder="Cole o ID do canal", max_length=25)
 
     def __init__(self, parent):
@@ -2648,11 +3503,11 @@ class HierarchyManualChannelModal(Modal, title="Canal da hierarquia"):
         raw = self.channel_id.value.strip()
         channel = self.parent_view.guild.get_channel(int(raw)) if raw.isdigit() else None
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Não encontrei um canal de texto com esse ID neste servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não encontrei um canal de texto com esse ID neste servidor."))
             return
         self.parent_view.channel_id = channel.id
         save_config_value("hierarchy_panel_channel_id", str(channel.id))
-        await interaction.response.send_message(embed=self.parent_view.embed(), view=self.parent_view, ephemeral=True)
+        await interaction.response.send_message(view=v2_view(self.parent_view.embed(), self.parent_view, None), ephemeral=True)
 
 
 class HierarchyFinalChannelSelect(discord.ui.Select):
@@ -2669,15 +3524,15 @@ class HierarchyFinalChannelSelect(discord.ui.Select):
         raw = self.values[0]
         channel = self.parent_view.guild.get_channel(int(raw)) if raw.isdigit() else None
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Selecione um canal de texto válido.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Selecione um canal de texto válido."))
             return
         self.parent_view.channel_id = channel.id
         save_config_value("hierarchy_panel_channel_id", str(channel.id))
         self.parent_view.refresh()
-        await interaction.response.edit_message(embed=self.parent_view.embed(), view=self.parent_view)
+        await interaction.response.edit_message(view=v2_view(self.parent_view.embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class HierarchyFinalChannelView(View):
+class HierarchyFinalChannelView(ComponentsV2View):
     def __init__(self, guild):
         super().__init__(timeout=900)
         self.guild = guild
@@ -2705,7 +3560,7 @@ class HierarchyFinalChannelView(View):
 
     def embed(self):
         channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
-        e = discord.Embed(title="Etapa 4 — Canal de publicação", description="Escolha o canal no menu. Use as setas para ver os demais canais quando houver mais de 25. Ao atualizar, o bot substitui somente as mensagens antigas da hierarquia enviadas por ele; outras mensagens do canal são preservadas.", color=discord.Color.blurple())
+        e = PanelMessage(title="Etapa 4 — Canal de publicação", description="Escolha o canal no menu. Use as setas para ver os demais canais quando houver mais de 25. Ao atualizar, o bot substitui somente as mensagens antigas da hierarquia enviadas por ele; outras mensagens do canal são preservadas.", color=discord.Color.blurple())
         e.add_field(name="Canal selecionado", value=channel.mention if channel else "Nenhum canal selecionado", inline=False)
         e.set_footer(text=f"Página {self.channel_page + 1}/{self.channel_pages} • O bot precisa de Ver canal, Enviar mensagens, Incorporar links e Gerenciar mensagens.")
         return e
@@ -2714,13 +3569,13 @@ class HierarchyFinalChannelView(View):
     async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.channel_page = max(0, self.channel_page - 1)
         self.refresh()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Próxima página ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.channel_page = min(self.channel_pages - 1, self.channel_page + 1)
         self.refresh()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Voltar às tags", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2728,40 +3583,23 @@ class HierarchyFinalChannelView(View):
         view = HierarchyTagConfigView(self.guild, [rid for _priority, rid, _tag in rows], interaction.user.id)
         view.tags = [tag for _priority, _rid, tag in rows]
         view._sync_buttons()
-        await interaction.response.edit_message(embed=view.embed(), view=view)
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     @discord.ui.button(label="Atualizar hierarquia neste canal", style=discord.ButtonStyle.success, emoji="🚀", row=2)
     async def publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        issue = hierarchy_configuration_issue(self.guild)
+        if issue:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, issue))
+            return
         channel = self.guild.get_channel(self.channel_id) if self.channel_id else None
         if not isinstance(channel, discord.TextChannel):
-            await interaction.response.send_message("Selecione um canal válido antes de publicar.", ephemeral=True)
-            return
-        if not hierarchy_rows():
-            await interaction.response.send_message("A configuração dos cargos não foi encontrada. Refaça as etapas anteriores.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Selecione um canal válido antes de publicar."))
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            async for message in channel.history(limit=None):
-                is_hierarchy_post = (
-                    bot.user is not None
-                    and message.author.id == bot.user.id
-                    and any((embed.title or "").startswith("📋 | ") for embed in message.embeds)
-                )
-                if not is_hierarchy_post:
-                    continue
-                try:
-                    await message.delete()
-                except discord.Forbidden:
-                    raise
-                except discord.HTTPException:
-                    continue
-        except discord.Forbidden:
-            await interaction.followup.send("Não tenho permissão para substituir as mensagens antigas da hierarquia. Conceda Gerenciar mensagens ao bot.", ephemeral=True)
-            return
         await publish_configured_panel(interaction, "hierarchy", channel_override=channel.id)
 
 
-class ConfigPanelView(View):
+class ConfigPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=900)
 
@@ -2770,7 +3608,7 @@ class ConfigPanelView(View):
             interaction.user.guild_permissions.administrator or has_leadership(interaction)
             or any(role.id == DEVELOPER_ROLE_ID for role in interaction.user.roles)
         )):
-            await interaction.response.send_message("Somente desenvolvedor, liderança ou administradores podem alterar a configuração.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente desenvolvedor, liderança ou administradores podem alterar a configuração."))
             return False
         return True
 
@@ -2781,9 +3619,9 @@ class ConfigPanelView(View):
     @discord.ui.button(label="Hierarquia", style=discord.ButtonStyle.primary, emoji="🏛️", row=0)
     async def hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Use este painel dentro do servidor.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este painel dentro do servidor."))
             return
-        guide = discord.Embed(
+        guide = PanelMessage(
             title="🏛️ Guia de configuração da hierarquia",
             description=(
                 "Configure a hierarquia em quatro etapas: **1)** quantidade de cargos; "
@@ -2796,7 +3634,7 @@ class ConfigPanelView(View):
             ),
             color=discord.Color.blurple(),
         )
-        await interaction.response.send_message(embed=guide, view=HierarchyGuideV2(interaction.guild), ephemeral=True)
+        await interaction.response.send_message(view=v2_view(guide, HierarchyGuideV2(interaction.guild), None), ephemeral=True)
 
     @discord.ui.button(label="Farm", style=discord.ButtonStyle.primary, emoji="🌾", row=0)
     async def farm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2809,10 +3647,10 @@ class ConfigPanelView(View):
     @discord.ui.button(label="Publicar hierarquia", style=discord.ButtonStyle.success, emoji="🏛️", row=2)
     async def publish_hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not interaction.guild:
-            await interaction.response.send_message("Use este recurso dentro de um servidor Discord.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este recurso dentro de um servidor Discord."))
             return
         view = HierarchyFinalChannelView(interaction.guild)
-        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        await interaction.response.send_message(view=v2_view(view.embed(), view, None), ephemeral=True)
 
     @discord.ui.button(label="Publicar Farm", style=discord.ButtonStyle.success, emoji="🌾", row=2)
     async def publish_farm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2831,11 +3669,16 @@ async def resolve_text_channel(guild: discord.Guild, channel_id: int) -> Optiona
 
 
 async def publish_configured_panel(interaction: discord.Interaction, kind: str, *, channel_override: Optional[int] = None) -> None:
+    # Publicações podem percorrer histórico, membros e vários canais; reconheça
+    # a interação antes de iniciar qualquer operação de rede demorada.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
     async def reply(content: str, **kwargs) -> None:
         if interaction.response.is_done():
-            await interaction.followup.send(content, **kwargs)
+            await interaction.followup.send(None, **kwargs, view=v2_view(None, None, content))
         else:
-            await interaction.response.send_message(content, **kwargs)
+            await interaction.response.send_message(None, **kwargs, view=v2_view(None, None, content))
     if not interaction.guild:
         await reply("Use este recurso dentro de um servidor Discord.", ephemeral=True); return
     defaults = {
@@ -2878,24 +3721,57 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
     try:
         embed = panel_embed(kind)
         if kind == "wl":
-            await target.send(embed=embed, view=RegistrationPanelView())
+            await target.send(view=v2_view(embed, RegistrationPanelView(), None))
         elif kind == "farm":
-            await target.send(embed=embed, view=FarmPanelView())
+            await target.send(view=v2_view(embed, FarmPanelView(), None))
         elif kind == "hierarchy":
+            issue = hierarchy_configuration_issue(interaction.guild)
+            if issue:
+                await reply(issue, ephemeral=True)
+                return
             try:
                 await interaction.guild.chunk(cache=True)
-            except Exception as exc:
-                log.warning("Não consegui atualizar o cache de membros ao publicar a hierarquia: %s", exc)
+            except Exception:
+                log.exception("Não consegui carregar todos os membros antes de publicar a hierarquia")
+                await reply(
+                    "Não consegui carregar a lista completa de membros. Ative **Server Members Intent** no Discord Developer Portal, confira as permissões e tente publicar novamente.",
+                    ephemeral=True,
+                )
+                return
 
             configured = []
             for priority, role_id, abbreviation in hierarchy_rows():
                 role = interaction.guild.get_role(role_id)
                 if role and role != interaction.guild.default_role:
-                    configured.append((priority, role, abbreviation or "RANK"))
+                    configured.append((priority, role, (abbreviation or "").strip()))
+
             # Publicação sempre do maior cargo (maior prioridade) para o menor.
             configured.sort(key=lambda item: item[0], reverse=True)
             if not configured:
                 await reply("Nenhum cargo está configurado para exibição. Abra `/config` > Hierarquia e selecione os cargos.", ephemeral=True)
+                return
+
+            # Guarda as mensagens antigas até que a nova publicação esteja completa.
+            # Se o envio falhar no meio, removemos somente as novas e mantemos as antigas.
+            old_hierarchy_messages = []
+            try:
+                async for old_message in target.history(limit=None):
+                    is_hierarchy_post = (
+                        bot.user is not None
+                        and old_message.author.id == bot.user.id
+                        and any(
+                            line.lstrip("# ").startswith("📋 | ")
+                            for line in message_component_text(old_message).splitlines()
+                        )
+                    )
+                    if is_hierarchy_post:
+                        old_hierarchy_messages.append(old_message)
+            except discord.HTTPException:
+                log.exception("Não consegui ler o histórico do canal antes de substituir a hierarquia")
+                await reply(
+                    "Não consegui ler o histórico do canal para substituir a hierarquia com segurança. Confira a permissão **Ler histórico de mensagens**.",
+                    ephemeral=True,
+                )
                 return
 
             ranks = [(priority, role.id, abbreviation, role) for priority, role, abbreviation in configured]
@@ -2908,48 +3784,79 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                 owned_rank_ids = [role.id for role in member.roles if role.id in configured_role_ids]
                 if not owned_rank_ids:
                     continue
-                # Higher priority number means higher rank. The member is listed in only one rank.
                 highest_role_id = max(owned_rank_ids, key=lambda rid: rank_priorities[rid])
                 members_by_highest_rank[highest_role_id].append(member)
 
-            panel_title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
-            panel_description = panel_setting("hierarchy_panel_description", "Cargos e membros da organização.")
             total_ranks = len(ranks)
-            sent_messages = 0
-            # Publish in configured order: highest rank first, lowest rank last.
-            for priority, role_id, abbreviation, role in ranks:
-                members = sorted(
-                    members_by_highest_rank.get(role_id, []),
-                    key=lambda m: m.display_name.casefold(),
-                )
-                member_lines = [m.mention for m in members] or ["Ninguém com esse cargo."]
-                chunks, buf, size = [], [], 0
-                for line in member_lines:
-                    if buf and size + len(line) + 1 > 3500:
-                        chunks.append(buf)
-                        buf, size = [], 0
-                    buf.append(line)
-                    size += len(line) + 1
-                if buf:
-                    chunks.append(buf)
-                for chunk_index, chunk in enumerate(chunks, start=1):
-                    suffix = f" · continuação {chunk_index}/{len(chunks)}" if len(chunks) > 1 else ""
-                    rank_title = f"📋 | {role.name.upper()} - [{len(members)}] membros{suffix}"
-                    body = f"# {role.mention}\n" + "\n".join(chunk)
-                    body += f"\n\n**Atualizado Automaticamente | Última alteração: {datetime.now().strftime('%d/%m/%Y, %H:%M')}**"
-                    role_embed = discord.Embed(
-                        title=rank_title[:256], description=body[:4096],
-                        color=discord.Color.from_rgb(76, 86, 180), timestamp=datetime.now(timezone.utc),
+            sent_messages = []
+            try:
+                # Cabeçalho do painel com a aparência configurada, marcado para
+                # ser substituído junto com as mensagens de cargos na próxima publicação.
+                header_message = embed.copy()
+                header_message.title = f"📋 | {header_message.title or f'HIERARQUIA — {FACTION_NAME}'}"[:256]
+                if not header_message.description:
+                    header_message.description = "Cargos e membros da organização."
+                sent_messages.append(await target.send(view=v2_view(header_message, None, None)))
+
+                # Envia todos os cargos, sempre do maior para o menor.
+                for priority, role_id, abbreviation, role in ranks:
+                    members = sorted(
+                        members_by_highest_rank.get(role_id, []),
+                        key=lambda member: member.display_name.casefold(),
                     )
-                    await target.send(embed=role_embed)
-                    sent_messages += 1
+                    member_lines = [member.mention for member in members] or ["Ninguém com esse cargo."]
+                    chunks, buffer, size = [], [], 0
+                    for line in member_lines:
+                        if buffer and size + len(line) + 1 > 3500:
+                            chunks.append(buffer)
+                            buffer, size = [], 0
+                        buffer.append(line)
+                        size += len(line) + 1
+                    if buffer:
+                        chunks.append(buffer)
+                    for chunk_index, chunk in enumerate(chunks, start=1):
+                        suffix = f" · continuação {chunk_index}/{len(chunks)}" if len(chunks) > 1 else ""
+                        rank_title = f"📋 | {role.name.upper()} - [{len(members)}] membros{suffix}"
+                        body = f"# {role.mention}\n" + "\n".join(chunk)
+                        body += f"\n\n**Atualizado Automaticamente | Última alteração: {datetime.now().strftime('%d/%m/%Y, %H:%M')}**"
+                        role_message = PanelMessage(
+                            title=rank_title[:256],
+                            description=body[:4096],
+                            color=discord.Color.from_rgb(76, 86, 180),
+                            timestamp=datetime.now(timezone.utc),
+                        )
+                        sent_messages.append(await target.send(view=v2_view(role_message, None, None)))
+            except Exception:
+                log.exception("Falha ao enviar a nova hierarquia; preservando a publicação anterior")
+                for new_message in sent_messages:
+                    try:
+                        await new_message.delete()
+                    except discord.HTTPException:
+                        log.warning("Não consegui remover uma mensagem parcial da nova hierarquia", exc_info=True)
+                raise
+
+            # Só remove a versão anterior depois de confirmar que a nova foi enviada.
+            delete_failures = 0
+            for old_message in old_hierarchy_messages:
+                try:
+                    await old_message.delete()
+                except discord.HTTPException:
+                    delete_failures += 1
+                    log.warning("Não consegui remover uma mensagem antiga da hierarquia (%s)", old_message.id, exc_info=True)
+
             # Aplica as tags recém-configuradas também aos membros que já estavam no servidor.
             for current_member in interaction.guild.members:
                 if not current_member.bot:
                     await sync_configured_member_nickname(current_member, "Nova hierarquia publicada")
+
+            warning = (
+                f" Atenção: não consegui remover {delete_failures} mensagem(ns) antiga(s); confira o canal."
+                if delete_failures else ""
+            )
             await reply(
                 f"✅ Hierarquia publicada em {target.mention}: **{total_ranks} cargos**, cada um em mensagem separada. "
-                f"O cargo nº 1 (mais alto) aparece primeiro; o último cargo (mais baixo) aparece por último. ({sent_messages} mensagem(ns)).",
+                f"O cargo nº 1 (mais alto) aparece primeiro; o último cargo (mais baixo) aparece por último. "
+                f"({len(sent_messages)} mensagem(ns), incluindo cabeçalho).{warning}",
                 ephemeral=True,
             )
         elif kind == "members":
@@ -2960,11 +3867,11 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
             else:
                 lines = [f"• <@{r['discord_id']}> — **{r['character_name']}** · ID `{r['game_id']}` · {r['rank_name']}" + (f" · Slot {r['slot_number']}" if r['slot_number'] is not None else "") for r in rows]
                 embed.description = (embed.description + "\n\n" + "\n".join(lines))[:4096]
-            await target.send(embed=embed)
+            await target.send(view=v2_view(embed, None, None))
         elif kind == "leader":
-            await target.send(embed=embed, view=LeadershipPanelView())
+            await target.send(view=v2_view(embed, LeadershipPanelView(), None))
         else:
-            await target.send(embed=embed)
+            await target.send(view=v2_view(embed, None, None))
         await reply(f"✅ Painel **{kind}** publicado em {target.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.exception("Não foi possível publicar painel %s", kind)
@@ -3028,8 +3935,7 @@ def remove_legacy_gtt_branding() -> None:
         log.exception("Falha ao limpar nomes antigos da organização nas configurações")
 
 
-@bot.event
-async def setup_hook() -> None:  # type: ignore[override]
+async def setup_hook() -> None:
     init_db()
     remove_legacy_gtt_branding()
     await start_render_health_server()
@@ -3082,6 +3988,10 @@ async def setup_hook() -> None:  # type: ignore[override]
             "Falha HTTP ao sincronizar comandos slash globalmente (%s). O bot continuará ligado; "
             "veja os logs e tente novamente após corrigir a configuração.", exc
         )
+
+# setup_hook é um método do ciclo de vida de discord.py, não um evento.
+# Registrá-lo com @bot.event não o executa durante a inicialização.
+bot.setup_hook = setup_hook  # type: ignore[method-assign]
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
@@ -3154,7 +4064,7 @@ async def on_ready() -> None:
 
 
 
-class FarmItemConfigModal(discord.ui.Modal, title="Adicionar item ao Farm"):
+class FarmItemConfigModal(ComponentsV2Modal, title="Adicionar item ao Farm"):
     nome = discord.ui.TextInput(label="Nome do item", placeholder="Ex.: Alumínio", max_length=60)
     valor = discord.ui.TextInput(label="Valor por unidade (R$)", placeholder="Ex.: 500,00", max_length=20)
     pontos = discord.ui.TextInput(label="Pontos por unidade", placeholder="Ex.: 1", default="1", max_length=7)
@@ -3167,10 +4077,10 @@ class FarmItemConfigModal(discord.ui.Modal, title="Adicionar item ao Farm"):
             cents = int(round(float(raw_value) * 100))
             points = int(self.pontos.value.strip())
         except (ValueError, OverflowError):
-            await interaction.response.send_message("Informe um valor em reais e uma quantidade de pontos válidos.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe um valor em reais e uma quantidade de pontos válidos."))
             return
         if not name or cents <= 0 or points < 1 or cents > 100000000:
-            await interaction.response.send_message("Confira o nome, o valor (maior que zero) e os pontos (mínimo 1).", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Confira o nome, o valor (maior que zero) e os pontos (mínimo 1)."))
             return
         with db() as con:
             con.execute(
@@ -3188,7 +4098,7 @@ class FarmItemConfigModal(discord.ui.Modal, title="Adicionar item ao Farm"):
         )
 
 
-class FarmItemSetupV2(discord.ui.LayoutView):
+class FarmItemSetupV2(ComponentsV2LayoutView):
     def __init__(self, success_message: str = ""):
         super().__init__(timeout=900)
         with db() as con:
@@ -3227,7 +4137,7 @@ class FarmItemSetupV2(discord.ui.LayoutView):
         with db() as con:
             count = con.execute("SELECT COUNT(*) AS n FROM farm_items WHERE active=1").fetchone()["n"]
         if not count:
-            await interaction.response.send_message("Cadastre pelo menos um item antes de continuar.", ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Cadastre pelo menos um item antes de continuar."))
             return
         await interaction.response.send_modal(ConfigFarmPanelModal())
 
@@ -3255,7 +4165,7 @@ class FarmConfigFieldSelect(discord.ui.Select):
             view=ConfigFarmChannelsV2(
                 interaction.guild, selected_key=self.values[0], page=0,
                 success_message="Agora escolha o canal ou cargo. Use as setas para percorrer todas as opções.",
-            )
+            ), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else [])
         )
 
 
@@ -3270,8 +4180,8 @@ class FarmConfigTargetSelect(discord.ui.Select):
         key = self.parent_view.selected_key
         if selected == "__none__":
             await interaction.response.send_message(
-                "Não há opções disponíveis. Confira os canais/cargos e as permissões do bot.",
-                ephemeral=True,
+                None,
+                ephemeral=True, view=v2_view(None, None, "Não há opções disponíveis. Confira os canais/cargos e as permissões do bot."),
             )
             return
         save_config_value(key, selected)
@@ -3285,7 +4195,7 @@ class FarmConfigTargetSelect(discord.ui.Select):
             view=ConfigFarmChannelsV2(
                 interaction.guild, selected_key=key, page=self.parent_view.page,
                 success_message=f"✅ **{label}** salvo: {shown}",
-            )
+            ), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else [])
         )
 
 
@@ -3302,7 +4212,7 @@ class FarmConfigPageButton(discord.ui.Button):
                 interaction.guild,
                 selected_key=self.parent_view.selected_key,
                 page=max(0, self.parent_view.page + self.delta),
-            )
+            ), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else [])
         )
 
 
@@ -3322,7 +4232,7 @@ class FarmSendPanelButton(discord.ui.Button):
         guild = interaction.guild
         if guild is None:
             await interaction.response.send_message(
-                "Use esta configuração dentro do servidor.", ephemeral=True
+                None, ephemeral=True, view=v2_view(None, None, "Use esta configuração dentro do servidor.")
             )
             return
 
@@ -3346,17 +4256,17 @@ class FarmSendPanelButton(discord.ui.Button):
 
         if missing:
             await interaction.response.send_message(
-                "Ainda faltam configurações obrigatórias válidas:\n"
+                None,
+                ephemeral=True, view=v2_view(None, None, "Ainda faltam configurações obrigatórias válidas:\n"
                 + "\n".join(f"• {label}" for label in missing)
-                + "\nSelecione cada campo acima para definir ou corrigir.",
-                ephemeral=True,
+                + "\nSelecione cada campo acima para definir ou corrigir."),
             )
             return
 
         await publish_configured_panel(interaction, "farm")
 
 
-class ConfigFarmChannelsV2(discord.ui.LayoutView):
+class ConfigFarmChannelsV2(ComponentsV2LayoutView):
     """Configuração paginada com resumo dos campos salvos e possibilidade de redefinir qualquer campo."""
     PAGE_SIZE = 25
 
@@ -3437,7 +4347,9 @@ class ConfigFarmChannelsV2(discord.ui.LayoutView):
                 "🔒 **ENVIAR PAINEL** será liberado quando o canal público, "
                 "o canal privado e o cargo autorizador estiverem definidos."
             ))
-        self.add_item(discord.ui.Container(*parts))
+        # Containers aceitam no máximo 10 filhos. O assistente pode ter até
+        # 13 blocos quando exibe resumo, paginação e botão de publicação.
+        add_v2_containers(self, parts, limit=10)
 
     def _resolve_saved_object(self, key: str):
         if not self.guild:
@@ -3491,7 +4403,7 @@ class ConfigFarmChannelsV2(discord.ui.LayoutView):
         )
 
 
-class HierarchyGuideV2(discord.ui.LayoutView):
+class HierarchyGuideV2(ComponentsV2LayoutView):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=900)
         self.guild = guild
@@ -3521,12 +4433,12 @@ class HierarchyGuideV2(discord.ui.LayoutView):
 
     async def reset(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            "⚠️ **Confirma a exclusão?** Serão apagados os cargos, tags, canal salvo e as mensagens publicadas da hierarquia.",
-            view=HierarchyResetConfirmView(self.guild), ephemeral=True
+            None,
+            view=v2_view(None, HierarchyResetConfirmView(self.guild), "⚠️ **Confirma a exclusão?** Serão apagados os cargos, tags, canal salvo e as mensagens publicadas da hierarquia."), ephemeral=True
         )
 
 
-class ConfigPanelV2(discord.ui.LayoutView):
+class ConfigPanelV2(ComponentsV2LayoutView):
     """Painel principal de configuração usando Discord Components V2."""
     def __init__(self):
         super().__init__(timeout=900)
@@ -3559,12 +4471,12 @@ class ConfigPanelV2(discord.ui.LayoutView):
                 return
             if action == "fac:configv2:wl":
                 if not interaction.guild:
-                    await interaction.response.send_message("Use a configuração dentro do servidor.", ephemeral=True)
+                    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use a configuração dentro do servidor."))
                     return
                 await interaction.response.send_message(view=WLConfigV2(interaction.guild), ephemeral=True)
             elif action == "fac:configv2:hierarchy":
                 if not interaction.guild:
-                    await interaction.response.send_message("Use no servidor.", ephemeral=True)
+                    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use no servidor."))
                     return
                 # Components V2 não aceita o campo legado "content".
                 # Todo o texto da tela fica dentro do LayoutView/Container.
@@ -3577,10 +4489,10 @@ class ConfigPanelV2(discord.ui.LayoutView):
                 await publish_configured_panel(interaction, "wl")
             elif action == "fac:configv2:publish-hierarchy":
                 if not interaction.guild:
-                    await interaction.response.send_message("Use no servidor.", ephemeral=True)
+                    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use no servidor."))
                     return
                 view = HierarchyFinalChannelView(interaction.guild)
-                await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+                await interaction.response.send_message(view=v2_view(view.embed(), view, None), ephemeral=True)
             elif action == "fac:configv2:publish-farm":
                 await publish_configured_panel(interaction, "farm")
         return callback
@@ -3634,9 +4546,9 @@ async def perfil(interaction: discord.Interaction, membro: Optional[discord.Memb
         total = con.execute("SELECT COALESCE(SUM(points),0) AS pts, COALESCE(SUM(quantity),0) AS qty FROM farm_entries WHERE discord_id=?", (str(target.id),)).fetchone()
         warnings = con.execute("SELECT COUNT(*) AS n FROM warnings WHERE discord_id=?", (str(target.id),)).fetchone()["n"]
     if not row:
-        await interaction.response.send_message("Esse usuário ainda não possui cadastro aprovado.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse usuário ainda não possui cadastro aprovado."))
         return
-    embed = discord.Embed(title=f"👤 Perfil de {row['character_name']}", color=discord.Color.blurple())
+    embed = PanelMessage(title=f"👤 Perfil de {row['character_name']}", color=discord.Color.blurple())
     embed.set_thumbnail(url=target.display_avatar.url)
     embed.add_field(name="Discord", value=target.mention, inline=True)
     embed.add_field(name="Passaporte", value=row["game_id"], inline=True)
@@ -3644,53 +4556,57 @@ async def perfil(interaction: discord.Interaction, membro: Optional[discord.Memb
     embed.add_field(name="Farm total", value=f"{total['qty']} unidades · {total['pts']} pontos", inline=True)
     embed.add_field(name="Advertências registradas", value=str(warnings), inline=True)
     embed.add_field(name="Entrada", value=row["joined_at"][:10], inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(view=v2_view(embed, None, None), ephemeral=True)
 
 @bot.tree.command(name="membros", description="Lista os membros ativos cadastrados")
 async def membros(interaction: discord.Interaction) -> None:
     with db() as con:
         rows = con.execute("SELECT character_name,game_id,rank_name,discord_id FROM members WHERE status='ACTIVE' ORDER BY character_name COLLATE NOCASE LIMIT 40").fetchall()
     if not rows:
-        await interaction.response.send_message("Ainda não há membros cadastrados.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há membros cadastrados."))
         return
     lines = [f"• **{r['character_name']} | {r['game_id']}** — {r['rank_name']} — <@{r['discord_id']}>" for r in rows]
-    embed = discord.Embed(title=f"👥 Membros ativos ({len(rows)})", description="\n".join(lines), color=discord.Color.blurple())
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed = PanelMessage(title=f"👥 Membros ativos ({len(rows)})", description="\n".join(lines), color=discord.Color.blurple())
+    await interaction.response.send_message(view=v2_view(embed, None, None), ephemeral=True)
 
 @bot.tree.command(name="promover", description="Adiciona um cargo e registra a promoção")
 @app_commands.describe(membro="Membro a promover", cargo="Cargo que será adicionado", motivo="Motivo da promoção")
 async def promover(interaction: discord.Interaction, membro: discord.Member, cargo: discord.Role, motivo: str = "Reconhecimento") -> None:
     if not await deny_unless_leader(interaction): return
     if interaction.user.id != interaction.guild.owner_id and cargo >= interaction.user.top_role:
-        await interaction.response.send_message("Você não pode atribuir um cargo igual ou superior ao seu.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não pode atribuir um cargo igual ou superior ao seu.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         await membro.add_roles(cargo, reason=f"Promoção por {interaction.user}: {motivo}")
         with db() as con:
             con.execute("UPDATE members SET rank_name=? WHERE discord_id=?", (cargo.name, str(membro.id)))
         log_action(interaction.user.id, "PROMOCAO", membro.id, motivo, f"Cargo adicionado: {cargo.name}")
-        await interaction.response.send_message(f"✅ {membro.mention} recebeu o cargo **{cargo.name}**.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"✅ {membro.mention} recebeu o cargo **{cargo.name}**."))
         await send_channel_log(interaction.guild, "📈 Promoção registrada", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nCargo: {cargo.mention}\nMotivo: {motivo}", color=discord.Color.green())
         await send_channel_log(interaction.guild, "🎉 Nova promoção", f"{membro.mention} foi promovido para {cargo.mention}.", public=True, color=discord.Color.green())
     except discord.Forbidden:
-        await interaction.response.send_message("Não tenho permissão para atribuir esse cargo. Confira a hierarquia de cargos do bot.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Não tenho permissão para atribuir esse cargo. Confira a hierarquia de cargos do bot."))
 
 @bot.tree.command(name="rebaixar", description="Remove um cargo e opcionalmente atribui outro")
 @app_commands.describe(membro="Membro a rebaixar", cargo_atual="Cargo que será removido", novo_cargo="Novo cargo", motivo="Motivo do rebaixamento")
 async def rebaixar(interaction: discord.Interaction, membro: discord.Member, cargo_atual: discord.Role, novo_cargo: discord.Role, motivo: str = "Reajuste hierárquico") -> None:
     if not await deny_unless_leader(interaction): return
     if interaction.user.id != interaction.guild.owner_id and membro.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("Você não pode gerenciar alguém com cargo igual ou superior ao seu.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não pode gerenciar alguém com cargo igual ou superior ao seu.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         await membro.remove_roles(cargo_atual, reason=f"Rebaixamento por {interaction.user}: {motivo}")
         await membro.add_roles(novo_cargo, reason=f"Rebaixamento por {interaction.user}: {motivo}")
         with db() as con:
             con.execute("UPDATE members SET rank_name=? WHERE discord_id=?", (novo_cargo.name, str(membro.id)))
         log_action(interaction.user.id, "REBAIXAMENTO", membro.id, motivo, f"{cargo_atual.name} -> {novo_cargo.name}")
-        await interaction.response.send_message(f"✅ {membro.mention} agora possui o cargo **{novo_cargo.name}**.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"✅ {membro.mention} agora possui o cargo **{novo_cargo.name}**."))
         await send_channel_log(interaction.guild, "📉 Rebaixamento registrado", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nCargo removido: {cargo_atual.mention}\nNovo cargo: {novo_cargo.mention}\nMotivo: {motivo}", color=discord.Color.orange())
         await send_channel_log(interaction.guild, "🔻 Atualização de hierarquia", f"O cargo de {membro.mention} foi atualizado para {novo_cargo.mention}.", public=True, color=discord.Color.orange())
     except discord.Forbidden:
-        await interaction.response.send_message("Não tenho permissão para alterar esses cargos.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Não tenho permissão para alterar esses cargos."))
 
 @bot.tree.command(name="farm-item", description="Cria ou atualiza um item de farm (liderança)")
 @app_commands.describe(nome="Nome do item", pontos="Pontos por unidade", meta="Meta em unidades para o ciclo")
@@ -3700,7 +4616,7 @@ async def farm_item(interaction: discord.Interaction, nome: str, pontos: app_com
     with db() as con:
         con.execute("INSERT INTO farm_items(name,points,target,active) VALUES(?,?,?,1) ON CONFLICT(name) DO UPDATE SET points=excluded.points,target=excluded.target,active=1", (name, pontos, meta))
     log_action(interaction.user.id, "FARM_ITEM_CONFIG", None, "", f"{name}: {pontos} ponto(s), meta {meta}")
-    await interaction.response.send_message(f"Item **{name}** configurado: **{pontos}** ponto(s) por unidade; meta: **{meta}**.", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Item **{name}** configurado: **{pontos}** ponto(s) por unidade; meta: **{meta}**."))
 
 @bot.tree.command(name="farm-preco", description="Define o valor unitário em reais de um item de farm")
 @app_commands.describe(nome="Nome exato do item cadastrado", valor="Valor em reais por unidade, por exemplo 2.50")
@@ -3711,10 +4627,10 @@ async def farm_preco(interaction: discord.Interaction, nome: str, valor: app_com
     with db() as con:
         cur = con.execute("UPDATE farm_items SET unit_price_cents=? WHERE name=? COLLATE NOCASE AND active=1", (cents, nome.strip()))
     if not cur.rowcount:
-        await interaction.response.send_message("Não encontrei esse item ativo. Cadastre primeiro com `/farm-item`.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não encontrei esse item ativo. Cadastre primeiro com `/farm-item`."))
         return
     log_action(interaction.user.id, "FARM_PRECO_CONFIG", None, "", f"{nome.strip()}: R$ {cents/100:.2f} por unidade")
-    await interaction.response.send_message(f"Valor de **{nome.strip()}** atualizado para **R$ {cents/100:.2f} por unidade**.", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Valor de **{nome.strip()}** atualizado para **R$ {cents/100:.2f} por unidade**."))
 
 @bot.tree.command(name="farm-item-desativar", description="Desativa um item de farm")
 async def farm_item_desativar(interaction: discord.Interaction, nome: str) -> None:
@@ -3722,15 +4638,15 @@ async def farm_item_desativar(interaction: discord.Interaction, nome: str) -> No
     with db() as con:
         cur = con.execute("UPDATE farm_items SET active=0 WHERE name=? COLLATE NOCASE", (nome.strip(),))
     if cur.rowcount == 0:
-        await interaction.response.send_message("Não encontrei esse item de farm.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não encontrei esse item de farm.")); return
     log_action(interaction.user.id, "FARM_ITEM_DESATIVADO", None, "", nome)
-    await interaction.response.send_message(f"Item **{nome}** desativado.", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Item **{nome}** desativado."))
 
 @bot.tree.command(name="farm", description="Informa como registrar farm pelo painel com comprovante")
 async def farm(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(
-        "Para manter a auditoria, o registro agora deve ser feito pelo **painel de Farm**: clique em **REGISTRAR FARM**, selecione o item, informe a quantidade e envie a imagem de prova no canal. Registros sem comprovante não são contabilizados.",
-        ephemeral=True)
+        None,
+        ephemeral=True, view=v2_view(None, None, "Para manter a auditoria, o registro agora deve ser feito pelo **painel de Farm**: clique em **REGISTRAR FARM**, selecione o item, informe a quantidade e envie a imagem de prova no canal. Registros sem comprovante não são contabilizados."))
 
 @bot.tree.command(name="farm-comprovante", description="Consulta um comprovante de farm salvo no banco")
 @app_commands.describe(registro="Número do registro de comprovante")
@@ -3739,11 +4655,11 @@ async def farm_comprovante(interaction: discord.Interaction, registro: app_comma
     with db() as con:
         row = con.execute("SELECT * FROM farm_proofs WHERE id=?", (registro,)).fetchone()
     if not row:
-        await interaction.response.send_message("Não encontrei esse comprovante.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Não encontrei esse comprovante.")); return
     import io
     file = discord.File(io.BytesIO(row["image_data"]), filename=row["image_filename"] or f"comprovante-{registro}.png")
-    embed = discord.Embed(title=f"🌾 Comprovante de farm #{registro}", description=f"Membro: <@{row['discord_id']}>\nNome RP: **{row['character_name']}**\nID FiveM: **{row['game_id']}**\nFarm: **{row['item_name'] or 'Não informado'}**\nQuantidade: **{row['quantity'] or 0}**\nPontos: **{row['points'] or 0}**\nStatus: **{row['status']}**\nData: {row['created_at']}", color=discord.Color.green() if row['status'] == 'APPROVED' else discord.Color.gold())
-    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+    embed = PanelMessage(title=f"🌾 Comprovante de farm #{registro}", description=f"Membro: <@{row['discord_id']}>\nNome RP: **{row['character_name']}**\nID FiveM: **{row['game_id']}**\nFarm: **{row['item_name'] or 'Não informado'}**\nQuantidade: **{row['quantity'] or 0}**\nPontos: **{row['points'] or 0}**\nStatus: **{row['status']}**\nData: {row['created_at']}", color=discord.Color.green() if row['status'] == 'APPROVED' else discord.Color.gold())
+    await interaction.response.send_message(view=v2_view(embed, None, None), file=file, ephemeral=True)
 
 @bot.tree.command(name="farm-resumo", description="Mostra o resumo de farm do ciclo atual")
 @app_commands.describe(membro="Membro para consultar; vazio para você")
@@ -3753,20 +4669,20 @@ async def farm_resumo(interaction: discord.Interaction, membro: Optional[discord
         rows = con.execute("SELECT item_name,SUM(quantity) qty,SUM(points) pts FROM farm_entries WHERE discord_id=? GROUP BY item_name ORDER BY pts DESC", (str(target.id),)).fetchall()
         total = con.execute("SELECT COALESCE(SUM(quantity),0) qty,COALESCE(SUM(points),0) pts FROM farm_entries WHERE discord_id=?", (str(target.id),)).fetchone()
     if not rows:
-        await interaction.response.send_message("Ainda não há registros de farm para esse membro.", ephemeral=True); return
-    embed = discord.Embed(title=f"📊 Resumo de farm — {target.display_name}", color=discord.Color.green())
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há registros de farm para esse membro.")); return
+    embed = PanelMessage(title=f"📊 Resumo de farm — {target.display_name}", color=discord.Color.green())
     embed.description = "\n".join(f"• **{r['item_name']}**: {r['qty']} unidade(s) · {r['pts']} ponto(s)" for r in rows[:20])
     embed.add_field(name="Total", value=f"{total['qty']} unidades · {total['pts']} pontos", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(view=v2_view(embed, None, None), ephemeral=True)
 
 @bot.tree.command(name="farm-ranking", description="Mostra o ranking de farm")
 async def farm_ranking(interaction: discord.Interaction) -> None:
     with db() as con:
         rows = con.execute("SELECT discord_id,SUM(points) pts,SUM(quantity) qty FROM farm_entries GROUP BY discord_id ORDER BY pts DESC LIMIT 15").fetchall()
     if not rows:
-        await interaction.response.send_message("Ainda não há registros de farm.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há registros de farm.")); return
     lines = [f"**{i}.** <@{r['discord_id']}> — **{r['pts']} pts** ({r['qty']} unidades)" for i, r in enumerate(rows, 1)]
-    await interaction.response.send_message(embed=discord.Embed(title="🏆 Ranking de farm", description="\n".join(lines), color=discord.Color.gold()), ephemeral=True)
+    await interaction.response.send_message(view=v2_view(PanelMessage(title="🏆 Ranking de farm", description="\n".join(lines), color=discord.Color.gold()), None, None), ephemeral=True)
 
 @bot.tree.command(name="meta-farm", description="Define a meta global de farm em unidades")
 async def meta_farm(interaction: discord.Interaction, quantidade: app_commands.Range[int, 1, 1000000]) -> None:
@@ -3774,7 +4690,7 @@ async def meta_farm(interaction: discord.Interaction, quantidade: app_commands.R
     with db() as con:
         con.execute("INSERT INTO settings(key,value) VALUES('global_farm_goal',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(quantidade),))
     log_action(interaction.user.id, "META_FARM_CONFIG", None, "", str(quantidade))
-    await interaction.response.send_message(f"Meta global de farm definida para **{quantidade} unidades**.", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Meta global de farm definida para **{quantidade} unidades**."))
 
 @bot.tree.command(name="farm-meta-status", description="Compara o farm total com a meta global")
 async def farm_meta_status(interaction: discord.Interaction) -> None:
@@ -3782,11 +4698,11 @@ async def farm_meta_status(interaction: discord.Interaction) -> None:
     with db() as con:
         total = con.execute("SELECT COALESCE(SUM(quantity),0) qty,COALESCE(SUM(points),0) pts FROM farm_entries").fetchone()
     if goal <= 0:
-        await interaction.response.send_message("A liderança ainda não configurou uma meta global com `/meta-farm`.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "A liderança ainda não configurou uma meta global com `/meta-farm`.")); return
     percent = min(100, round(total["qty"] / goal * 100))
     filled = int(percent / 10)
     bar = "🟩" * filled + "⬜" * (10-filled)
-    await interaction.response.send_message(f"**Meta de farm da facção**\n{bar} **{percent}%**\nQuantidade: **{total['qty']} / {goal}** · Pontos: **{total['pts']}**", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"**Meta de farm da facção**\n{bar} **{percent}%**\nQuantidade: **{total['qty']} / {goal}** · Pontos: **{total['pts']}**"))
 
 @bot.tree.command(name="slot", description="Atribui um número de slot do baú a um membro")
 async def slot(interaction: discord.Interaction, membro: discord.Member, numero: app_commands.Range[int, 1, 9999]) -> None:
@@ -3795,14 +4711,14 @@ async def slot(interaction: discord.Interaction, membro: discord.Member, numero:
         with db() as con:
             row = con.execute("SELECT discord_id FROM members WHERE discord_id=?", (str(membro.id),)).fetchone()
             if not row:
-                await interaction.response.send_message("Esse membro ainda não tem cadastro aprovado.", ephemeral=True); return
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse membro ainda não tem cadastro aprovado.")); return
             con.execute("UPDATE members SET slot_number=? WHERE discord_id=?", (numero, str(membro.id)))
         log_action(interaction.user.id, "SLOT_ATRIBUIDO", membro.id, "", f"Slot {numero}")
-        await interaction.response.send_message(f"Slot **{numero}** atribuído a {membro.mention}.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Slot **{numero}** atribuído a {membro.mention}."))
         if interaction.guild:
             await send_channel_log(interaction.guild, "📦 Slot de baú atualizado", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nSlot: **{numero}**", color=discord.Color.blurple())
     except sqlite3.IntegrityError:
-        await interaction.response.send_message("Esse número de slot já está atribuído a outro membro.", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse número de slot já está atribuído a outro membro."))
 
 @bot.tree.command(name="slots", description="Lista os slots de baú atribuídos")
 async def slots(interaction: discord.Interaction) -> None:
@@ -3810,27 +4726,40 @@ async def slots(interaction: discord.Interaction) -> None:
     with db() as con:
         rows = con.execute("SELECT character_name,game_id,discord_id,slot_number FROM members WHERE status='ACTIVE' AND slot_number IS NOT NULL ORDER BY slot_number LIMIT 40").fetchall()
     if not rows:
-        await interaction.response.send_message("Nenhum slot foi atribuído ainda.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Nenhum slot foi atribuído ainda.")); return
     lines = [f"**Slot {r['slot_number']}** — {r['character_name']} | {r['game_id']} — <@{r['discord_id']}>" for r in rows]
-    await interaction.response.send_message(embed=discord.Embed(title="📦 Slots do baú", description="\n".join(lines), color=discord.Color.blurple()), ephemeral=True)
+    await interaction.response.send_message(view=v2_view(PanelMessage(title="📦 Slots do baú", description="\n".join(lines), color=discord.Color.blurple()), None, None), ephemeral=True)
 
 @bot.tree.command(name="nickname", description="Atualiza o nickname RP de um membro")
 async def nickname(interaction: discord.Interaction, membro: discord.Member, nome_rp: str, passaporte: str) -> None:
     if not await deny_unless_leader(interaction): return
+    nome_rp = nome_rp.strip()
+    if not nome_rp:
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe um nome RP válido.")); return
     if not passaporte.isdigit():
-        await interaction.response.send_message("O passaporte deve conter somente números.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O passaporte deve conter somente números.")); return
+    with db() as con:
+        duplicate = con.execute(
+            "SELECT discord_id FROM members WHERE game_id=? AND discord_id<>?",
+            (passaporte, str(membro.id)),
+        ).fetchone()
+    if duplicate:
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse passaporte já está vinculado a outro membro.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        new_nick = f"[ M ] {nome_rp.strip().upper()} - {passaporte}"[:32]
+        _rank_role, abbreviation = highest_configured_rank(membro)
+        new_nick = build_member_nickname(nome_rp, passaporte, abbreviation or "M")
         await membro.edit(nick=new_nick, reason=f"Nickname atualizado por {interaction.user}")
         with db() as con:
             con.execute("UPDATE members SET character_name=?,game_id=? WHERE discord_id=?", (nome_rp.strip(), passaporte, str(membro.id)))
         log_action(interaction.user.id, "NICKNAME_ATUALIZADO", membro.id, "", new_nick)
-        await interaction.response.send_message(f"Nickname atualizado para **{new_nick}**.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"Nickname atualizado para **{new_nick}**."))
         await send_channel_log(interaction.guild, "🏷️ Nickname atualizado", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nNovo nickname: **{new_nick}**", color=discord.Color.blurple())
     except sqlite3.IntegrityError:
-        await interaction.response.send_message("Esse passaporte já está vinculado a outro membro.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Esse passaporte já está vinculado a outro membro."))
     except discord.Forbidden:
-        await interaction.response.send_message("Não tenho permissão para editar esse nickname.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Não tenho permissão para editar esse nickname."))
 
 @bot.tree.command(name="acao", description="Registra uma ação administrativa e envia log")
 @app_commands.choices(tipo=[
@@ -3843,7 +4772,7 @@ async def nickname(interaction: discord.Interaction, membro: discord.Member, nom
 async def acao(interaction: discord.Interaction, membro: discord.Member, tipo: app_commands.Choice[str], motivo: str) -> None:
     if not await deny_unless_leader(interaction): return
     log_action(interaction.user.id, tipo.value.upper(), membro.id, motivo, "Ação administrativa")
-    await interaction.response.send_message(f"Ação **{tipo.value}** registrada para {membro.mention}.", ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Ação **{tipo.value}** registrada para {membro.mention}."))
     if interaction.guild:
         await send_channel_log(interaction.guild, f"📌 Ação administrativa: {tipo.value}", f"Aplicada por: {interaction.user.mention}\nMembro: {membro.mention}\nMotivo: {motivo}", color=discord.Color.orange())
 
@@ -3871,11 +4800,13 @@ async def add_warning(guild: discord.Guild, member: discord.Member, actor: disco
 async def adv(interaction: discord.Interaction, membro: discord.Member, motivo: str) -> None:
     if not await deny_unless_leader(interaction): return
     if interaction.user.id != interaction.guild.owner_id and membro.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("Você não pode aplicar advertência em alguém com cargo igual ou superior ao seu.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não pode aplicar advertência em alguém com cargo igual ou superior ao seu.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     level = await add_warning(interaction.guild, membro, interaction.user, motivo)
     if level == "ADV 3" and AUTO_PD_ON_ADV3:
         try:
-            await membro.send(f"Você recebeu ADV 3 na organização **{FACTION_NAME}** e será removido conforme a configuração automática. Motivo: {motivo}")
+            await membro.send(None, view=v2_view(None, None, f"Você recebeu ADV 3 na organização **{FACTION_NAME}** e será removido conforme a configuração automática. Motivo: {motivo}"))
         except discord.HTTPException:
             pass
         try:
@@ -3884,49 +4815,51 @@ async def adv(interaction: discord.Interaction, membro: discord.Member, motivo: 
                 con.execute("UPDATE members SET status='REMOVED' WHERE discord_id=?", (str(membro.id),))
             log_action(interaction.user.id, "PD_AUTOMATICA_ADV3", membro.id, motivo, "Removido automaticamente por configuração")
             await send_channel_log(interaction.guild, "💀 PD automático por ADV 3", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nMotivo: {motivo}", color=discord.Color.dark_red())
-            await interaction.response.send_message("⚠️ ADV 3 registrada e PD automático aplicado conforme configuração.", ephemeral=True)
+            await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "⚠️ ADV 3 registrada e PD automático aplicado conforme configuração."))
         except discord.Forbidden:
-            await interaction.response.send_message("ADV 3 registrada, mas não consegui aplicar PD automático por falta de permissão.", ephemeral=True)
+            await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "ADV 3 registrada, mas não consegui aplicar PD automático por falta de permissão."))
     elif level == "ADV 3":
         try:
-            await membro.send(f"Você recebeu ADV 3 na organização **{FACTION_NAME}**. Motivo: {motivo}. A liderança deverá revisar seu caso.")
+            await membro.send(None, view=v2_view(None, None, f"Você recebeu ADV 3 na organização **{FACTION_NAME}**. Motivo: {motivo}. A liderança deverá revisar seu caso."))
         except discord.HTTPException:
             pass
-        await interaction.response.send_message("⚠️ ADV 3 registrada. O PD automático está desativado; a liderança pode revisar o caso e usar `/pd`.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "⚠️ ADV 3 registrada. O PD automático está desativado; a liderança pode revisar o caso e usar `/pd`."))
     else:
-        await interaction.response.send_message(f"⚠️ Advertência aplicada: **{level}**.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"⚠️ Advertência aplicada: **{level}**."))
 
 @bot.tree.command(name="pd", description="Aplica perda de direitos e remove o membro do Discord")
 async def pd(interaction: discord.Interaction, membro: discord.Member, motivo: str) -> None:
     if not await deny_unless_leader(interaction): return
     if interaction.user.id != interaction.guild.owner_id and membro.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("Você não pode aplicar PD em alguém com cargo igual ou superior ao seu.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Você não pode aplicar PD em alguém com cargo igual ou superior ao seu.")); return
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         try:
-            await membro.send(f"Você recebeu PD na organização **{FACTION_NAME}**. Motivo: {motivo}")
+            await membro.send(None, view=v2_view(None, None, f"Você recebeu PD na organização **{FACTION_NAME}**. Motivo: {motivo}"))
         except discord.HTTPException:
             pass
         await membro.kick(reason=f"PD por {interaction.user}: {motivo}")
         with db() as con:
             con.execute("UPDATE members SET status='REMOVED' WHERE discord_id=?", (str(membro.id),))
         log_action(interaction.user.id, "PD", membro.id, motivo, "Membro removido do servidor")
-        await interaction.response.send_message(f"PD aplicado em {membro.display_name}.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, f"PD aplicado em {membro.display_name}."))
         await send_channel_log(interaction.guild, "💀 PD aplicado", f"Liderança: {interaction.user.mention}\nMembro: {membro.mention}\nMotivo: {motivo}", color=discord.Color.dark_red())
         await send_channel_log(interaction.guild, "💀 Membro desligado", f"Um membro recebeu PD. Motivo registrado pela liderança: {motivo}", public=True, color=discord.Color.dark_grey())
     except discord.Forbidden:
-        await interaction.response.send_message("Não tenho permissão para expulsar esse membro.", ephemeral=True)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, "Não tenho permissão para expulsar esse membro."))
 
 @bot.tree.command(name="blacklist-add", description="Adiciona um passaporte à blacklist")
 async def blacklist_add(interaction: discord.Interaction, passaporte: str, motivo: str) -> None:
     if not await deny_unless_leader(interaction): return
     if not passaporte.isdigit():
-        await interaction.response.send_message("O passaporte deve conter somente números.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O passaporte deve conter somente números.")); return
     with db() as con:
         con.execute("INSERT INTO blacklist(game_id,reason,added_by,created_at) VALUES(?,?,?,?) ON CONFLICT(game_id) DO UPDATE SET reason=excluded.reason,added_by=excluded.added_by,created_at=excluded.created_at", (passaporte, motivo, str(interaction.user.id), now_iso()))
     log_action(interaction.user.id, "BLACKLIST_ADD", None, motivo, f"Passaporte {passaporte}")
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Passaporte **{passaporte}** adicionado à blacklist."))
     if interaction.guild:
         await send_channel_log(interaction.guild, "⛔ BLACKLIST adicionada", f"Liderança: {interaction.user.mention}\nPassaporte: `{passaporte}`\nMotivo: {motivo}", color=discord.Color.dark_red())
-    await interaction.response.send_message(f"Passaporte **{passaporte}** adicionado à blacklist.", ephemeral=True)
 
 @bot.tree.command(name="blacklist-check", description="Consulta um passaporte na blacklist")
 async def blacklist_check(interaction: discord.Interaction, passaporte: str) -> None:
@@ -3934,8 +4867,8 @@ async def blacklist_check(interaction: discord.Interaction, passaporte: str) -> 
     with db() as con:
         row = con.execute("SELECT * FROM blacklist WHERE game_id=?", (passaporte.strip(),)).fetchone()
     if not row:
-        await interaction.response.send_message(f"Passaporte **{passaporte}** não está na blacklist.", ephemeral=True); return
-    await interaction.response.send_message(f"⛔ **Passaporte {passaporte} está na blacklist**\nMotivo: {row['reason']}\nAdicionado por: <@{row['added_by']}>\nData: {row['created_at']}", ephemeral=True)
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Passaporte **{passaporte}** não está na blacklist.")); return
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"⛔ **Passaporte {passaporte} está na blacklist**\nMotivo: {row['reason']}\nAdicionado por: <@{row['added_by']}>\nData: {row['created_at']}"))
 
 @bot.tree.command(name="logs", description="Consulta as ações recentes da liderança")
 @app_commands.describe(quantidade="Quantidade de registros, máximo 20")
@@ -3944,15 +4877,15 @@ async def logs(interaction: discord.Interaction, quantidade: app_commands.Range[
     with db() as con:
         rows = con.execute("SELECT * FROM actions ORDER BY id DESC LIMIT ?", (quantidade,)).fetchall()
     if not rows:
-        await interaction.response.send_message("Ainda não há ações registradas.", ephemeral=True); return
+        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há ações registradas.")); return
     lines = []
     for r in rows:
         target = f" · alvo <@{r['target_id']}>" if r["target_id"] else ""
         reason = f" · motivo: {r['reason']}" if r["reason"] else ""
         details = f" · {r['details']}" if r["details"] else ""
         lines.append(f"`#{r['id']}` **{r['action']}** por <@{r['actor_id']}>{target}{reason}{details}\n< t:{int(datetime.fromisoformat(r['created_at']).timestamp())}:R >".replace("< t:", "<t:").replace(":R >", ":R>"))
-    embed = discord.Embed(title="🧾 Logs administrativos", description="\n\n".join(lines)[:4000], color=discord.Color.blurple())
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed = PanelMessage(title="🧾 Logs administrativos", description="\n\n".join(lines)[:4000], color=discord.Color.blurple())
+    await interaction.response.send_message(view=v2_view(embed, None, None), ephemeral=True)
 
 @bot.tree.command(name="conquistas", description="Mostra marcos simples de atividade do membro")
 @app_commands.describe(membro="Membro para consultar; vazio para você")
@@ -3966,7 +4899,7 @@ async def conquistas(interaction: discord.Interaction, membro: Optional[discord.
     if total["qty"] >= 100: achievements.append("📦 100 unidades farmadas")
     if total["pts"] >= 1000: achievements.append("🏆 1.000 pontos acumulados")
     if not achievements: achievements = ["Ainda não desbloqueou marcos. Registre seu farm para começar!"]
-    await interaction.response.send_message(f"**Marcos de {target.mention}**\n" + "\n".join(achievements), ephemeral=True)
+    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"**Marcos de {target.mention}**\n" + "\n".join(achievements)))
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
@@ -3976,9 +4909,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
         message = "Você não tem permissão para usar esse comando."
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+            await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, message))
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, message))
     except discord.HTTPException:
         pass
 

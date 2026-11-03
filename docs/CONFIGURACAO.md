@@ -1,87 +1,92 @@
-# Guia de configuração do FAC-GERAL
+# Guia de configuração do FAC Control
+
+## Antes de começar
+
+Use Python 3.10+ e `discord.py>=2.7.1,<3.0.0` para garantir as correções de LayoutView e modais Components V2.
+
+1. Configure `DISCORD_TOKEN` e `DISCORD_GUILD_ID` no ambiente.
+2. Ative `Server Members Intent` e `Message Content Intent` no Discord Developer Portal.
+3. Conceda ao bot acesso aos canais e as permissões para enviar mensagens, anexar arquivos, ler histórico, gerenciar mensagens, cargos e apelidos.
+4. Inicie o bot e execute `/config` no servidor.
+
+As telas, mensagens, seletores, botões e confirmações usam Discord Components V2. Os formulários abrem modais com `Label` e `TextInput`.
 
 ## Painel `/config`
 
-O comando abre um painel privado para liderança ou administradores. Os módulos disponíveis no painel são **WL**, **Hierarquia**, **Farm**, **Selecionar cargos** e **Logs**. As alterações são salvas no SQLite.
+O painel é privado. O acesso é permitido a administradores, liderança configurada e desenvolvedores autorizados.
 
-### WL
+### WL — configuração em etapas
 
-No botão **WL**, configure título e descrição, além de foto/miniatura e banner usando URLs públicas HTTPS. Depois do formulário, escolha nos menus do Discord o canal onde o painel será publicado e o canal que recebe as solicitações. O recrutador escolhido continua sendo o único que pode decidir a solicitação, com prazo de 5 minutos.
+Configure os cargos de:
+- membro aprovado;
+- recrutador;
+- pessoa autorizada a aprovar ou recusar;
+- membro temporário enquanto aguarda a WL (opcional).
 
-### Hierarquia
+Depois configure:
+- canal onde o painel público será publicado;
+- canal onde a liderança/recrutadores recebem as solicitações.
 
-Configure título e descrição. Em seguida, selecione o canal de publicação no menu de canais e selecione os cargos que devem aparecer na hierarquia usando o seletor nativo de cargos. Selecione vários cargos por página (máximo 25 por menu) e navegue pelas páginas sem perder a seleção. Informe a quantidade exata de cargos antes, depois salve uma vez. A prioridade acompanha a posição nativa do Discord: nº 1 é o cargo mais baixo e o último número é o mais alto. O bot gera uma sigla do nome de cada cargo. Ao publicar, cada cargo recebe sua própria mensagem/embed, em ordem do maior para o menor, e cada membro aparece apenas no cargo mais alto configurado que possui.
+Os seletores próprios são paginados em blocos de até 25 opções. O cargo temporário é opcional. A solicitação expira após cinco minutos sem decisão. O recrutador selecionado fica registrado na solicitação.
+
+### Hierarquia — quatro etapas
+
+1. **Quantidade:** informe de 1 a 100 cargos, sem ultrapassar a quantidade de cargos selecionáveis do servidor.
+2. **Cargos:** selecione os cargos disponíveis. A ordem é calculada pela posição real no Discord, do maior para o menor. Se houver mais de 25 cargos, use os controles de página.
+3. **Tags:** o bot carrega as tags existentes e pede somente as pendentes. Cada formulário mostra até cinco cargos; após salvar, o assistente avança automaticamente ao próximo bloco incompleto. O progresso é exibido na tela. A etapa de publicação permanece bloqueada enquanto houver tag pendente.
+4. **Canal:** selecione o canal de publicação. Use **Anterior** e **Próxima** quando houver mais de 25 canais. Confirme a publicação quando todos os campos estiverem corretos.
+
+A publicação apresenta os cargos do maior para o menor. Para cada membro, o bot considera somente o cargo configurado de maior prioridade ao gerar o apelido `[TAG] NOME RP - ID`.
+
+O assistente reaproveita a hierarquia já salva quando os cargos ainda existem no servidor. O botão de apagar configuração solicita confirmação e remove somente as mensagens de hierarquia enviadas pelo bot no canal configurado.
 
 ### Farm
 
-Configure título e texto de instruções, foto/miniatura, banner e se o comprovante exige aprovação. Depois escolha o canal onde o painel será publicado, o canal onde a liderança receberá os comprovantes para análise, o cargo autorizado a decidir e o canal que receberá os registros finais.
+Configure:
+- canal público onde ficará o painel de registro;
+- canal privado da liderança;
+- cargo autorizado a aprovar, pagar ou recusar;
+- canal opcional de histórico final.
 
-O jogador clica em **REGISTRAR FARM**. O bot identifica o Discord ID e consulta o cadastro ativo em `members`, criado pela WL aprovada. Itens sem preço cadastrado não podem ser solicitados. Em seguida, o jogador seleciona um item ativo cadastrado, informa a quantidade e envia a imagem de prova como anexo no mesmo canal do painel. O bot monta o registro com nome, ID FiveM, item, quantidade, pontos, Discord e imagem. Com aprovação obrigatória, só contabiliza os pontos após aprovação; com aprovação automática, contabiliza ao receber a prova. A imagem e os dados ficam salvos em `farm_proofs` e os registros contabilizados em `farm_entries`.
+Cadastre itens com `/farm-item`, defina preço com `/farm-preco` e desative opções com `/farm-item-desativar`.
 
-A liderança configura os itens com `/farm-item` (nome, pontos por unidade e meta), define o preço em reais por unidade com `/farm-preco` (ex.: `2.50`) e pode desativá-los com `/farm-item-desativar`. O comando legado `/farm` não contabiliza registros sem prova: ele orienta o uso do painel.
+O membro deve ter cadastro ativo pela WL. No painel, seleciona o item, informa a quantidade e envia a imagem de prova no canal público. A liderança analisa a prova no canal privado. Quando aplicável, a confirmação de pagamento solicita o envio da imagem do comprovante, que é salva no banco e encaminhada ao membro.
 
-### Selecionar cargos
+### Outros painéis e recursos
 
-Use os menus do Discord para selecionar o cargo padrão de membro, o cargo autorizado a recrutar WL e o cargo de liderança. Não é necessário digitar ou copiar IDs de cargos.
+Os comandos `/painel`, `/painel-membros` e `/painel-lideranca` publicam as telas correspondentes. `/perfil`, `/membros`, `/farm-resumo`, `/farm-ranking`, `/logs` e `/conquistas` apresentam consultas em Components V2.
 
-### Logs
+Os canais de logs administrativos, públicos, ADV, PD, blacklist e Farm são definidos pelas variáveis de ambiente e/ou configurações salvas. O comando `/logs` consulta o histórico registrado no SQLite.
 
-Os canais de logs administrativos, públicos e de farm permanecem disponíveis no botão **Logs**. Esses campos ainda aceitam IDs numéricos de canais.
+## Paginação
 
-## Publicar os painéis
+O Discord limita menus de seleção próprios a 25 opções. Os seletores de recrutadores, itens de Farm, cargos de hierarquia, remoção de cargos, destinos de publicação e campos de configuração dividem os resultados em páginas. Use os botões **Anterior** e **Próxima** para navegar; a seleção e o progresso permanecem salvos entre as páginas.
 
-Depois de configurar os módulos, use os botões **Publicar WL**, **Publicar hierarquia** ou **Publicar Farm** no painel `/config`. O bot precisa ter permissão para ver e enviar mensagens nos canais escolhidos. Para foto e banner, use links públicos HTTPS que apontem diretamente para imagens; deixe os campos vazios para remover as imagens.
+Seletores nativos de cargo/canal do Discord permitem pesquisa pelo próprio cliente e não precisam ser convertidos em listas manuais.
 
-## Render
+## Apelidos e permissões
 
+O bot monta o apelido com a tag do cargo de maior prioridade, o nome RP e o ID. O cargo do bot deve ficar acima dos cargos que ele gerencia. Para alterar apelidos, habilite `Manage Nicknames`; para atribuir ou remover cargos, habilite `Manage Roles`.
+
+Para publicar ou substituir a hierarquia, conceda `View Channel`, `Send Messages`, `Read Message History` e `Manage Messages` no canal escolhido.
+
+## SQLite e hospedagem
+
+`DATABASE_PATH` define o arquivo SQLite. Em ambiente de hospedagem com disco efêmero, configure um disco persistente. O arquivo contém configurações, membros, registros de Farm, comprovantes e logs.
+
+No Render:
 - Build Command: `pip install -r requirements.txt`
 - Start Command: `python bot.py`
-- `DISCORD_TOKEN`: token do bot, mantido somente nas variáveis secretas do Render.
-- `DISCORD_GUILD_ID`: ID do servidor principal.
-- Ative as intents Server Members e Message Content no Developer Portal.
-- O SQLite é um arquivo local. Em ambiente com disco efêmero, configure disco persistente para não perder configurações e comprovantes entre recriações.
+- Mantenha `DISCORD_TOKEN` somente como variável secreta.
+- Configure um disco persistente para o banco.
 
+## Diagnóstico
 
-## Seleção de hierarquia
+Execute:
 
-O seletor de hierarquia é paginado em grupos de até 25 cargos, pois esse é o limite por menu do Discord. Use **Próxima** e **Anterior** para percorrer todos os cargos do servidor; as seleções ficam guardadas entre páginas. A publicação é exibida do cargo de menor posição para o de maior posição no Discord. O botão **Logs** foi removido do painel `/config`.
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q .
+```
 
-### Assistente sequencial da hierarquia
-
-Informe a quantidade de cargos (1–50), escolha um cargo para cada posição começando pelo mais baixo e confirme cada escolha. Ao terminar, revise e salve a ordem. Para publicar, escolha um canal no seletor do botão `Publicar hierarquia`. Um membro aparece somente sob o cargo de maior prioridade configurada que possui.
-
-### Cargos de WL e Farm
-
-Abra `/config` e entre em **WL** para selecionar separadamente: cargo temporário antes da aprovação, cargo adicionado após aprovação, cargo autorizado a aprovar/recusar e cargo cujos membros aparecem na seleção de recrutadores. O cargo temporário é aplicado a novos membros e removido quando a WL é aprovada; em caso de recusa, permanece.
-
-Em **Farm**, selecione o cargo autorizado a aprovar ou recusar comprovantes. Administradores continuam podendo realizar essas ações. As configurações ficam salvas no banco SQLite.
-
-## Seleção de cargos e canais por ID
-
-Nos painéis de configuração, use os menus do Discord quando o cargo/canal estiver disponível. Se o Discord não listar o item desejado, use **Informar ID manualmente**, cole o ID numérico e o bot validará se ele pertence ao servidor e se é do tipo correto.
-
-## Configuração da hierarquia
-
-A configuração não solicita mais uma quantidade de cargos. Selecione os cargos nas páginas, use **Remover cargo selecionado** para corrigir uma escolha, **Adicionar cargo por ID** quando o cargo não aparecer no menu, **Reiniciar configuração** para limpar a hierarquia e **Salvar hierarquia** para confirmar. A ordem de seleção define a hierarquia: primeiro cargo = base; último cargo = topo.
-
-A publicação cria uma mensagem limpa por cargo, com o nome do cargo, quantidade de membros, menções dos membros (ou aviso de que ninguém possui o cargo) e horário da última atualização.
-
-
-## Hierarquia dinâmica pelo Discord
-
-A configuração da hierarquia é feita em `/config` → **Hierarquia**. O fluxo guiado possui quatro etapas:
-
-1. Informe a quantidade de cargos (de 1 a 25).
-2. Informe os IDs dos cargos na ordem do mais baixo para o mais alto. Para respeitar o limite de cinco campos por modal do Discord, o preenchimento é dividido em blocos.
-3. Defina uma tag/abreviação para cada cargo. A tag é aplicada antes do nome RP e do ID do jogador.
-4. Selecione o canal de publicação pelo menu ou informe o ID manualmente.
-
-Exemplo de nickname: `[ LT ] GUSTAVO BOBO - 1908`. Quando o membro recebe ou perde um cargo configurado, o bot identifica o cargo de maior prioridade e atualiza o nickname. O nome RP e o ID são recuperados do cadastro aprovado da WL.
-
-A configuração é persistida no SQLite. O botão **Apagar configuração anterior** solicita confirmação e, após confirmado, remove os cargos/tags/canal salvos e limpa as mensagens do canal anteriormente configurado. O botão de publicação também limpa o canal escolhido antes de publicar a hierarquia nova.
-
-**Permissões necessárias:** habilite `Server Members Intent` no Developer Portal e conceda ao bot `View Channel`, `Send Messages`, `Embed Links`, `Read Message History` e `Manage Messages` no canal da hierarquia. O cargo do bot deve ficar acima dos cargos que ele precisa atribuir/gerenciar e ter `Manage Nicknames` para editar apelidos.
-
-
-## Nome exibido do bot
-O nome global exibido pelo Discord (por exemplo, o nome do usuário do bot) deve ser alterado no perfil/aplicação do bot no Discord Developer Portal. O código remove GTT de títulos e descrições salvos, mas não pode renomear a conta do bot.
+O bot registra erros de interação no log e responde com uma mensagem V2 genérica. O `discord.py` gerencia os limites de requisição do Discord; em falhas de login com `Retry-After`/HTTP 429, o processo usa espera automática com backoff.

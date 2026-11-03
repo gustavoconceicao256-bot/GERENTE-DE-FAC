@@ -1,35 +1,40 @@
-ATUALIZAÇÕES DESTA VERSÃO
+ATUALIZAÇÕES — MIGRAÇÃO COMPONENTS V2
+
+INTERFACE
+- Todas as classes de mensagens interativas usam LayoutView/ComponentsV2View.
+- Os envios e edições do bot passam por LayoutView; não são enviados embeds nem Views tradicionais.
+- Os botões e menus são agrupados em ActionRows dentro de Containers.
+- Os formulários usam modais Components V2 com Label + TextInput.
+- Callbacks decorados de botões recebem explicitamente interaction e o componente.
+- As ActionRows são reordenadas pelo índice lógico, evitando botões acima dos seletores.
+- Containers com mais de dez filhos são divididos em blocos válidos.
+- Erros em LayoutViews e modais são registrados e recebem resposta V2 amigável.
 
 HIERARQUIA
-- A seleção e a configuração agora seguem do cargo mais baixo para o mais alto.
-- A prioridade gravada aumenta de 1 em diante; o maior valor representa o cargo mais alto.
-- O bot identifica o cargo configurado de maior prioridade entre os cargos que o membro possui.
-- O apelido usa [TAG] NOME - ID e preserva o ID no final dentro do limite de 32 caracteres do Discord.
-- A seleção por menu e por ID mantém a ordem da hierarquia.
+- Ordem do maior cargo para o menor, inclusive na publicação.
+- Configuração suporta até 100 posições, respeitando a quantidade de cargos disponíveis no servidor.
+- Menus de cargos e canais usam paginação de até 25 opções.
+- Tags existentes são reaproveitadas; só as pendentes aparecem nos modais.
+- O assistente mostra o progresso e avança automaticamente após cada bloco de tags.
+- A etapa de publicação permanece bloqueada enquanto houver tags pendentes.
+- A etapa 4 permite navegar pelos canais com Anterior/Próxima.
+- O apelido usa a tag do cargo configurado de maior prioridade.
 
-FARM
-- Corrigido o envio da etapa de canais: LayoutView/Components V2 não recebe mais texto no campo content.
-- A mensagem de confirmação agora fica dentro do próprio LayoutView.
-- O botão da etapa de itens foi renomeado para Próximo.
+WL E FARM
+- WL em etapas, com cargos, canais, revisão e publicação.
+- Farm com seleção paginada de campos/destinos, confirmação de pagamento e comprovantes.
+- Fluxos demorados deferem a interação antes de operações de rede e respondem por followup.
 
-IDENTIDADE
-- Menções antigas a GTT em títulos e descrições salvos nas configurações são removidas na inicialização.
-- O nome de usuário/apelido global do bot no Discord precisa ser alterado no perfil do bot; a API de mensagens não altera esse nome.
+ESTABILIDADE
+- Tratamento de erros em callbacks de Views V2 e modais.
+- Operações demoradas foram ajustadas para não exceder a janela de resposta inicial das interações.
+- O cliente HTTP do discord.py aplica o controle de rate limit; o login usa Retry-After e backoff progressivo para falhas 429.
 
-VALIDAÇÃO
-- Compilação sintática do bot.py aprovada.
-- Verificação funcional isolada do formato do apelido aprovada.
-- O bot não foi conectado ao Discord nesta validação; faça o deploy e teste as interações no servidor.
+TESTES AUTOMATIZADOS
+- Auditoria estática de migração Components V2.
+- Verificação de callbacks de botões e modais Label.
+- Verificação de envios/edições sem embeds legados.
+- Compilação sintática e compileall.
 
-
-ATUALIZAÇÃO — LISTAS COMPLETAS DO FARM
-- Etapa 1: o botão Próximo só é exibido quando existe pelo menos um item ativo cadastrado.
-- Configuração do Farm: os quatro campos agora são escolhidos em um seletor de configuração.
-- Canais de texto e cargos são listados em páginas de até 25 opções, com botões Anterior/Próxima para percorrer a lista completa.
-- A seleção salva o ID correspondente no banco de dados.
-- A seleção manual por ID continua disponível.
-- Canais listados são canais de texto/anúncio em que o bot pode publicar mensagens; categorias e canais de voz não são destinos válidos para o painel de Farm.
-
-VALIDAÇÃO DESTA ATUALIZAÇÃO
-- Compilação sintática de bot.py aprovada.
-- O ambiente desta execução não possui discord.py instalado; portanto, não foi possível executar um teste real de montagem das views nem conectar ao Discord.
+LIMITAÇÃO DE VALIDAÇÃO
+- Os testes automatizados não substituem um teste conectado ao Discord. A publicação, permissões, DMs e interações reais precisam ser validadas em um servidor de teste com o bot instalado.
