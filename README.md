@@ -83,11 +83,11 @@ O painel é privado e restrito à liderança, desenvolvedores autorizados e admi
 ### Assistente da hierarquia
 
 1. Informe a quantidade de cargos (1 a 100; limitada à quantidade de cargos selecionáveis no servidor).
-2. Selecione cada cargo. O assistente organiza a lista automaticamente pela posição real do Discord, do **mais alto para o mais baixo**. Os menus exibem até 25 opções por página.
-3. Defina as tags pendentes. O bot pula tags já configuradas, mostra o progresso e avança automaticamente para o próximo bloco após salvar. Não é possível avançar para a publicação enquanto houver tag pendente.
-4. Escolha o canal de publicação usando **Anterior** e **Próxima** quando houver mais de 25 canais. A publicação é feita do cargo mais alto para o mais baixo.
+2. Selecione os cargos na ordem que deseja usar: **Cargo 1 é o topo** e o último é a base. Os menus exibem até 25 opções por página. Use **Apagar 1** para liberar uma posição específica e escolher outro cargo; repita quantas vezes precisar. **Mudar posição** troca a ordem de um cargo sem refazer a seleção.
+3. Defina as tags em blocos de até cinco cargos. Ao salvar, o bloco atual é substituído na mesma mensagem pelo próximo bloco pendente. Os únicos botões são **Definir tag dos cargos**, **Voltar** (retorna aos cargos) e **Recomeçar tags** (limpa somente o bloco exibido).
+4. Escolha o canal de publicação usando **Anterior** e **Próxima** quando houver mais de 25 canais. A publicação segue a ordem manual configurada.
 
-O bot reaproveita cargos e tags existentes quando possível. A prioridade salva determina o cargo usado no apelido do membro e a posição na publicação.
+No guia da hierarquia, **Editar hierarquia** preserva a configuração e permite editar cargos/posições, a tag de qualquer cargo ou o canal. **Começar do zero** pede confirmação e remove a configuração e as mensagens da hierarquia publicadas pelo bot antes de iniciar novamente. A prioridade salva determina o cargo usado no apelido do membro e a posição na publicação.
 
 ### Farm
 

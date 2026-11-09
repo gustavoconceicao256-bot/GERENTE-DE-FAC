@@ -2838,19 +2838,21 @@ def clear_hierarchy_settings():
 
 
 class HierarchyGuideView(ComponentsV2View):
+    """Compatibilidade com a entrada antiga: mantém as mesmas ações do guia V2 atual."""
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=900)
         self.guild = guild
 
-    @discord.ui.button(label="Configurar hierarquia do zero", style=discord.ButtonStyle.success, emoji="⚙️")
+    @discord.ui.button(label="Editar hierarquia", style=discord.ButtonStyle.primary, emoji="✏️")
     async def configure(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(HierarchyCountModal(self.guild))
+        view = HierarchyEditMenuView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
-    @discord.ui.button(label="Apagar configuração anterior", style=discord.ButtonStyle.danger, emoji="🗑️")
+    @discord.ui.button(label="Começar do zero", style=discord.ButtonStyle.success, emoji="🔄")
     async def reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
             None,
-            view=v2_view(None, HierarchyResetConfirmView(self.guild), "⚠️ **Confirma a exclusão?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia no canal anteriormente configurado. Essa ação não pode ser desfeita."), ephemeral=True
+            view=v2_view(None, HierarchyResetConfirmView(self.guild), "⚠️ **Começar do zero?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia publicadas pelo bot."), ephemeral=True
         )
 
 
@@ -2859,7 +2861,7 @@ class HierarchyResetConfirmView(ComponentsV2View):
         super().__init__(timeout=120)
         self.guild = guild
 
-    @discord.ui.button(label="Sim, apagar tudo", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Sim, começar do zero", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -2892,7 +2894,14 @@ class HierarchyResetConfirmView(ComponentsV2View):
         clear_hierarchy_settings()
         await interaction.edit_original_response(
             content=None,
-            view=v2_view(None, None, f"✅ Configuração apagada. {deleted} mensagem(ns) removida(s) do canal anterior. Você pode começar do zero."),
+            view=v2_view(
+                PanelMessage(
+                    title="✅ Configuração anterior removida",
+                    description=f"{deleted} mensagem(ns) da hierarquia foram removidas. Agora defina a nova quantidade de cargos para começar a configuração do zero."
+                ),
+                HierarchyStartSetupView(self.guild),
+                None,
+            ),
             embeds=[],
             attachments=(interaction.message.attachments if interaction.message else []),
         )
@@ -2902,12 +2911,23 @@ class HierarchyResetConfirmView(ComponentsV2View):
         await interaction.response.edit_message(content=None, view=v2_view(None, None, "Operação cancelada. Nenhuma configuração foi alterada."), embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
-class HierarchyCountModal(ComponentsV2Modal, title="Etapa 1 — Quantidade de cargos"):
-    count = TextInput(label="Quantos cargos terá a hierarquia? (1 a 100)", placeholder="Ex.: 10", max_length=3)
-
+class HierarchyStartSetupView(ComponentsV2View):
     def __init__(self, guild):
         super().__init__(timeout=300)
         self.guild = guild
+
+    @discord.ui.button(label="Definir quantidade de cargos", style=discord.ButtonStyle.success, emoji="➡️", row=0)
+    async def continue_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(HierarchyCountModal(self.guild, interaction.message))
+
+
+class HierarchyCountModal(ComponentsV2Modal, title="Etapa 1 — Quantidade de cargos"):
+    count = TextInput(label="Quantos cargos terá a hierarquia? (1 a 100)", placeholder="Ex.: 10", max_length=3)
+
+    def __init__(self, guild, source_message=None):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.source_message = source_message
 
     async def on_submit(self, interaction: discord.Interaction):
         raw = self.count.value.strip()
@@ -2927,14 +2947,14 @@ class HierarchyCountModal(ComponentsV2Modal, title="Etapa 1 — Quantidade de ca
             return
         save_config_value("hierarchy_role_count", str(count))
         save_config_value("hierarchy_setup_in_progress", "1")
-        # Reaproveita cargos/tags já configurados; só solicita o que ainda falta.
+        # Reaproveita a ordem configurada (prioridade salva), não a posição
+        # nativa do Discord. Assim, a ordem da hierarquia pode ser personalizada.
         selectable_ids = {role.id for role in selectable_hierarchy_roles(self.guild)}
         existing = []
         for _priority, role_id, _abbr in hierarchy_rows():
             role = self.guild.get_role(role_id)
             if role and role.id in selectable_ids:
                 existing.append(role)
-        existing = sorted(existing, key=lambda role: (role.position, role.name.casefold()), reverse=True)
         view = HierarchyRoleConfigView(self.guild, count)
         view.owner_id = interaction.user.id
         view.role_ids = [role.id for role in existing[:count]] + [None] * max(0, count - len(existing))
@@ -2942,17 +2962,13 @@ class HierarchyCountModal(ComponentsV2Modal, title="Etapa 1 — Quantidade de ca
             tags_view = HierarchyTagConfigView(self.guild, view.role_ids, view.owner_id)
             if all(tags_view.tags):
                 tags_view.persist_tags()
-                final_view = HierarchyFinalChannelView(self.guild)
-                await interaction.response.send_message(
-                    view=v2_view(final_view.embed(), final_view, None), ephemeral=True
-                )
+                next_view = HierarchyFinalChannelView(self.guild)
             else:
-                await interaction.response.send_message(
-                    view=v2_view(tags_view.embed(), tags_view, None), ephemeral=True
-                )
-            return
-        view._refresh_role_picker()
-        await interaction.response.send_message(view=v2_view(view.embed(), view, None), ephemeral=True)
+                next_view = tags_view
+        else:
+            view._refresh_role_picker()
+            next_view = view
+        await update_hierarchy_modal_message(interaction, self.source_message, next_view)
 
 
 class HierarchyRoleIdsModal(ComponentsV2Modal):
@@ -3050,8 +3066,8 @@ class HierarchyRoleIdModal(ComponentsV2Modal, title="Adicionar cargo por ID"):
             return
         raw = self.role_id_input.value.strip()
         role = self.parent_view.guild.get_role(int(raw)) if raw.isdigit() else None
-        if role is None or role == self.parent_view.guild.default_role:
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID inválido: não encontrei esse cargo neste servidor."))
+        if role is None or role.id not in {item.id for item in selectable_hierarchy_roles(self.parent_view.guild)}:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "ID inválido: escolha um cargo não gerenciado e abaixo do cargo do bot."))
             return
         if role.id in [rid for rid in self.parent_view.role_ids if rid]:
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esse cargo já foi selecionado. Informe outro ID."))
@@ -3063,12 +3079,19 @@ class HierarchyRoleIdModal(ComponentsV2Modal, title="Adicionar cargo por ID"):
             return
         self.parent_view.role_ids[index] = role.id
         if all(rid is not None for rid in self.parent_view.role_ids):
-            self.parent_view.role_ids.sort(key=lambda rid: self.parent_view.guild.get_role(rid).position if self.parent_view.guild.get_role(rid) else -1, reverse=True)
-            next_view = HierarchyTagConfigView(self.parent_view.guild, self.parent_view.role_ids, self.parent_view.owner_id)
-            await interaction.response.send_message(view=v2_view(next_view.embed(), next_view, None), ephemeral=True)
+            tags_view = HierarchyTagConfigView(
+                self.parent_view.guild, self.parent_view.role_ids,
+                self.parent_view.owner_id, return_to_edit=self.parent_view.edit_mode,
+            )
+            if all(tags_view.tags):
+                tags_view.persist_tags()
+                next_view = HierarchyEditMenuView(self.parent_view.guild, self.parent_view.owner_id) if self.parent_view.edit_mode else HierarchyFinalChannelView(self.parent_view.guild)
+            else:
+                next_view = tags_view
         else:
             self.parent_view._refresh_role_picker()
-            await interaction.response.send_message(view=v2_view(self.parent_view.embed(), self.parent_view, None), ephemeral=True)
+            next_view = self.parent_view
+        await update_hierarchy_modal_message(interaction, self.parent_view.message, next_view)
 
 
 def selectable_hierarchy_roles(guild: discord.Guild) -> list[discord.Role]:
@@ -3128,13 +3151,14 @@ def hierarchy_configuration_issue(guild: discord.Guild) -> Optional[str]:
 
 
 class HierarchyRoleConfigView(ComponentsV2View):
-    """Seleciona cargos do servidor em páginas, do cargo mais alto ao mais baixo."""
-    def __init__(self, guild, count):
+    """Seleciona e reorganiza cargos em ordem manual: topo primeiro, base por último."""
+    def __init__(self, guild, count, *, edit_mode=False):
         super().__init__(timeout=900)
         self.guild, self.count = guild, count
         self.role_ids = [None] * count
         self.owner_id = 0
-        # Ordem de seleção: primeiro o cargo mais alto; último o mais baixo.
+        self.edit_mode = edit_mode
+        self.message = None
         self.available_roles = selectable_hierarchy_roles(guild)
         self.role_page = 0
         self.role_picker = HierarchyRolePicker(self)
@@ -3155,34 +3179,34 @@ class HierarchyRoleConfigView(ComponentsV2View):
         self.add_item(self.role_picker)
         self._update_role_page_buttons()
 
+    async def _show_next_stage(self, interaction):
+        # A ordem digitada/selecionada é preservada. Não ordenar por role.position.
+        tags_view = HierarchyTagConfigView(
+            self.guild, self.role_ids, self.owner_id, return_to_edit=self.edit_mode
+        )
+        if all(tags_view.tags):
+            tags_view.persist_tags()
+            next_view = HierarchyEditMenuView(self.guild, self.owner_id) if self.edit_mode else HierarchyFinalChannelView(self.guild)
+        else:
+            next_view = tags_view
+        await interaction.response.edit_message(
+            view=v2_view(next_view.embed(), next_view, None),
+            content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
     async def refresh_after_role_change(self, interaction):
         if all(rid is not None for rid in self.role_ids):
-            # Normaliza pela posição real dos cargos: maior primeiro, menor por último.
-            self.role_ids.sort(
-                key=lambda rid: self.guild.get_role(rid).position if self.guild.get_role(rid) else -1,
-                reverse=True,
-            )
-            tags_view = HierarchyTagConfigView(self.guild, self.role_ids, self.owner_id)
-            if all(tags_view.tags):
-                tags_view.persist_tags()
-                final_view = HierarchyFinalChannelView(self.guild)
-                await interaction.response.edit_message(
-                    view=v2_view(final_view.embed(), final_view, None),
-                    content=None, embeds=[],
-                    attachments=(interaction.message.attachments if interaction.message else []),
-                )
-            else:
-                await interaction.response.edit_message(
-                    view=v2_view(tags_view.embed(), tags_view, None),
-                    content=None, embeds=[],
-                    attachments=(interaction.message.attachments if interaction.message else []),
-                )
+            await self._show_next_stage(interaction)
             return
         self._refresh_role_picker()
-        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+        await interaction.response.edit_message(
+            view=v2_view(self.embed(), self, None), content=None, embeds=[],
+            attachments=(interaction.message.attachments if interaction.message else []),
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
+        if self.owner_id and interaction.user.id != self.owner_id:
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode alterar os cargos."))
             return False
         return True
@@ -3191,12 +3215,14 @@ class HierarchyRoleConfigView(ComponentsV2View):
         lines = []
         for idx, rid in enumerate(self.role_ids):
             role = self.guild.get_role(rid) if rid else None
-            lines.append(f"**Cargo {idx + 1}:** {role.mention if role else '— não preenchido —'}")
+            position = "MAIS ALTO" if idx == 0 else ("MAIS BAIXO" if idx == len(self.role_ids) - 1 else f"POSIÇÃO {idx + 1}")
+            lines.append(f"**{idx + 1}. {position}:** {role.mention if role else '— vaga livre —'}")
         e = PanelMessage(
-            title="Etapa 2 — Seleção de cargos",
+            title="Etapa 2 — Cargos e posições",
             description=(
-                "Use o menu para selecionar os cargos na ordem **do mais alto para o mais baixo**. "
-                "As setas mudam a página do menu e percorrem todos os cargos do servidor.\n\n"
+                "Defina a ordem manualmente: **Cargo 1 é o topo** e o último cargo é a base. "
+                "O menu adiciona o cargo na primeira vaga livre. Use **Apagar 1** para corrigir uma escolha "
+                "ou **Mudar posição** para reorganizar cargos já selecionados.\n\n"
                 + "\n".join(lines)
             ),
             color=discord.Color.blurple(),
@@ -3204,13 +3230,13 @@ class HierarchyRoleConfigView(ComponentsV2View):
         e.set_footer(text=f"Página de cargos {self.role_page + 1}/{self.role_pages} • {sum(rid is not None for rid in self.role_ids)}/{self.count} cargos definidos")
         return e
 
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.role_page = max(0, self.role_page - 1)
         self._refresh_role_picker()
         await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="Próxima página ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.role_page = min(self.role_pages - 1, self.role_page + 1)
         self._refresh_role_picker()
@@ -3218,22 +3244,107 @@ class HierarchyRoleConfigView(ComponentsV2View):
 
     @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(HierarchyCountModal(self.guild))
+        if self.edit_mode:
+            next_view = HierarchyEditMenuView(self.guild, self.owner_id or interaction.user.id)
+            await interaction.response.edit_message(view=v2_view(next_view.embed(), next_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+        else:
+            self.message = interaction.message
+            await interaction.response.send_modal(HierarchyCountModal(self.guild, interaction.message))
 
     @discord.ui.button(label="Por ID", style=discord.ButtonStyle.primary, emoji="🔢", row=2)
     async def by_id(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.message = interaction.message
         await interaction.response.send_modal(HierarchyRoleIdModal(self))
 
-    @discord.ui.button(label="Recomeçar", style=discord.ButtonStyle.danger, emoji="🔄", row=2)
-    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.role_ids = [None] * self.count
-        self.role_page = 0
-        self._refresh_role_picker()
-        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+    @discord.ui.button(label="Apagar 1", style=discord.ButtonStyle.danger, emoji="🗑️", row=2)
+    async def remove_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not any(self.role_ids):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não há cargos selecionados para apagar."))
+            return
+        self.message = interaction.message
+        await interaction.response.send_modal(HierarchyRemoveRoleModal(self))
+
+    @discord.ui.button(label="Mudar posição", style=discord.ButtonStyle.primary, emoji="↕️", row=3)
+    async def move_role(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if any(rid is None for rid in self.role_ids):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Preencha todas as posições antes de reorganizar a hierarquia."))
+            return
+        self.message = interaction.message
+        await interaction.response.send_modal(HierarchyMoveRoleModal(self))
+
+
+async def update_hierarchy_modal_message(interaction, source_message, next_view):
+    """Atualiza a mensagem efêmera que abriu o modal, sem criar uma segunda tela."""
+    await interaction.response.defer(ephemeral=True)
+    rendered_view = v2_view(next_view.embed(), next_view, None)
+    if source_message is not None:
+        await source_message.edit(
+            content=None, embeds=[], view=rendered_view,
+            attachments=(source_message.attachments if getattr(source_message, "attachments", None) else []),
+        )
+    else:
+        await interaction.followup.send(view=rendered_view, ephemeral=True)
+
+
+class HierarchyRemoveRoleModal(ComponentsV2Modal, title="Apagar um cargo"):
+    position = TextInput(label="Número da posição que deseja apagar", placeholder="Ex.: 3", max_length=3, required=True)
+
+    def __init__(self, parent):
+        super().__init__(timeout=300)
+        self.parent_view = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = self.position.value.strip()
+        if not raw.isdigit() or not 1 <= int(raw) <= len(self.parent_view.role_ids):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Informe uma posição entre 1 e {len(self.parent_view.role_ids)}."))
+            return
+        index = int(raw) - 1
+        role_id = self.parent_view.role_ids[index]
+        if role_id is None:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Essa posição já está vazia. Escolha uma posição que tenha um cargo."))
+            return
+        self.parent_view.role_ids[index] = None
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key=?", (f"rank_role_{role_id}",))
+            con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{role_id}",))
+            con.execute("INSERT INTO settings(key,value) VALUES('hierarchy_setup_in_progress','1') ON CONFLICT(key) DO UPDATE SET value='1'")
+        self.parent_view._refresh_role_picker()
+        await update_hierarchy_modal_message(interaction, self.parent_view.message, self.parent_view)
+
+
+class HierarchyMoveRoleModal(ComponentsV2Modal, title="Mudar posição do cargo"):
+    current_position = TextInput(label="Posição atual do cargo", placeholder="Ex.: 4", max_length=3, required=True)
+    new_position = TextInput(label="Nova posição na hierarquia", placeholder="Ex.: 2", max_length=3, required=True)
+
+    def __init__(self, parent):
+        super().__init__(timeout=300)
+        self.parent_view = parent
+
+    async def on_submit(self, interaction: discord.Interaction):
+        total = len(self.parent_view.role_ids)
+        raw_current = self.current_position.value.strip()
+        raw_new = self.new_position.value.strip()
+        if not raw_current.isdigit() or not raw_new.isdigit():
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe números válidos para a posição atual e a nova posição."))
+            return
+        current, new = int(raw_current), int(raw_new)
+        if not (1 <= current <= total and 1 <= new <= total):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"As posições precisam estar entre 1 e {total}."))
+            return
+        moved = self.parent_view.role_ids.pop(current - 1)
+        self.parent_view.role_ids.insert(new - 1, moved)
+        next_view = HierarchyTagConfigView(
+            self.parent_view.guild, self.parent_view.role_ids,
+            self.parent_view.owner_id, return_to_edit=self.parent_view.edit_mode,
+        )
+        if all(next_view.tags):
+            next_view.persist_tags()
+            next_view = HierarchyEditMenuView(self.parent_view.guild, self.parent_view.owner_id) if self.parent_view.edit_mode else HierarchyFinalChannelView(self.parent_view.guild)
+        await update_hierarchy_modal_message(interaction, self.parent_view.message, next_view)
 
 
 class HierarchyTagsModal(ComponentsV2Modal):
-    """Modal para preencher apenas as tags que ainda faltam no bloco atual."""
+    """Preenche somente o bloco atual e substitui a mesma mensagem pelo próximo bloco."""
     def __init__(self, parent, indices: list[int]):
         start = min(indices) + 1 if indices else 1
         end = max(indices) + 1 if indices else start
@@ -3254,76 +3365,55 @@ class HierarchyTagsModal(ComponentsV2Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         if self.parent_view.owner_id and interaction.user.id != self.parent_view.owner_id:
-            await interaction.response.send_message(
-                None, ephemeral=True,
-                view=v2_view(None, None, "Somente quem iniciou a configuração pode definir as tags."),
-            )
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode definir as tags."))
             return
 
         new_tags = []
         for field in self.inputs:
             tag = field.value.strip().replace("[", "").replace("]", "")
             if not tag or any(ch in tag for ch in "\n\r"):
-                await interaction.response.send_message(
-                    None, ephemeral=True,
-                    view=v2_view(None, None, "Cada cargo precisa ter uma tag válida (até 12 caracteres)."),
-                )
+                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Cada cargo precisa ter uma tag válida (até 12 caracteres)."))
                 return
             new_tags.append(tag)
 
-        # Valida o bloco inteiro antes de persistir para evitar progresso parcial.
+        # Valida o bloco inteiro antes de gravar qualquer alteração.
         for idx, tag in zip(self.indices, new_tags):
             self.parent_view.tags[idx] = tag
             rid = self.parent_view.role_ids[idx]
             save_config_value(f"hierarchy_draft_tag_{rid}", tag)
 
-        if all(self.parent_view.tags):
-            self.parent_view.persist_tags()
-            final_view = HierarchyFinalChannelView(self.parent_view.guild)
-            await interaction.response.send_message(
-                view=v2_view(final_view.embed(), final_view, None),
-                ephemeral=True,
-            )
-            return
-
-        next_page = self.parent_view.find_next_incomplete_page(self.parent_view.page + 1)
+        next_page = self.parent_view.find_next_incomplete_page(0)
         if next_page is None:
-            next_page = self.parent_view.find_next_incomplete_page(0)
-        next_view = HierarchyTagConfigView(
-            self.parent_view.guild,
-            self.parent_view.role_ids,
-            self.parent_view.owner_id,
-        )
-        next_view.page = next_page if next_page is not None else self.parent_view.page
-        next_view._sync_buttons()
-        await interaction.response.send_message(
-            view=v2_view(next_view.embed(), next_view, None),
-            ephemeral=True,
-        )
+            self.parent_view.persist_tags()
+            next_view = HierarchyEditMenuView(self.parent_view.guild, self.parent_view.owner_id) if self.parent_view.return_to_edit else HierarchyFinalChannelView(self.parent_view.guild)
+        else:
+            self.parent_view.page = next_page
+            self.parent_view._sync_buttons()
+            next_view = self.parent_view
+        # A tela antiga é editada; não é enviada uma nova mensagem efêmera abaixo dela.
+        await update_hierarchy_modal_message(interaction, self.parent_view.message, next_view)
 
 
 class HierarchyTagConfigView(ComponentsV2View):
-    """Tags sequenciais: pula o que já está configurado e avança após cada bloco."""
-    def __init__(self, guild, role_ids, owner_id=0):
+    """Tags em blocos de até cinco cargos; cada bloco substitui o anterior ao ser salvo."""
+    def __init__(self, guild, role_ids, owner_id=0, *, return_to_edit=False):
         super().__init__(timeout=900)
         self.guild, self.role_ids = guild, list(role_ids)
         self.owner_id = owner_id
+        self.return_to_edit = return_to_edit
+        self.message = None
         self.tags = []
         with db() as con:
             for rid in self.role_ids:
-                draft = con.execute(
-                    "SELECT value FROM settings WHERE key=?",
-                    (f"hierarchy_draft_tag_{rid}",),
-                ).fetchone()
-                saved = con.execute(
-                    "SELECT value FROM settings WHERE key=?",
-                    (f"rank_role_{rid}",),
-                ).fetchone()
+                draft = con.execute("SELECT value FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",)).fetchone()
+                saved = con.execute("SELECT value FROM settings WHERE key=?", (f"rank_role_{rid}",)).fetchone()
                 tag = str(draft["value"] if draft else "").strip()
                 if not tag and saved:
                     tag = str(saved["value"]).split("|", 1)[0].strip()
                 self.tags.append(tag)
-        self.page = self.find_next_incomplete_page(0) or 0
+        self.page = self.find_next_incomplete_page(0)
+        if self.page is None:
+            self.page = 0
         self._sync_buttons()
 
     @property
@@ -3341,35 +3431,22 @@ class HierarchyTagConfigView(ComponentsV2View):
     def persist_tags(self):
         total = len(self.role_ids)
         with db() as con:
-            # Remove cargos/tags que pertenciam a uma configuração anterior
-            # e não fazem mais parte da hierarquia atual.
             con.execute("DELETE FROM settings WHERE key LIKE 'rank_role_%'")
             con.execute("DELETE FROM settings WHERE key LIKE 'hierarchy_draft_tag_%'")
             for idx, (rid, tag) in enumerate(zip(self.role_ids, self.tags)):
                 if not tag:
                     continue
-                # Primeiro cargo é o mais alto; prioridade maior publica primeiro.
                 priority = total - idx
                 con.execute(
-                    "INSERT INTO settings(key,value) VALUES(?,?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (f"rank_role_{rid}", f"{tag}|{priority}"),
                 )
-                con.execute(
-                    "DELETE FROM settings WHERE key=?",
-                    (f"hierarchy_draft_tag_{rid}",),
-                )
-            con.execute(
-                "INSERT INTO settings(key,value) VALUES('hierarchy_setup_in_progress','0') "
-                "ON CONFLICT(key) DO UPDATE SET value='0'"
-            )
+            con.execute("INSERT INTO settings(key,value) VALUES('hierarchy_setup_in_progress','0') ON CONFLICT(key) DO UPDATE SET value='0'")
+            con.execute("INSERT INTO settings(key,value) VALUES('hierarchy_role_count',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(total),))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.owner_id and interaction.user.id != self.owner_id:
-            await interaction.response.send_message(
-                None, ephemeral=True,
-                view=v2_view(None, None, "Somente quem iniciou a configuração pode alterar as tags."),
-            )
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a configuração pode alterar as tags."))
             return False
         return True
 
@@ -3381,12 +3458,11 @@ class HierarchyTagConfigView(ComponentsV2View):
             tag = self.tags[idx] or "— pendente —"
             state = "✅" if self.tags[idx] else "⏳"
             lines.append(f"{state} **Cargo {idx + 1}** · {role.mention if role else 'Cargo removido'} → **[{tag}]**")
-        done = sum(bool(x) for x in self.tags)
+        done = sum(bool(tag) for tag in self.tags)
         e = PanelMessage(
             title="Etapa 3 — Tags / abreviações",
             description=(
-                "As tags são configuradas em sequência. Cargos que já possuem tag são ignorados automaticamente. "
-                "Após salvar um bloco, o painel avança para o próximo bloco pendente.\n\n"
+                "Defina as tags dos cargos deste bloco. Depois de salvar, **este bloco será substituído aqui mesmo pelo próximo bloco pendente**.\n\n"
                 + "\n".join(lines)
             ),
             color=discord.Color.blurple(),
@@ -3395,101 +3471,49 @@ class HierarchyTagConfigView(ComponentsV2View):
         return e
 
     def _sync_buttons(self):
-        self.previous_page.disabled = self.page <= 0
-        self.next_page.disabled = self.page >= self.pages - 1
         start, end = self.page * 5, min(self.page * 5 + 5, len(self.tags))
         self.define_tag.disabled = all(self.tags[start:end])
-        self.next_stage.disabled = not all(self.tags)
+        self.restart.disabled = not any(self.tags[start:end])
 
-    @discord.ui.button(label="Definir tags pendentes deste bloco", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
+    @discord.ui.button(label="Definir tag dos cargos", style=discord.ButtonStyle.primary, emoji="✏️", row=0)
     async def define_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
         start = self.page * 5
         end = min(start + 5, len(self.tags))
         indices = [idx for idx in range(start, end) if not self.tags[idx]]
         if not indices:
-            next_page = self.find_next_incomplete_page(self.page + 1)
+            next_page = self.find_next_incomplete_page(0)
             if next_page is not None:
                 self.page = next_page
                 self._sync_buttons()
-                await interaction.response.edit_message(
-                    view=v2_view(self.embed(), self, None),
-                    content=None, embeds=[],
-                    attachments=(interaction.message.attachments if interaction.message else []),
-                )
-            else:
-                self.persist_tags()
-                final_view = HierarchyFinalChannelView(self.guild)
-                await interaction.response.edit_message(
-                    view=v2_view(final_view.embed(), final_view, None),
-                    content=None, embeds=[],
-                    attachments=(interaction.message.attachments if interaction.message else []),
-                )
+                await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+                return
+            next_view = HierarchyEditMenuView(self.guild, self.owner_id) if self.return_to_edit else HierarchyFinalChannelView(self.guild)
+            self.persist_tags()
+            await interaction.response.edit_message(view=v2_view(next_view.embed(), next_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
             return
+        self.message = interaction.message
         await interaction.response.send_modal(HierarchyTagsModal(self, indices))
 
-    @discord.ui.button(label="◀ Anterior", style=discord.ButtonStyle.secondary, row=1)
-    async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.page = max(0, self.page - 1)
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            view=v2_view(self.embed(), self, None),
-            content=None, embeds=[],
-            attachments=(interaction.message.attachments if interaction.message else []),
-        )
-
-    @discord.ui.button(label="Próxima página ▶", style=discord.ButtonStyle.secondary, row=1)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        next_page = self.find_next_incomplete_page(self.page + 1)
-        self.page = next_page if next_page is not None else min(self.pages - 1, self.page + 1)
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            view=v2_view(self.embed(), self, None),
-            content=None, embeds=[],
-            attachments=(interaction.message.attachments if interaction.message else []),
-        )
-
-    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, emoji="⬅️", row=0)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = HierarchyRoleConfigView(self.guild, len(self.role_ids))
+        view = HierarchyRoleConfigView(self.guild, len(self.role_ids), edit_mode=self.return_to_edit)
         view.role_ids = list(self.role_ids)
         view.owner_id = self.owner_id or interaction.user.id
         view._refresh_role_picker()
-        await interaction.response.edit_message(
-            view=v2_view(view.embed(), view, None),
-            content=None, embeds=[],
-            attachments=(interaction.message.attachments if interaction.message else []),
-        )
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
-    @discord.ui.button(label="Continuar para canal", style=discord.ButtonStyle.success, emoji="➡️", row=3)
-    async def next_stage(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not all(self.tags):
-            await interaction.response.send_message(
-                None, ephemeral=True,
-                view=v2_view(None, None, "Defina todas as tags antes de avançar."),
-            )
-            return
-        self.persist_tags()
-        final_view = HierarchyFinalChannelView(self.guild)
-        await interaction.response.edit_message(
-            view=v2_view(final_view.embed(), final_view, None),
-            content=None, embeds=[],
-            attachments=(interaction.message.attachments if interaction.message else []),
-        )
-
-    @discord.ui.button(label="Recomeçar tags", style=discord.ButtonStyle.danger, emoji="🔄", row=2)
+    @discord.ui.button(label="Recomeçar tags", style=discord.ButtonStyle.danger, emoji="🔄", row=0)
     async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        start, end = self.page * 5, min(self.page * 5 + 5, len(self.tags))
         with db() as con:
-            for rid in self.role_ids:
+            for idx in range(start, end):
+                rid = self.role_ids[idx]
+                self.tags[idx] = ""
                 con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{rid}",))
                 con.execute("DELETE FROM settings WHERE key=?", (f"rank_role_{rid}",))
-        self.tags = [""] * len(self.role_ids)
-        self.page = 0
+            con.execute("INSERT INTO settings(key,value) VALUES('hierarchy_setup_in_progress','1') ON CONFLICT(key) DO UPDATE SET value='1'")
         self._sync_buttons()
-        await interaction.response.edit_message(
-            view=v2_view(self.embed(), self, None),
-            content=None, embeds=[],
-            attachments=(interaction.message.attachments if interaction.message else []),
-        )
+        await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class HierarchyManualChannelModal(ComponentsV2Modal, title="Canal da hierarquia"):
@@ -3533,9 +3557,11 @@ class HierarchyFinalChannelSelect(discord.ui.Select):
 
 
 class HierarchyFinalChannelView(ComponentsV2View):
-    def __init__(self, guild):
+    def __init__(self, guild, *, return_to_edit=False, owner_id=0):
         super().__init__(timeout=900)
         self.guild = guild
+        self.return_to_edit = return_to_edit
+        self.owner_id = owner_id
         raw = setting("hierarchy_panel_channel_id", "0")
         self.channel_id = int(raw) if raw.isdigit() and int(raw) else None
         self.channels = sorted((c for c in guild.text_channels), key=lambda c: (getattr(c.category, "position", -1), c.position, c.name.casefold()))
@@ -3577,8 +3603,18 @@ class HierarchyFinalChannelView(ComponentsV2View):
         self.refresh()
         await interaction.response.edit_message(view=v2_view(self.embed(), self, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
-    @discord.ui.button(label="Voltar às tags", style=discord.ButtonStyle.secondary, row=2)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a edição pode alterar o canal."))
+            return False
+        return True
+
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.return_to_edit:
+            view = HierarchyEditMenuView(self.guild, self.owner_id or interaction.user.id)
+            await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+            return
         rows = hierarchy_rows()
         view = HierarchyTagConfigView(self.guild, [rid for _priority, rid, _tag in rows], interaction.user.id)
         view.tags = [tag for _priority, _rid, tag in rows]
@@ -4403,6 +4439,104 @@ class ConfigFarmChannelsV2(ComponentsV2LayoutView):
         )
 
 
+class HierarchyEditMenuView(ComponentsV2View):
+    """Menu de edição sem apagar a hierarquia que já está configurada."""
+    def __init__(self, guild, owner_id=0):
+        super().__init__(timeout=900)
+        self.guild = guild
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a edição pode alterar a hierarquia."))
+            return False
+        return True
+
+    def embed(self):
+        rows = hierarchy_rows()
+        lines = []
+        for index, (_priority, role_id, tag) in enumerate(rows, 1):
+            role = self.guild.get_role(role_id)
+            lines.append(f"**{index}.** {role.mention if role else f'Cargo removido ({role_id})'} — **[{tag}]**")
+        if not lines:
+            lines = ["Nenhum cargo salvo ainda. Comece uma configuração do zero."]
+        return PanelMessage(
+            title="✏️ Editar hierarquia",
+            description=(
+                "A hierarquia atual será preservada. Escolha exatamente o que deseja alterar:\n\n"
+                "**Editar cargos e posições:** trocar cargos ou mudar a ordem do topo até a base.\n"
+                "**Editar uma tag:** alterar a abreviação de qualquer cargo sem refazer as outras.\n"
+                "**Editar canal:** trocar o canal onde a hierarquia é publicada.\n\n"
+                "**Configuração atual:**\n" + "\n".join(lines)
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    @discord.ui.button(label="Editar cargos e posições", style=discord.ButtonStyle.primary, emoji="🏛️", row=0)
+    async def edit_roles(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = hierarchy_rows()
+        if not rows:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não existe uma hierarquia para editar. Use Começar do zero."))
+            return
+        try:
+            expected = int(setting("hierarchy_role_count", str(len(rows))) or len(rows))
+        except (TypeError, ValueError):
+            expected = len(rows)
+        count = max(len(rows), expected, 1)
+        view = HierarchyRoleConfigView(self.guild, count, edit_mode=True)
+        view.owner_id = self.owner_id or interaction.user.id
+        view.role_ids = [role_id for _priority, role_id, _tag in rows[:count]] + [None] * max(0, count - len(rows))
+        view._refresh_role_picker()
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+
+    @discord.ui.button(label="Editar tag de qualquer cargo", style=discord.ButtonStyle.primary, emoji="🏷️", row=0)
+    async def edit_tag(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not hierarchy_rows():
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Ainda não existe nenhum cargo salvo para editar."))
+            return
+        await interaction.response.send_modal(HierarchyEditTagModal(self.guild, self.owner_id or interaction.user.id, interaction.message))
+
+    @discord.ui.button(label="Editar canal", style=discord.ButtonStyle.secondary, emoji="📣", row=1)
+    async def edit_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = HierarchyFinalChannelView(self.guild, return_to_edit=True, owner_id=self.owner_id or interaction.user.id)
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+
+    @discord.ui.button(label="Voltar", style=discord.ButtonStyle.secondary, emoji="⬅️", row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(view=HierarchyGuideV2(self.guild), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+
+
+class HierarchyEditTagModal(ComponentsV2Modal, title="Editar tag de um cargo"):
+    position = TextInput(label="Número do cargo na lista", placeholder="Ex.: 3", max_length=3, required=True)
+    new_tag = TextInput(label="Nova tag (até 12 caracteres)", placeholder="Ex.: GT.G", max_length=12, required=True)
+
+    def __init__(self, guild, owner_id, source_message):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.owner_id = owner_id
+        self.source_message = source_message
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou a edição pode alterar as tags."))
+            return
+        raw_position = self.position.value.strip()
+        tag = self.new_tag.value.strip().replace("[", "").replace("]", "")
+        rows = hierarchy_rows()
+        if not raw_position.isdigit() or not 1 <= int(raw_position) <= len(rows):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"Informe uma posição entre 1 e {len(rows)}."))
+            return
+        if not tag or any(ch in tag for ch in "\n\r"):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Informe uma tag válida de até 12 caracteres."))
+            return
+        priority, role_id, _old_tag = rows[int(raw_position) - 1]
+        save_config_value(f"rank_role_{role_id}", f"{tag}|{priority}")
+        with db() as con:
+            con.execute("DELETE FROM settings WHERE key=?", (f"hierarchy_draft_tag_{role_id}",))
+        next_view = HierarchyEditMenuView(self.guild, self.owner_id)
+        await update_hierarchy_modal_message(interaction, self.source_message, next_view)
+
+
 class HierarchyGuideV2(ComponentsV2LayoutView):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=900)
@@ -4411,30 +4545,36 @@ class HierarchyGuideV2(ComponentsV2LayoutView):
             discord.ui.TextDisplay(
                 "## 🏛️ Hierarquia\n"
                 "A configuração é feita do **cargo mais alto para o mais baixo**.\n\n"
-                "**1.** Informe a quantidade de cargos.\n"
-                "**2.** Selecione os cargos: Cargo 1 é o mais alto; o último é o mais baixo.\n"
-                "**3.** Defina todas as tags antes de avançar.\n"
-                "**4.** Escolha o canal com as setas e publique.\n\n"
-                "O bot usa sempre o cargo mais alto que o membro possuir e atualiza o apelido no formato `[TAG] NOME - ID`."
+                "**Editar hierarquia:** mantém a configuração atual e permite trocar cargos, mudar posições, "
+                "editar a tag de qualquer cargo e trocar o canal de publicação.\n\n"
+                "**Começar do zero:** apaga a configuração atual e as mensagens da hierarquia publicadas pelo bot, "
+                "para montar tudo novamente.\n\n"
+                "O apelido dos membros continua no formato `[TAG] NOME - ID`."
             ),
             discord.ui.Separator(),
             discord.ui.ActionRow(
-                discord.ui.Button(label="Configurar do zero", emoji="⚙️", style=discord.ButtonStyle.success, custom_id="fac:hierarchyv2:start"),
-                discord.ui.Button(label="Apagar configuração", emoji="🗑️", style=discord.ButtonStyle.danger, custom_id="fac:hierarchyv2:reset"),
+                discord.ui.Button(label="Editar hierarquia", emoji="✏️", style=discord.ButtonStyle.primary, custom_id="fac:hierarchyv2:edit"),
+                discord.ui.Button(label="Começar do zero", emoji="🔄", style=discord.ButtonStyle.success, custom_id="fac:hierarchyv2:start"),
             ),
         )
         self.add_item(container)
         row = container.children[-1]
-        row.children[0].callback = self.start
-        row.children[1].callback = self.reset
+        row.children[0].callback = self.edit
+        row.children[1].callback = self.start
+
+    async def edit(self, interaction: discord.Interaction):
+        view = HierarchyEditMenuView(self.guild, interaction.user.id)
+        await interaction.response.edit_message(view=v2_view(view.embed(), view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
     async def start(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(HierarchyCountModal(self.guild))
-
-    async def reset(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             None,
-            view=v2_view(None, HierarchyResetConfirmView(self.guild), "⚠️ **Confirma a exclusão?** Serão apagados os cargos, tags, canal salvo e as mensagens publicadas da hierarquia."), ephemeral=True
+            view=v2_view(
+                None,
+                HierarchyResetConfirmView(self.guild),
+                "⚠️ **Começar do zero?** Isso apagará os cargos, tags, canal salvo e as mensagens da hierarquia publicadas pelo bot. A configuração atual não poderá ser recuperada.",
+            ),
+            ephemeral=True,
         )
 
 
