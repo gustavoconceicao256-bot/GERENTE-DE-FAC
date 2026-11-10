@@ -18,7 +18,7 @@ A dependência `discord.py` precisa ser `2.7.1` ou superior para suportar Compon
 - Painéis principal, WL, farm, hierarquia, membros e liderança.
 - Perfis, membros, ranking, metas, slots, advertências, PD, blacklist e registros administrativos.
 - Logs em canais configuráveis e armazenamento em SQLite.
-- Paginação para seletores próprios que ultrapassam o limite de 25 opções do Discord.
+- Paginação para todos os seletores de cargos, canais de texto e categorias: até 25 opções por página, com setas Anterior/Próxima e preservação da seleção.
 - Tratamento de erros nas interações e backoff de login para erros HTTP/429; o cliente HTTP do `discord.py` também aplica o controle de rate limit do Discord.
 
 ## Requisitos
@@ -101,9 +101,9 @@ O registro depende do cadastro ativo da WL. A imagem, os dados do item e a decis
 
 ## Sistema de Tickets
 
-O painel `/config` agora possui o módulo **Tickets**, com configuração guiada para **Suporte**, **Denúncia** e **Outros assuntos**. Configure o canal do painel, canal privado de logs, categoria e cargo de atendimento para cada tipo; depois clique em **Publicar painel**.
+O painel `/config` agora possui o módulo **Tickets**, com configuração guiada para **Suporte**, **Denúncia** e **Outros assuntos**. Configure o canal do painel, canal privado de logs, categoria e cargo de atendimento para cada tipo; depois clique em **Publicar painel**. Os seletores de canal, categoria e cargo também possuem paginação por setas.
 
-Inclui canais privados, modais, assumir/liberar, fechar/reabrir, transcripts HTML, cópia administrativa nos logs e cópia privada para o autor. Consulte [docs/SISTEMA-DE-TICKETS.md](docs/SISTEMA-DE-TICKETS.md) para o passo a passo e permissões.
+Inclui canais privados, modais, assumir/liberar, fechar/reabrir, transcripts HTML, cópia administrativa nos logs e cópia privada para o autor. Consulte [docs/SISTEMA-DE-TICKETS.md](docs/SISTEMA-DE-TICKETS.md) para o passo a passo e permissões. Para o comportamento dos seletores paginados, consulte [docs/PAGINACAO-SELETORES.md](docs/PAGINACAO-SELETORES.md).
 
 O código do Open Ticket original fornecido está preservado em `vendor/open-ticket-reference/` como referência; o módulo em execução é nativo em Python e não inicia um segundo bot Node.js.
 

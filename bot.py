@@ -1794,22 +1794,260 @@ def _set_modal_defaults(modal: Modal, values: list[tuple[TextInput, str]]) -> No
         field.default = str(value)[:field.max_length]
 
 
-class ConfigTextChannelSelect(discord.ui.ChannelSelect):
-    """Canal de texto selecionado com o próprio menu do Discord, sem digitar IDs."""
-    def __init__(self, setting_key: str, placeholder: str, *, row: int = 0):
+class PaginatedGuildObjectSelect(discord.ui.Select):
+    """Dropdown de até 25 cargos/canais por página para uso em Components V2."""
+    def __init__(self, parent_view: "PaginatedGuildObjectPickerView"):
+        self.parent_view = parent_view
+        start = parent_view.page * parent_view.PAGE_SIZE
+        self.page_objects = parent_view.objects[start:start + parent_view.PAGE_SIZE]
+        options = []
+        for obj in self.page_objects:
+            if parent_view.kind == "role":
+                label = obj.name
+                description = f"Cargo · posição {obj.position}"
+            elif parent_view.kind == "category":
+                label = f"📁 {obj.name}"
+                description = "Categoria de canais"
+            else:
+                label = f"#{obj.name}"
+                category = getattr(getattr(obj, "category", None), "name", None)
+                description = f"Canal de texto · {category}" if category else "Canal de texto"
+            options.append(discord.SelectOption(
+                label=label[:100],
+                value=str(obj.id),
+                description=description[:100],
+                default=(obj.id == parent_view.selected_id),
+            ))
+        if not options:
+            options = [discord.SelectOption(
+                label="Nenhuma opção encontrada", value="__none__",
+                description="Não há itens disponíveis neste servidor",
+            )]
+        total = len(parent_view.objects)
+        first = start + 1 if total else 0
+        last = min(start + len(self.page_objects), total)
         super().__init__(
-            placeholder=placeholder,
-            channel_types=[discord.ChannelType.text],
+            placeholder=f"{parent_view.kind_label} · {first}–{last} de {total}",
             min_values=1,
             max_values=1,
-            row=row,
+            options=options,
+            row=0,
         )
-        self.setting_key = setting_key
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        channel = self.values[0]
-        save_config_value(self.setting_key, str(channel.id))
-        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"✅ Canal salvo: {channel.mention}"))
+        raw = self.values[0]
+        if raw == "__none__":
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Não há cargos ou canais disponíveis nesta página."),
+            )
+            return
+        self.parent_view.selected_id = int(raw)
+        self.parent_view.refresh()
+        await interaction.response.edit_message(view=self.parent_view)
+
+
+class PaginatedGuildObjectPickerView(ComponentsV2View):
+    """Seletor reutilizável com setas para todos os cargos e canais do servidor."""
+    PAGE_SIZE = 25
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        *,
+        kind: str,
+        title: str,
+        owner_id: int,
+        on_confirm,
+        on_back=None,
+        selected_id: int = 0,
+        allow_clear: bool = False,
+        confirm_label: str = "Confirmar seleção",
+    ):
+        super().__init__(timeout=900)
+        if kind not in {"role", "text_channel", "category"}:
+            raise ValueError(f"Tipo de seletor não suportado: {kind}")
+        self.guild = guild
+        self.kind = kind
+        self.title = title
+        self.owner_id = int(owner_id or 0)
+        self.on_confirm = on_confirm
+        self.on_back = on_back
+        self.selected_id = int(selected_id or 0)
+        self.allow_clear = bool(allow_clear)
+        self.objects = self._get_objects()
+        self.page = 0
+        if self.selected_id:
+            for index, obj in enumerate(self.objects):
+                if obj.id == self.selected_id:
+                    self.page = index // self.PAGE_SIZE
+                    break
+        self.kind_label = {
+            "role": "Cargos",
+            "text_channel": "Canais de texto",
+            "category": "Categorias",
+        }[kind]
+
+        self.selector = PaginatedGuildObjectSelect(self)
+        self.add_item(self.selector)
+
+        self.previous_button = discord.ui.Button(
+            label="◀ Anterior", style=discord.ButtonStyle.secondary,
+            row=1, disabled=True,
+        )
+        self.next_button = discord.ui.Button(
+            label="Próxima página ▶", style=discord.ButtonStyle.secondary,
+            row=1, disabled=self.page_count <= 1,
+        )
+        self.confirm_button = discord.ui.Button(
+            label=confirm_label, emoji="✅", style=discord.ButtonStyle.success,
+            row=2, disabled=not self._selected_object(),
+        )
+        self.back_button = discord.ui.Button(
+            label="Voltar", emoji="⬅️", style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+        self.previous_button.callback = self._previous
+        self.next_button.callback = self._next
+        self.confirm_button.callback = self._confirm
+        self.back_button.callback = self._back
+        self.add_item(self.previous_button)
+        self.add_item(self.next_button)
+        self.add_item(self.confirm_button)
+        self.add_item(self.back_button)
+        if self.allow_clear:
+            self.clear_button = discord.ui.Button(
+                label="Limpar seleção", emoji="🗑️", style=discord.ButtonStyle.danger,
+                row=3,
+            )
+            self.clear_button.callback = self._clear
+            self.add_item(self.clear_button)
+        self._refresh_text_and_buttons()
+
+    def _get_objects(self):
+        if self.kind == "role":
+            return sorted(
+                (role for role in self.guild.roles if not role.is_default()),
+                key=lambda role: (role.position, role.name.casefold()),
+                reverse=True,
+            )
+        if self.kind == "category":
+            return sorted(self.guild.categories, key=lambda channel: (channel.position, channel.name.casefold()))
+        return sorted(
+            self.guild.text_channels,
+            key=lambda channel: (
+                getattr(getattr(channel, "category", None), "position", -1),
+                channel.position,
+                channel.name.casefold(),
+            ),
+        )
+
+    @property
+    def page_count(self) -> int:
+        return max(1, math.ceil(len(self.objects) / self.PAGE_SIZE))
+
+    def _selected_object(self):
+        if not self.selected_id:
+            return None
+        # Retorna somente um item que realmente pertence ao tipo deste seletor.
+        # Isso evita aceitar um ID antigo de canal de voz/categoria num campo de texto.
+        return next((obj for obj in self.objects if obj.id == self.selected_id), None)
+
+    def _refresh_text_and_buttons(self):
+        selected = self._selected_object()
+        selected_text = selected.mention if selected and hasattr(selected, "mention") else (selected.name if selected else "Nenhum selecionado")
+        self.set_text(
+            f"# {self.title}\n"
+            f"Selecione uma opção no menu abaixo. Quando houver mais de 25 opções, use as setas para avançar ou voltar.\n\n"
+            f"**Selecionado:** {selected_text}\n"
+            f"**Página:** {self.page + 1}/{self.page_count} · **Opções encontradas:** {len(self.objects)}"
+        )
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.page_count - 1
+        self.confirm_button.disabled = selected is None
+
+    def refresh(self):
+        if hasattr(self, "selector"):
+            self.remove_item(self.selector)
+        self.selector = PaginatedGuildObjectSelect(self)
+        self.add_item(self.selector)
+        self._refresh_text_and_buttons()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.owner_id and interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Somente quem iniciou esta configuração pode selecionar cargos ou canais."),
+            )
+            return False
+        return True
+
+    async def _previous(self, interaction: discord.Interaction):
+        self.page = max(0, self.page - 1)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def _next(self, interaction: discord.Interaction):
+        self.page = min(self.page_count - 1, self.page + 1)
+        self.refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def _confirm(self, interaction: discord.Interaction):
+        selected = self._selected_object()
+        if selected is None:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Selecione um cargo ou canal antes de confirmar."),
+            )
+            return
+        await self.on_confirm(interaction, selected)
+
+    async def _back(self, interaction: discord.Interaction):
+        if self.on_back:
+            await self.on_back(interaction)
+        else:
+            await interaction.response.edit_message(
+                view=v2_view(None, None, "Seleção cancelada. Nenhuma configuração foi alterada."),
+            )
+
+    async def _clear(self, interaction: discord.Interaction):
+        self.selected_id = 0
+        if self.on_confirm:
+            await self.on_confirm(interaction, None)
+
+
+class ConfigTextChannelSelect(discord.ui.Button):
+    """Abre um seletor paginado de canais de texto em vez do menu limitado do Discord."""
+    def __init__(self, setting_key: str, placeholder: str, *, row: int = 0):
+        super().__init__(label=placeholder[:80], style=discord.ButtonStyle.secondary, emoji="📁", row=row)
+        self.setting_key = setting_key
+        self.placeholder = placeholder
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este seletor dentro do servidor."))
+            return
+        async def confirm(picker_interaction, channel):
+            save_config_value(self.setting_key, str(channel.id if channel else 0))
+            shown = channel.mention if channel else "(desconfigurado)"
+            await picker_interaction.response.edit_message(
+                view=v2_view(None, None, f"✅ **{self.placeholder}** salvo: {shown}"),
+            )
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(
+                view=v2_view(None, None, "Seleção cancelada. Nenhuma configuração foi alterada."),
+            )
+        raw_selected_id = panel_setting(self.setting_key, "0")
+        try:
+            selected_id = int(raw_selected_id or 0)
+        except (TypeError, ValueError):
+            selected_id = 0
+        picker = PaginatedGuildObjectPickerView(
+            interaction.guild, kind="text_channel", title=self.placeholder,
+            owner_id=interaction.user.id, on_confirm=confirm, on_back=back,
+            selected_id=selected_id,
+        )
+        await interaction.response.send_message(view=picker, ephemeral=True)
 
 
 class ConfigManualIdModal(ComponentsV2Modal, title="Configurar ID manualmente"):
@@ -1917,16 +2155,37 @@ class ConfigFarmChannelsView(ComponentsV2View):
         self.add_item(ConfigManualIdButton(preset_key="farm_private_channel_id"))
 
 
-class ConfigSingleRoleSelect(discord.ui.RoleSelect):
+class ConfigSingleRoleSelect(discord.ui.Button):
     def __init__(self, setting_key: str, placeholder: str, *, row: int):
-        super().__init__(placeholder=placeholder, min_values=0, max_values=1, row=row)
+        super().__init__(label=placeholder[:80], style=discord.ButtonStyle.secondary, emoji="🎭", row=row)
         self.setting_key = setting_key
+        self.placeholder = placeholder
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        role = self.values[0] if self.values else None
-        save_config_value(self.setting_key, str(role.id if role else 0))
-        role_name = role.mention if role else "(desconfigurado)"
-        await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, f"✅ Cargo salvo: {role_name}"))
+        if interaction.guild is None:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este seletor dentro do servidor."))
+            return
+        async def confirm(picker_interaction, role):
+            save_config_value(self.setting_key, str(role.id if role else 0))
+            shown = role.mention if role else "(desconfigurado)"
+            await picker_interaction.response.edit_message(
+                view=v2_view(None, None, f"✅ **{self.placeholder}** salvo: {shown}"),
+            )
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(
+                view=v2_view(None, None, "Seleção cancelada. Nenhuma configuração foi alterada."),
+            )
+        raw_selected_id = panel_setting(self.setting_key, "0")
+        try:
+            selected_id = int(raw_selected_id or 0)
+        except (TypeError, ValueError):
+            selected_id = 0
+        picker = PaginatedGuildObjectPickerView(
+            interaction.guild, kind="role", title=self.placeholder,
+            owner_id=interaction.user.id, on_confirm=confirm, on_back=back,
+            selected_id=selected_id, allow_clear=True,
+        )
+        await interaction.response.send_message(view=picker, ephemeral=True)
 
 
 class ConfigRolesSelectView(ComponentsV2View):
@@ -1941,18 +2200,32 @@ class ConfigRolesSelectView(ComponentsV2View):
 HIERARCHY_ROLES_PER_PAGE = 25
 
 
-class ConfigHierarchyChannelSelect(discord.ui.ChannelSelect):
+class ConfigHierarchyChannelSelect(discord.ui.Button):
     def __init__(self, parent_view: "ConfigHierarchySetupView"):
         super().__init__(
-            placeholder="① Selecione o canal de publicação da hierarquia",
-            channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=0,
+            label="Selecionar canal de publicação",
+            style=discord.ButtonStyle.secondary, emoji="📣", row=0,
         )
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        channel = self.values[0]
-        self.parent_view.channel_id = channel.id
-        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+        async def confirm(picker_interaction, channel):
+            self.parent_view.channel_id = channel.id
+            await picker_interaction.response.edit_message(
+                view=v2_view(self.parent_view.build_embed(), self.parent_view, None),
+                content=None, embeds=[], attachments=(picker_interaction.message.attachments if picker_interaction.message else []),
+            )
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(
+                view=v2_view(self.parent_view.build_embed(), self.parent_view, None),
+                content=None, embeds=[], attachments=(picker_interaction.message.attachments if picker_interaction.message else []),
+            )
+        picker = PaginatedGuildObjectPickerView(
+            interaction.guild, kind="text_channel", title="Canal de publicação da hierarquia",
+            owner_id=interaction.user.id, on_confirm=confirm, on_back=back,
+            selected_id=getattr(self.parent_view, "channel_id", 0) or 0,
+        )
+        await interaction.response.send_message(view=picker, ephemeral=True)
 
 
 class ConfigHierarchyRolePageSelect(discord.ui.Select):
@@ -2819,16 +3092,34 @@ class FarmProofReviewView(ComponentsV2View):
         await interaction.response.send_modal(FarmProofRejectModal(proof_id))
 
 
-class HierarchyPublishChannelSelect(discord.ui.ChannelSelect):
+class HierarchyPublishChannelSelect(discord.ui.Button):
     def __init__(self, parent_view: "HierarchyPublishChannelView"):
+        super().__init__(
+            label="Selecionar canal de publicação",
+            style=discord.ButtonStyle.secondary, emoji="📣", row=0,
+        )
         self.parent_view = parent_view
-        super().__init__(placeholder="Selecione o canal onde publicar a hierarquia", channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        channel = self.values[0]
-        self.parent_view.channel_id = channel.id
-        self.parent_view.publish_now.disabled = False
-        await interaction.response.edit_message(view=v2_view(self.parent_view.build_embed(), self.parent_view, None), content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
+        async def confirm(picker_interaction, channel):
+            self.parent_view.channel_id = channel.id
+            save_config_value("hierarchy_panel_channel_id", str(channel.id))
+            self.parent_view.publish_now.disabled = False
+            await picker_interaction.response.edit_message(
+                view=v2_view(self.parent_view.build_embed(), self.parent_view, None),
+                content=None, embeds=[], attachments=(picker_interaction.message.attachments if picker_interaction.message else []),
+            )
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(
+                view=v2_view(self.parent_view.build_embed(), self.parent_view, None),
+                content=None, embeds=[], attachments=(picker_interaction.message.attachments if picker_interaction.message else []),
+            )
+        picker = PaginatedGuildObjectPickerView(
+            interaction.guild, kind="text_channel", title="Canal onde publicar a hierarquia",
+            owner_id=interaction.user.id, on_confirm=confirm, on_back=back,
+            selected_id=self.parent_view.channel_id or 0,
+        )
+        await interaction.response.edit_message(view=picker, content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []))
 
 
 class HierarchyPublishChannelView(ComponentsV2View):
@@ -5292,87 +5583,61 @@ class TicketConfigV2(ComponentsV2View):
         await interaction.response.edit_message(view=ConfigPanelV2(include_banner=False), content=None, embeds=[], attachments=[])
 
 
-class TicketTextChannelSelectV2(ComponentsV2View):
+class TicketTextChannelSelectV2(PaginatedGuildObjectPickerView):
     def __init__(self, guild: discord.Guild, key: str, label: str, owner_id: int):
-        super().__init__(timeout=900)
-        self.guild, self.key, self.label, self.owner_id = guild, key, label, owner_id
-        self.selected_channel_id = 0
-        self.set_text(f"# 📍 {label.upper()}\nSelecione um canal de texto no menu abaixo e clique em **Salvar canal**.\n\nO canal de logs deve permanecer privado à liderança.")
-        self.channel_select = discord.ui.ChannelSelect(placeholder=f"Selecione: {label}", channel_types=[discord.ChannelType.text], min_values=1, max_values=1, row=0)
-        async def on_select(interaction: discord.Interaction):
-            selected = self.channel_select.values[0]
-            self.selected_channel_id = selected.id
-            self.set_text(f"# 📍 {self.label.upper()}\nCanal selecionado: {selected.mention}\n\nClique em **Salvar canal** para confirmar ou selecione outro canal para substituir.")
-            await interaction.response.edit_message(view=self)
-        self.channel_select.callback = on_select
-        self.add_item(self.channel_select)
-        save = discord.ui.Button(label="Salvar canal", emoji="💾", style=discord.ButtonStyle.success, row=1)
-        back = discord.ui.Button(label="Voltar", style=discord.ButtonStyle.secondary, row=1)
-        async def save_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.owner_id:
-                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem abriu a configuração pode salvar.")); return
-            if not self.selected_channel_id:
-                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Selecione um canal antes de salvar.")); return
-            save_config_value(self.key, str(self.selected_channel_id))
-            view = TicketConfigV2(self.guild, self.owner_id)
-            await interaction.response.edit_message(view=view, content=None, embeds=[], attachments=[])
-        async def back_callback(interaction: discord.Interaction):
-            await interaction.response.edit_message(view=TicketConfigV2(self.guild, self.owner_id), content=None, embeds=[], attachments=[])
-        save.callback = save_callback; back.callback = back_callback
-        self.add_item(save); self.add_item(back)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou esta configuração pode alterá-la.")); return False
-        return True
+        async def confirm(picker_interaction, channel):
+            save_config_value(key, str(channel.id))
+            await picker_interaction.response.edit_message(
+                view=TicketConfigV2(guild, owner_id), content=None, embeds=[], attachments=[],
+            )
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(
+                view=TicketConfigV2(guild, owner_id), content=None, embeds=[], attachments=[],
+            )
+        raw = panel_setting(key, "0")
+        try:
+            selected_id = int(raw or 0)
+        except (TypeError, ValueError):
+            selected_id = 0
+        super().__init__(
+            guild, kind="text_channel", title=label,
+            owner_id=owner_id, on_confirm=confirm, on_back=back,
+            selected_id=selected_id, confirm_label="Salvar canal",
+        )
 
 
 class TicketCategorySelectV2(ComponentsV2View):
+    """Configuração de categoria/equipe com paginadores separados de 25 itens."""
     def __init__(self, guild: discord.Guild, ticket_type: str, owner_id: int):
         super().__init__(timeout=900)
         self.guild, self.ticket_type, self.owner_id = guild, ticket_type, owner_id
         self.data = ticket_type_data(ticket_type)
-        self.selected_category_id = 0
-        self.selected_role_id = 0
-        self.set_text(
-            f"# {self.data['emoji']} CONFIGURAR {self.data['label'].upper()}\n"
-            "1. Selecione a categoria onde os canais serão criados.\n"
-            "2. Selecione o cargo que terá acesso e atenderá esses tickets.\n"
-            "3. Clique em **Salvar configuração**."
+        try:
+            self.selected_category_id = int(panel_setting(self.data["category_key"], "0") or 0)
+        except (TypeError, ValueError):
+            self.selected_category_id = 0
+        try:
+            self.selected_role_id = int(panel_setting(self.data["role_key"], "0") or 0)
+        except (TypeError, ValueError):
+            self.selected_role_id = 0
+        self._refresh_selection_text()
+
+        category_button = discord.ui.Button(
+            label="Selecionar categoria", emoji="📁", style=discord.ButtonStyle.secondary, row=0,
         )
-        self.category_select = discord.ui.ChannelSelect(placeholder="1 · Categoria dos tickets", channel_types=[discord.ChannelType.category], min_values=1, max_values=1, row=0)
-        self.role_select = discord.ui.RoleSelect(placeholder="2 · Cargo da equipe responsável", min_values=1, max_values=1, row=1)
-        async def select_category(interaction: discord.Interaction):
-            selected = self.category_select.values[0]
-            self.selected_category_id = selected.id
-            self._refresh_selection_text()
-            await interaction.response.edit_message(view=self)
-        async def select_role(interaction: discord.Interaction):
-            selected = self.role_select.values[0]
-            self.selected_role_id = selected.id
-            self._refresh_selection_text()
-            await interaction.response.edit_message(view=self)
-        self.category_select.callback = select_category
-        self.role_select.callback = select_role
-        self.add_item(self.category_select); self.add_item(self.role_select)
+        role_button = discord.ui.Button(
+            label="Selecionar cargo da equipe", emoji="🎭", style=discord.ButtonStyle.secondary, row=1,
+        )
         save = discord.ui.Button(label="Salvar configuração", emoji="💾", style=discord.ButtonStyle.success, row=2)
-        back = discord.ui.Button(label="Voltar", style=discord.ButtonStyle.secondary, row=2)
-        async def save_callback(interaction: discord.Interaction):
-            if interaction.user.id != self.owner_id:
-                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou pode salvar.")); return
-            if not self.selected_category_id or not self.selected_role_id:
-                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Selecione a categoria e o cargo da equipe antes de salvar.")); return
-            category = self.guild.get_channel(self.selected_category_id)
-            role = self.guild.get_role(self.selected_role_id)
-            if not isinstance(category, discord.CategoryChannel) or not role:
-                await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "A seleção não é mais válida. Selecione novamente.")); return
-            save_config_value(self.data["category_key"], str(category.id))
-            save_config_value(self.data["role_key"], str(role.id))
-            await interaction.response.edit_message(view=TicketConfigV2(self.guild, self.owner_id), content=None, embeds=[], attachments=[])
-        async def back_callback(interaction: discord.Interaction):
-            await interaction.response.edit_message(view=TicketConfigV2(self.guild, self.owner_id), content=None, embeds=[], attachments=[])
-        save.callback = save_callback; back.callback = back_callback
-        self.add_item(save); self.add_item(back)
+        back = discord.ui.Button(label="Voltar", emoji="⬅️", style=discord.ButtonStyle.secondary, row=2)
+        category_button.callback = self._open_category_picker
+        role_button.callback = self._open_role_picker
+        save.callback = self._save
+        back.callback = self._back
+        self.add_item(category_button)
+        self.add_item(role_button)
+        self.add_item(save)
+        self.add_item(back)
 
     def _refresh_selection_text(self):
         category = self.guild.get_channel(self.selected_category_id) if self.selected_category_id else None
@@ -5381,13 +5646,69 @@ class TicketCategorySelectV2(ComponentsV2View):
         role_text = role.mention if role else "Ainda não selecionado"
         self.set_text(
             f"# {self.data['emoji']} CONFIGURAR {self.data['label'].upper()}\n"
-            f"**Categoria:** {category_text}\n**Equipe:** {role_text}\n\n"
-            "Selecione os campos que faltam e clique em **Salvar configuração**."
+            "Escolha os dois campos. Em cada seletor você terá setas para percorrer todas as opções do servidor.\n\n"
+            f"**Categoria:** {category_text}\n**Equipe responsável:** {role_text}\n\n"
+            "Depois de selecionar os dois, clique em **Salvar configuração**."
+        )
+
+    async def _open_category_picker(self, interaction: discord.Interaction):
+        async def confirm(picker_interaction, category):
+            self.selected_category_id = category.id
+            self._refresh_selection_text()
+            await picker_interaction.response.edit_message(view=self)
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(view=self)
+        picker = PaginatedGuildObjectPickerView(
+            self.guild, kind="category", title=f"Categoria · {self.data['label']}",
+            owner_id=self.owner_id, on_confirm=confirm, on_back=back,
+            selected_id=self.selected_category_id, confirm_label="Usar esta categoria",
+        )
+        await interaction.response.edit_message(view=picker, content=None, embeds=[], attachments=[])
+
+    async def _open_role_picker(self, interaction: discord.Interaction):
+        async def confirm(picker_interaction, role):
+            self.selected_role_id = role.id
+            self._refresh_selection_text()
+            await picker_interaction.response.edit_message(view=self)
+        async def back(picker_interaction):
+            await picker_interaction.response.edit_message(view=self)
+        picker = PaginatedGuildObjectPickerView(
+            self.guild, kind="role", title=f"Cargo da equipe · {self.data['label']}",
+            owner_id=self.owner_id, on_confirm=confirm, on_back=back,
+            selected_id=self.selected_role_id, confirm_label="Usar este cargo",
+        )
+        await interaction.response.edit_message(view=picker, content=None, embeds=[], attachments=[])
+
+    async def _save(self, interaction: discord.Interaction):
+        if not self.selected_category_id or not self.selected_role_id:
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "Selecione a categoria e o cargo da equipe antes de salvar."),
+            )
+            return
+        category = self.guild.get_channel(self.selected_category_id)
+        role = self.guild.get_role(self.selected_role_id)
+        if not isinstance(category, discord.CategoryChannel) or not role or role.is_default():
+            await interaction.response.send_message(
+                None, ephemeral=True,
+                view=v2_view(None, None, "A seleção não é mais válida. Selecione novamente."),
+            )
+            return
+        save_config_value(self.data["category_key"], str(category.id))
+        save_config_value(self.data["role_key"], str(role.id))
+        await interaction.response.edit_message(
+            view=TicketConfigV2(self.guild, self.owner_id), content=None, embeds=[], attachments=[],
+        )
+
+    async def _back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            view=TicketConfigV2(self.guild, self.owner_id), content=None, embeds=[], attachments=[],
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou esta configuração pode alterá-la.")); return False
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem iniciou esta configuração pode alterá-la."))
+            return False
         return True
 
 
