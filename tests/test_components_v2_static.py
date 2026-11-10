@@ -99,7 +99,7 @@ class ComponentsV2MigrationTests(unittest.TestCase):
             func = ast.unparse(node.func)
             is_message_edit = (
                 func.endswith(".edit") and not any(
-                    keyword.arg == "nick" for keyword in node.keywords
+                    keyword.arg in {"nick", "name"} for keyword in node.keywords
                 )
             ) or func.endswith("edit_original_response")
             if not any(func.endswith(suffix) for suffix in ("send_message", ".send", "edit_message")) and not is_message_edit:

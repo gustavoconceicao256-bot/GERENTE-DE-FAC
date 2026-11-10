@@ -29,3 +29,9 @@ COMPONENTS V2
 VALIDAÇÃO
 - A auditoria estática de migração e a compilação sintática são executadas pelos testes em `tests/`.
 - Um teste real exige um servidor Discord de homologação com o bot instalado e permissões configuradas.
+
+ATUALIZAÇÃO — APELIDO AUTOMÁTICO APÓS WL
+- Após aprovação, o bot aplica o cargo de membro, grava o cadastro ativo e só então sincroniza o apelido.
+- Formato: [TAG] Nome RP | ID (exemplo: [M] gustavo | 2908).
+- A tag é obtida do cargo de maior prioridade configurado na hierarquia, incluindo o cargo recém-aplicado mesmo se o cache de cargos do Discord ainda não tiver atualizado.
+- Alterações posteriores nos cargos continuam atualizando o apelido; a tag e o ID são preservados no limite de 32 caracteres.

@@ -133,13 +133,21 @@ class DatabaseSchemaTests(unittest.TestCase):
                 "settings", "members", "registration_requests",
                 "farm_items", "farm_entries", "farm_proofs",
                 "farm_proof_pending", "farm_receipt_pending",
-                "warnings", "actions", "blacklist",
+                "warnings", "actions", "blacklist", "tickets", "ticket_transcripts",
             }.issubset(tables))
             proof_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(farm_proofs)")
             }
             self.assertIn("receipt_data", proof_columns)
             self.assertIn("total_cents", proof_columns)
+            ticket_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(tickets)")
+            }
+            self.assertTrue({"guild_id", "channel_id", "user_id", "ticket_type", "status", "claimed_by"}.issubset(ticket_columns))
+            transcript_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(ticket_transcripts)")
+            }
+            self.assertTrue({"ticket_id", "file_name", "html_blob"}.issubset(transcript_columns))
 
 
 if __name__ == "__main__":

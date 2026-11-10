@@ -36,7 +36,7 @@ Os seletores próprios são paginados em blocos de até 25 opções. O cargo tem
 3. **Tags:** o bot carrega as tags existentes e pede somente as pendentes. Cada formulário mostra até cinco cargos; após salvar, o assistente avança automaticamente ao próximo bloco incompleto. O progresso é exibido na tela. A etapa de publicação permanece bloqueada enquanto houver tag pendente.
 4. **Canal:** selecione o canal de publicação. Use **Anterior** e **Próxima** quando houver mais de 25 canais. Confirme a publicação quando todos os campos estiverem corretos.
 
-A publicação apresenta os cargos do maior para o menor. Para cada membro, o bot considera somente o cargo configurado de maior prioridade ao gerar o apelido `[TAG] NOME RP - ID`.
+A publicação apresenta os cargos do maior para o menor. Após uma WL ser aprovada, o bot aplica o cargo configurado em **Cargo após aprovação**, salva o cadastro como ativo e sincroniza o apelido usando a tag do cargo de maior prioridade configurado na hierarquia. O formato é **`[TAG] Nome RP | ID`**, por exemplo **`[M] gustavo | 2908`**. Para que a tag personalizada seja aplicada imediatamente na aprovação, inclua também o cargo definido em **Cargo após aprovação** na Etapa 2 da hierarquia e informe sua tag na Etapa 3. Se o membro já possuir outro cargo configurado com prioridade maior, prevalece a tag desse cargo. Quando os cargos de hierarquia forem alterados depois, o bot atualiza o apelido automaticamente.
 
 O assistente reaproveita a hierarquia já salva quando os cargos ainda existem no servidor. O botão de apagar configuração solicita confirmação e remove somente as mensagens de hierarquia enviadas pelo bot no canal configurado.
 
@@ -66,7 +66,7 @@ Seletores nativos de cargo/canal do Discord permitem pesquisa pelo próprio clie
 
 ## Apelidos e permissões
 
-O bot monta o apelido com a tag do cargo de maior prioridade, o nome RP e o ID. O cargo do bot deve ficar acima dos cargos que ele gerencia. Para alterar apelidos, habilite `Manage Nicknames`; para atribuir ou remover cargos, habilite `Manage Roles`.
+O bot monta o apelido no formato `[TAG] Nome RP | ID`, preservando a grafia do nome informado na WL e o ID completo dentro do limite de 32 caracteres do Discord. A tag vem do cargo de maior prioridade que o membro possui entre os configurados na hierarquia. O cargo do bot deve ficar acima dos cargos que ele gerencia. Para alterar apelidos, habilite `Manage Nicknames`; para atribuir ou remover cargos, habilite `Manage Roles`.
 
 Para publicar ou substituir a hierarquia, conceda `View Channel`, `Send Messages`, `Read Message History` e `Manage Messages` no canal escolhido.
 

@@ -13,7 +13,7 @@ A dependência `discord.py` precisa ser `2.7.1` ou superior para suportar Compon
 - WL em etapas: seleção de recrutador, formulário, aprovação/recusa por cargo autorizado e prazo de cinco minutos.
 - Hierarquia guiada: quantidade de cargos, seleção paginada, tags automáticas em blocos, seleção paginada do canal e publicação do maior para o menor.
 - Reaproveitamento das tags/cargos já configurados e pulo automático dos campos concluídos.
-- Apelido automático no formato `[TAG] NOME RP - ID`, usando o cargo de maior prioridade do membro.
+- Após aprovação da WL, apelido automático no formato `[TAG] Nome RP | ID`, usando a tag configurada para o cargo de maior prioridade do membro; mudanças posteriores de cargo atualizam a tag.
 - Farm com itens configuráveis, preço, quantidade, imagem de prova, aprovação e fluxo de confirmação de pagamento.
 - Painéis principal, WL, farm, hierarquia, membros e liderança.
 - Perfis, membros, ranking, metas, slots, advertências, PD, blacklist e registros administrativos.
@@ -98,6 +98,14 @@ No guia da hierarquia, **Editar hierarquia** preserva a configuração e permite
 5. O membro seleciona um item, informa a quantidade e envia uma imagem de prova. A liderança aprova ou recusa no canal privado configurado.
 
 O registro depende do cadastro ativo da WL. A imagem, os dados do item e a decisão são armazenados no SQLite.
+
+## Sistema de Tickets
+
+O painel `/config` agora possui o módulo **Tickets**, com configuração guiada para **Suporte**, **Denúncia** e **Outros assuntos**. Configure o canal do painel, canal privado de logs, categoria e cargo de atendimento para cada tipo; depois clique em **Publicar painel**.
+
+Inclui canais privados, modais, assumir/liberar, fechar/reabrir, transcripts HTML, cópia administrativa nos logs e cópia privada para o autor. Consulte [docs/SISTEMA-DE-TICKETS.md](docs/SISTEMA-DE-TICKETS.md) para o passo a passo e permissões.
+
+O código do Open Ticket original fornecido está preservado em `vendor/open-ticket-reference/` como referência; o módulo em execução é nativo em Python e não inicia um segundo bot Node.js.
 
 ## Comandos
 
