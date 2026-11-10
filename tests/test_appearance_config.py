@@ -158,6 +158,21 @@ class AppearanceConfigLogicTests(unittest.TestCase):
         self.assertIn('published_channel_key = f"{kind}_panel_published_channel_id"', SOURCE)
         self.assertIn('save_config_value(message_key, str(message.id))', SOURCE)
 
+    def test_opening_appearance_reuses_the_existing_config_message(self):
+        start = SOURCE.index('elif action == "fac:configv2:appearance":')
+        end = SOURCE.index('elif action == "fac:configv2:publish-wl":', start)
+        route = SOURCE[start:end]
+        self.assertIn("interaction.response.edit_message(", route)
+        self.assertIn("AppearancePanelSelectV2(interaction.guild, interaction.user.id)", route)
+
+    def test_appearance_modals_do_not_spawn_duplicate_editor_panels(self):
+        start = SOURCE.index("class AppearanceDescriptionModal(")
+        end = SOURCE.index("# ---------------- MÓDULO DE TICKETS", start)
+        modals = SOURCE[start:end]
+        self.assertIn("Descrição salva", modals)
+        self.assertIn("Banner salvo", modals)
+        self.assertNotIn("view=AppearanceEditorV2(", modals)
+
     def test_old_wl_wizard_no_longer_has_a_separate_appearance_button(self):
         self.assertNotIn('custom_id="fac:wl-v2:appearance"', SOURCE)
 

@@ -4283,10 +4283,12 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
                     delete_failures += 1
                     log.warning("Não consegui remover uma mensagem antiga da hierarquia (%s)", old_message.id, exc_info=True)
 
-            # Aplica as tags recém-configuradas também aos membros que já estavam no servidor.
-            for current_member in interaction.guild.members:
-                if not current_member.bot:
-                    await sync_configured_member_nickname(current_member, "Nova hierarquia publicada")
+            # Atualiza os apelidos em lote: uma leitura/escrita SQLite agrupada e
+            # até quatro alterações Discord simultâneas, em vez de duas consultas
+            # ao banco e uma chamada de rede sequenciais para cada membro.
+            nickname_updated, nickname_failures = await sync_hierarchy_member_nicknames(
+                interaction.guild, ranks, "Nova hierarquia publicada"
+            )
 
             warning = (
                 f" Atenção: não consegui remover {delete_failures} mensagem(ns) antiga(s); confira o canal."
@@ -4295,7 +4297,9 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
             await reply(
                 f"✅ Hierarquia publicada em {target.mention}: **{total_ranks} cargos**, cada um em mensagem separada. "
                 f"O cargo nº 1 (mais alto) aparece primeiro; o último cargo (mais baixo) aparece por último. "
-                f"({len(sent_messages)} mensagem(ns), incluindo cabeçalho).{warning}",
+                f"({len(sent_messages)} mensagem(ns), incluindo cabeçalho; {nickname_updated} apelido(s) atualizado(s))."
+                + (f" {nickname_failures} apelido(s) não puderam ser alterados por permissões ou erro da API." if nickname_failures else "")
+                + warning,
                 ephemeral=True,
             )
         elif kind == "members":
@@ -4446,6 +4450,68 @@ async def on_member_join(member: discord.Member) -> None:
         except discord.Forbidden:
             log.warning("Sem permissão para aplicar o cargo pré-WL ao novo membro %s", member.id)
     await sync_configured_member_nickname(member, "Membro entrou no servidor")
+
+
+async def sync_hierarchy_member_nicknames(
+    guild: discord.Guild,
+    configured_ranks: list[tuple[int, int, str, discord.Role]],
+    reason: str = "Nova hierarquia publicada",
+) -> tuple[int, int]:
+    """Sincroniza em lote os apelidos, evitando consultas SQLite por membro.
+
+    A leitura e atualização dos dados locais são agrupadas; as alterações na API
+    do Discord são limitadas em paralelo para não criar uma rajada de requisições.
+    Retorna (apelidos atualizados, falhas).
+    """
+    with db() as con:
+        rows = con.execute(
+            "SELECT discord_id, character_name, game_id FROM members WHERE status='ACTIVE'"
+        ).fetchall()
+
+    rank_by_id = {role_id: (priority, abbreviation, role) for priority, role_id, abbreviation, role in configured_ranks}
+    member_by_id = {str(member.id): member for member in guild.members if not member.bot}
+    updates = []
+    nickname_jobs = []
+
+    for row in rows:
+        member = member_by_id.get(str(row["discord_id"]))
+        if member is None:
+            continue
+        owned = [rank_by_id[role.id] for role in member.roles if role.id in rank_by_id]
+        if owned:
+            _priority, abbreviation, role = max(owned, key=lambda item: item[0])
+            rank_name = role.name
+        else:
+            abbreviation = "M"
+            rank_name = "Membro"
+        updates.append((rank_name, str(member.id)))
+        nickname = build_member_nickname(row["character_name"], row["game_id"], abbreviation or "M")
+        if member.nick != nickname:
+            nickname_jobs.append((member, nickname))
+
+    if updates:
+        with db() as con:
+            con.executemany("UPDATE members SET rank_name=? WHERE discord_id=?", updates)
+
+    semaphore = asyncio.Semaphore(4)
+    failures = 0
+
+    async def apply_nickname(member: discord.Member, nickname: str) -> bool:
+        nonlocal failures
+        async with semaphore:
+            try:
+                await member.edit(nick=nickname, reason=reason)
+                return True
+            except discord.Forbidden:
+                failures += 1
+                log.warning("Sem permissão para atualizar nickname do membro %s; confira a posição do cargo do bot.", member.id)
+            except discord.HTTPException as exc:
+                failures += 1
+                log.warning("Falha ao sincronizar nickname do membro %s: %s", member.id, exc)
+            return False
+
+    results = await asyncio.gather(*(apply_nickname(member, nickname) for member, nickname in nickname_jobs))
+    return sum(results), failures
 
 
 async def sync_configured_member_nickname(
@@ -5067,8 +5133,11 @@ class ConfigPanelV2(ComponentsV2LayoutView):
                 if not interaction.guild:
                     await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use a configuração dentro do servidor."))
                     return
-                await interaction.response.send_message(
-                    view=AppearancePanelSelectV2(interaction.guild, interaction.user.id), ephemeral=True
+                # Reaproveita a mensagem efêmera atual em vez de criar outra a
+                # cada clique. Isso evita empilhar cópias da área de Aparência.
+                await interaction.response.edit_message(
+                    view=AppearancePanelSelectV2(interaction.guild, interaction.user.id),
+                    content=None, embeds=[], attachments=[],
                 )
             elif action == "fac:configv2:publish-wl":
                 await publish_configured_panel(interaction, "wl")
@@ -5325,9 +5394,11 @@ class AppearanceDescriptionModal(ComponentsV2Modal, title="Editar descrição do
         if not await deny_unless_config_access(interaction):
             return
         save_config_value(f"{self.kind}_panel_description", self.description_input.value.strip())
+        # Não cria uma segunda cópia do editor após cada modal. A tela anterior
+        # continua disponível; a confirmação informa como aplicar a alteração.
         await interaction.response.send_message(
-            view=AppearanceEditorV2(interaction.guild, self.owner_id, self.kind, "✅ Descrição salva. Clique em Atualizar painel para aplicar no canal público."),
-            ephemeral=True,
+            None, ephemeral=True,
+            view=v2_view(None, None, "✅ Descrição salva. Volte ao editor de Aparência que já está aberto e clique em Atualizar painel."),
         )
 
 
@@ -5354,9 +5425,10 @@ class AppearanceBannerModal(ComponentsV2Modal, title="Alterar banner grande"):
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O banner precisa usar uma URL pública HTTPS. Deixe vazio somente para remover o banner."))
             return
         save_config_value(f"{self.kind}_panel_banner_url", banner)
+        # Mantém o editor original no lugar; somente confirma a gravação.
         await interaction.response.send_message(
-            view=AppearanceEditorV2(interaction.guild, self.owner_id, self.kind, "✅ Banner salvo. Clique em Atualizar painel para aplicar no canal público."),
-            ephemeral=True,
+            None, ephemeral=True,
+            view=v2_view(None, None, "✅ Banner salvo. Volte ao editor de Aparência que já está aberto e clique em Atualizar painel."),
         )
 
 
