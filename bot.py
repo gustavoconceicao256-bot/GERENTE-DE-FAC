@@ -995,9 +995,14 @@ class RecruiterSelectView(ComponentsV2View):
 class RegistrationPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
+        button = discord.ui.Button(
+            label="Fazer WL", style=panel_button_style("wl"), emoji="📋",
+            custom_id="fac:register", row=0,
+        )
+        button.callback = self.register
+        self.add_item(button)
 
-    @discord.ui.button(label="Fazer WL", style=discord.ButtonStyle.primary, emoji="📋", custom_id="fac:register")
-    async def register(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def register(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este botão no servidor.")); return
         await interaction.response.send_message(None, view=v2_view(None, RecruiterSelectView(interaction.guild), "Primeiro, selecione um recrutador disponível e depois preencha seus dados. A aprovação ou recusa será feita por quem possuir o cargo autorizado em /config → WL."), ephemeral=True)
@@ -1508,9 +1513,14 @@ class FarmItemSelectView(ComponentsV2View):
 class FarmPanelView(ComponentsV2View):
     def __init__(self):
         super().__init__(timeout=None)
+        button = discord.ui.Button(
+            label="REGISTRAR FARM", style=panel_button_style("farm"), emoji="🌾",
+            custom_id="fac:farm:start", row=0,
+        )
+        button.callback = self.start
+        self.add_item(button)
 
-    @discord.ui.button(label="REGISTRAR FARM", style=discord.ButtonStyle.success, emoji="🌾", custom_id="fac:farm:start")
-    async def start(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def start(self, interaction: discord.Interaction) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Faça o registro pelo servidor."))
             return
@@ -1644,11 +1654,60 @@ def valid_asset_url(raw: str) -> bool:
     return parsed.scheme == "https" and bool(parsed.netloc)
 
 
+# O Discord oferece quatro estilos nativos de botão. Não há suporte a HEX/RGB
+# personalizado para botões comuns, então o painel expõe nomes claros para eles.
+PANEL_BUTTON_STYLE_LABELS = {
+    "primary": "Azul",
+    "secondary": "Cinza",
+    "success": "Verde",
+    "danger": "Vermelho",
+}
+PANEL_BUTTON_STYLE_DEFAULTS = {
+    "wl": "primary",
+    "farm": "success",
+    "ticket_support": "primary",
+    "ticket_denuncia": "danger",
+    "ticket_outros": "secondary",
+}
+PANEL_BUTTON_STYLE_ENUMS = {
+    "primary": discord.ButtonStyle.primary,
+    "secondary": discord.ButtonStyle.secondary,
+    "success": discord.ButtonStyle.success,
+    "danger": discord.ButtonStyle.danger,
+}
+
+def appearance_style_setting_key(kind: str, slot: str | None = None) -> str:
+    """Retorna a chave persistente da cor de botão de cada painel/ação."""
+    if kind == "ticket":
+        if slot not in {"support", "denuncia", "outros"}:
+            raise ValueError("Ação de ticket inválida para configuração de aparência.")
+        return f"ticket_{slot}_button_style"
+    if kind not in {"wl", "farm"}:
+        raise ValueError("Painel inválido para configuração de aparência.")
+    return f"{kind}_panel_button_style"
+
+
+def normalize_panel_button_style(raw: str, default: str = "secondary") -> str:
+    value = str(raw or "").strip().lower()
+    if value in PANEL_BUTTON_STYLE_LABELS:
+        return value
+    return default if default in PANEL_BUTTON_STYLE_LABELS else "secondary"
+
+
+def panel_button_style_value(kind: str, slot: str | None = None) -> str:
+    key = appearance_style_setting_key(kind, slot)
+    default_key = f"ticket_{slot}" if kind == "ticket" else kind
+    default = PANEL_BUTTON_STYLE_DEFAULTS[default_key]
+    return normalize_panel_button_style(panel_setting(key, default), default)
+
+
+def panel_button_style(kind: str, slot: str | None = None) -> discord.ButtonStyle:
+    return PANEL_BUTTON_STYLE_ENUMS[panel_button_style_value(kind, slot)]
+
+
 def apply_panel_media(embed: PanelMessage, kind: str) -> PanelMessage:
-    photo_url = panel_setting(f"{kind}_panel_photo_url", "").strip()
+    """Aplica somente o banner grande; a aparência central não oferece miniatura pequena."""
     banner_url = panel_setting(f"{kind}_panel_banner_url", "").strip()
-    if photo_url and valid_asset_url(photo_url):
-        embed.set_thumbnail(url=photo_url)
     if banner_url and valid_asset_url(banner_url):
         embed.set_image(url=banner_url)
     return embed
@@ -1670,10 +1729,6 @@ def panel_embed(kind: str) -> PanelMessage:
             "1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
             "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL.",
         )
-        if "informe nome e ID" in description.lower() or "na dm do bot" in description.lower() or "informe seus dados" in description.lower():
-            description = ("1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
-                           "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL.")
-            save_config_value("farm_panel_description", description)
         return apply_panel_media(PanelMessage(title=title[:256], description=description[:4096], color=discord.Color.green()), "farm")
     if kind == "hierarchy":
         title = panel_setting("hierarchy_panel_title", f"🏛️ HIERARQUIA — {FACTION_NAME}")
@@ -2643,8 +2698,7 @@ class WLConfigV2(ComponentsV2LayoutView):
             parts.extend([
                 discord.ui.TextDisplay("**Resumo final**\n" + "\n".join(lines)),
                 discord.ui.Separator(),
-                discord.ui.TextDisplay("Revise os dados. O painel só será publicado quando todos os campos obrigatórios estiverem configurados."),
-                discord.ui.ActionRow(discord.ui.Button(label="Editar aparência", emoji="🎨", style=discord.ButtonStyle.secondary, custom_id="fac:wl-v2:appearance")),
+                discord.ui.TextDisplay("Revise os dados. O painel só será publicado quando todos os campos obrigatórios estiverem configurados. Para mudar descrição, banner ou cor do botão, use **/config → Aparência → WL**."),
             ])
             parts.append(discord.ui.ActionRow(WLStageButton(self, -1)))
             if self.roles_ready() and self.channels_ready():
@@ -2653,47 +2707,6 @@ class WLConfigV2(ComponentsV2LayoutView):
                 parts.append(discord.ui.TextDisplay("🔒 Complete as etapas 1 e 2 para liberar a publicação."))
         container = discord.ui.Container(*parts)
         self.add_item(container)
-        for child in container.children:
-            if isinstance(child, discord.ui.ActionRow):
-                for button in child.children:
-                    if getattr(button, "custom_id", "") == "fac:wl-v2:appearance":
-                        button.callback = self.edit_appearance
-
-    async def edit_appearance(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(ConfigWLPanelModal())
-
-
-class ConfigWLPanelModal(ComponentsV2Modal, title="Configurar painel de WL"):
-    title_input = TextInput(label="Título do painel WL", max_length=256, required=True)
-    description_input = TextInput(label="Descrição do painel WL", style=discord.TextStyle.paragraph, max_length=3500, required=True)
-    photo_url = TextInput(label="URL da foto / miniatura (opcional)", max_length=500, required=False, placeholder="https://.../foto.png")
-    banner_url = TextInput(label="URL do banner (opcional)", max_length=500, required=False, placeholder="https://.../banner.png")
-
-    def __init__(self):
-        super().__init__(timeout=300)
-        _set_modal_defaults(self, [
-            (self.title_input, panel_setting("wl_panel_title", f"📋 WHITELIST — {FACTION_NAME}")),
-            (self.description_input, panel_setting("wl_panel_description", "Clique em Fazer WL, escolha o recrutador e informe nome RP e ID FiveM.")),
-            (self.photo_url, panel_setting("wl_panel_photo_url", "")),
-            (self.banner_url, panel_setting("wl_panel_banner_url", "")),
-        ])
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        photo, banner = self.photo_url.value.strip(), self.banner_url.value.strip()
-        if not valid_asset_url(photo) or not valid_asset_url(banner):
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem."))
-            return
-        save_config_value("wl_panel_title", self.title_input.value.strip() or f"WL — {FACTION_NAME}")
-        save_config_value("wl_panel_description", self.description_input.value.strip())
-        save_config_value("wl_panel_photo_url", photo)
-        save_config_value("wl_panel_banner_url", banner)
-        if not interaction.guild:
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use esta configuração dentro do servidor."))
-            return
-        await interaction.response.send_message(
-            view=WLConfigV2(interaction.guild, success_message="✅ Aparência salva. Continue configurando a WL por etapas."),
-            ephemeral=True,
-        )
 
 
 class ConfigHierarchyModal(ComponentsV2Modal, title="Aparência da hierarquia"):
@@ -2718,46 +2731,6 @@ class ConfigHierarchyModal(ComponentsV2Modal, title="Aparência da hierarquia"):
 
 
 # O fluxo antigo de seleção cargo-por-cargo foi removido: agora a hierarquia é configurada em lote por páginas.
-
-class ConfigFarmPanelModal(ComponentsV2Modal, title="Configurar painel e aprovação de farm"):
-    title_input = TextInput(label="Título do painel farm", max_length=256, required=True)
-    description_input = TextInput(label="Descrição/instruções do farm", style=discord.TextStyle.paragraph, max_length=2500, required=True)
-    photo_url = TextInput(label="URL da foto / miniatura (opcional)", max_length=500, required=False, placeholder="https://.../foto.png")
-    banner_url = TextInput(label="URL do banner (opcional)", max_length=500, required=False, placeholder="https://.../banner.png")
-
-    def __init__(self):
-        super().__init__(timeout=300)
-        _set_modal_defaults(self, [
-            (self.title_input, panel_setting("farm_panel_title", f"🌾 REGISTRO DE FARM — {FACTION_NAME}")),
-            (self.description_input, panel_setting("farm_panel_description", "Clique em REGISTRAR FARM, selecione o item, informe a quantidade e envie a imagem de prova neste canal. Nome e ID são identificados automaticamente pela WL.")),
-            (self.photo_url, panel_setting("farm_panel_photo_url", "")),
-            (self.banner_url, panel_setting("farm_panel_banner_url", "")),
-        ])
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message(
-                None, ephemeral=True, view=v2_view(None, None, "Use este formulário dentro de um servidor.")
-            )
-            return
-        photo, banner = self.photo_url.value.strip(), self.banner_url.value.strip()
-        if not valid_asset_url(photo) or not valid_asset_url(banner):
-            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Foto e banner precisam ser URLs públicas HTTPS, ou deixe o campo vazio para remover a imagem."))
-            return
-        save_config_value("farm_panel_title", self.title_input.value.strip() or f"FARM — {FACTION_NAME}")
-        save_config_value("farm_panel_description", self.description_input.value.strip())
-        save_config_value("farm_panel_photo_url", photo)
-        save_config_value("farm_panel_banner_url", banner)
-        await interaction.response.send_message(
-            view=ConfigFarmChannelsV2(
-                interaction.guild,
-                success_message="✅ Aparência do painel salva. Agora configure os canais e as permissões do Farm abaixo."
-            ),
-            ephemeral=True,
-        )
-
-
-
 
 class ConfigLogsModal(ComponentsV2Modal, title="Canais de logs"):
     admin_channel = TextInput(label="ID do canal de logs administrativos", max_length=22, required=True)
@@ -4012,7 +3985,10 @@ class ConfigPanelView(ComponentsV2View):
 
     @discord.ui.button(label="WL", style=discord.ButtonStyle.primary, emoji="📋", row=0)
     async def wl(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(ConfigWLPanelModal())
+        if not interaction.guild:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use este painel dentro do servidor."))
+            return
+        await interaction.response.send_message(view=WLConfigV2(interaction.guild), ephemeral=True)
 
     @discord.ui.button(label="Hierarquia", style=discord.ButtonStyle.primary, emoji="🏛️", row=0)
     async def hierarchy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4036,7 +4012,7 @@ class ConfigPanelView(ComponentsV2View):
 
     @discord.ui.button(label="Farm", style=discord.ButtonStyle.primary, emoji="🌾", row=0)
     async def farm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(ConfigFarmPanelModal())
+        await interaction.response.send_message(view=FarmItemSetupV2(), ephemeral=True)
 
     @discord.ui.button(label="Publicar WL", style=discord.ButtonStyle.success, emoji="📨", row=2)
     async def publish_wl(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4064,6 +4040,65 @@ async def resolve_text_channel(guild: discord.Guild, channel_id: int) -> Optiona
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None
     return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def message_has_custom_id(message: discord.Message, wanted: str) -> bool:
+    """Procura um custom_id em qualquer componente aninhado de uma mensagem Components V2."""
+    def walk(component) -> bool:
+        if getattr(component, "custom_id", None) == wanted:
+            return True
+        return any(walk(child) for child in (getattr(component, "children", ()) or ()))
+
+    return any(walk(component) for component in (getattr(message, "components", ()) or ()))
+
+
+async def publish_or_update_simple_panel(
+    guild: discord.Guild, target: discord.TextChannel, kind: str, panel_message: PanelMessage, view: ComponentsV2View
+) -> tuple[discord.Message, bool]:
+    """Atualiza a mensagem já publicada de WL/Farm; publica somente se ainda não existir."""
+    message_key = f"{kind}_panel_message_id"
+    published_channel_key = f"{kind}_panel_published_channel_id"
+    try:
+        existing_id = int(setting(message_key, "0") or 0)
+        previous_channel_id = int(setting(published_channel_key, "0") or 0)
+    except (TypeError, ValueError):
+        existing_id = previous_channel_id = 0
+
+    if existing_id and previous_channel_id == target.id:
+        try:
+            existing = await target.fetch_message(existing_id)
+            await existing.edit(view=v2_view(panel_message, view, None))
+            return existing, True
+        except discord.NotFound:
+            pass
+
+    # Na primeira atualização após esta versão, versões antigas talvez ainda não
+    # tenham salvo o ID. Tente adotar uma mensagem existente pelo custom_id antes de publicar outra.
+    if not existing_id:
+        marker = "fac:register" if kind == "wl" else "fac:farm:start"
+        try:
+            async for candidate in target.history(limit=100):
+                if bot.user and candidate.author.id == bot.user.id and message_has_custom_id(candidate, marker):
+                    await candidate.edit(view=v2_view(panel_message, view, None))
+                    save_config_value(message_key, str(candidate.id))
+                    save_config_value(published_channel_key, str(target.id))
+                    return candidate, True
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("Não foi possível procurar um painel %s antigo; será usado o fluxo normal de publicação", kind)
+
+    if existing_id and previous_channel_id and previous_channel_id != target.id:
+        old_channel = guild.get_channel(previous_channel_id)
+        if isinstance(old_channel, discord.TextChannel):
+            try:
+                old_message = await old_channel.fetch_message(existing_id)
+                await old_message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                log.warning("Não foi possível remover o painel %s antigo do canal %s", kind, previous_channel_id)
+
+    message = await target.send(view=v2_view(panel_message, view, None))
+    save_config_value(message_key, str(message.id))
+    save_config_value(published_channel_key, str(target.id))
+    return message, False
 
 
 async def publish_configured_panel(interaction: discord.Interaction, kind: str, *, channel_override: Optional[int] = None) -> None:
@@ -4119,9 +4154,15 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
     try:
         embed = panel_embed(kind)
         if kind == "wl":
-            await target.send(view=v2_view(embed, RegistrationPanelView(), None))
+            _message, updated = await publish_or_update_simple_panel(
+                interaction.guild, target, "wl", embed, RegistrationPanelView()
+            )
+            await reply(f"✅ Painel **WL** {'atualizado' if updated else 'publicado'} em {target.mention}.", ephemeral=True)
         elif kind == "farm":
-            await target.send(view=v2_view(embed, FarmPanelView(), None))
+            _message, updated = await publish_or_update_simple_panel(
+                interaction.guild, target, "farm", embed, FarmPanelView()
+            )
+            await reply(f"✅ Painel **Farm** {'atualizado' if updated else 'publicado'} em {target.mention}.", ephemeral=True)
         elif kind == "hierarchy":
             issue = hierarchy_configuration_issue(interaction.guild)
             if issue:
@@ -4270,7 +4311,8 @@ async def publish_configured_panel(interaction: discord.Interaction, kind: str, 
             await target.send(view=v2_view(embed, LeadershipPanelView(), None))
         else:
             await target.send(view=v2_view(embed, None, None))
-        await reply(f"✅ Painel **{kind}** publicado em {target.mention}.", ephemeral=True)
+        if kind not in {"wl", "farm"}:
+            await reply(f"✅ Painel **{kind}** publicado em {target.mention}.", ephemeral=True)
     except (discord.Forbidden, discord.HTTPException) as exc:
         log.exception("Não foi possível publicar painel %s", kind)
         await reply(f"Não consegui publicar o painel. Confira as permissões do bot. Detalhe: {str(exc)[:180]}", ephemeral=True)
@@ -4548,7 +4590,16 @@ class FarmItemSetupV2(ComponentsV2LayoutView):
         if not count:
             await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Cadastre pelo menos um item antes de continuar."))
             return
-        await interaction.response.send_modal(ConfigFarmPanelModal())
+        if interaction.guild is None:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use a configuração dentro do servidor."))
+            return
+        await interaction.response.send_message(
+            view=ConfigFarmChannelsV2(
+                interaction.guild,
+                success_message="✅ Itens cadastrados. Agora configure o canal público, canal privado da liderança, equipe e logs. A aparência é editada em /config → Aparência → Farme.",
+            ),
+            ephemeral=True,
+        )
 
 
 FARM_CONFIG_FIELDS = {
@@ -4962,7 +5013,7 @@ class ConfigPanelV2(ComponentsV2LayoutView):
             components.append(discord.ui.MediaGallery(discord.MediaGalleryItem("attachment://painel_configuracao.png", description="Painel de configuração GERENTE-DE-FAC")))
         components.extend([
             discord.ui.Separator(),
-            discord.ui.TextDisplay("📋 **WL** — painel e cadastro de membros\n🏛️ **Hierarquia** — cargos, tags e publicação\n🌾 **Farm** — itens, valores, canais e cobranças\n🎫 **Tickets** — suporte, denúncias, outros assuntos, equipe e transcripts\n🧾 **Publicação** — enviar os painéis configurados"),
+            discord.ui.TextDisplay("📋 **WL** — painel e cadastro de membros\n🏛️ **Hierarquia** — cargos, tags e publicação\n🌾 **Farm** — itens, valores, canais e cobranças\n🎫 **Tickets** — suporte, denúncias, outros assuntos, equipe e transcripts\n🧾 **Publicação** — enviar os painéis configurados\n🎨 **Aparência** — cores dos botões, descrição e banner da WL, Farm ou Tickets"),
             discord.ui.Separator(),
             discord.ui.ActionRow(
                 discord.ui.Button(label="WL", emoji="📋", style=discord.ButtonStyle.primary, custom_id="fac:configv2:wl"),
@@ -4975,6 +5026,9 @@ class ConfigPanelV2(ComponentsV2LayoutView):
                 discord.ui.Button(label="Publicar hierarquia", emoji="🏛️", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-hierarchy"),
                 discord.ui.Button(label="Publicar Farm", emoji="🌾", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-farm"),
                 discord.ui.Button(label="Publicar Tickets", emoji="🎫", style=discord.ButtonStyle.success, custom_id="fac:configv2:publish-tickets"),
+            ),
+            discord.ui.ActionRow(
+                discord.ui.Button(label="Aparência dos painéis", emoji="🎨", style=discord.ButtonStyle.secondary, custom_id="fac:configv2:appearance"),
             ),
         ])
         container = discord.ui.Container(*components)
@@ -5009,6 +5063,13 @@ class ConfigPanelV2(ComponentsV2LayoutView):
                     await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use a configuração dentro do servidor."))
                     return
                 await interaction.response.send_message(view=TicketConfigV2(interaction.guild), ephemeral=True)
+            elif action == "fac:configv2:appearance":
+                if not interaction.guild:
+                    await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use a configuração dentro do servidor."))
+                    return
+                await interaction.response.send_message(
+                    view=AppearancePanelSelectV2(interaction.guild, interaction.user.id), ephemeral=True
+                )
             elif action == "fac:configv2:publish-wl":
                 await publish_configured_panel(interaction, "wl")
             elif action == "fac:configv2:publish-hierarchy":
@@ -5027,6 +5088,276 @@ class ConfigPanelV2(ComponentsV2LayoutView):
                 ok, message = await publish_ticket_panel(interaction.guild)
                 await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, message))
         return callback
+
+
+# ---------------- APARÊNCIA DOS PAINÉIS (COMPONENTS V2) ----------------
+APPEARANCE_PANEL_LABELS = {
+    "wl": "Whitelist",
+    "farm": "Registro de Farm",
+    "ticket": "Tickets",
+}
+APPEARANCE_PANEL_DEFAULT_DESCRIPTIONS = {
+    "wl": (
+        "Clique em **Fazer WL**, escolha o recrutador e informe seu nome no RP e ID do FiveM. "
+        "A aprovação ou recusa é feita por quem possuir o cargo autorizado configurado em /config → WL."
+    ),
+    "farm": (
+        "1. Clique em **REGISTRAR FARM**.\n2. Selecione o farm configurado e informe a quantidade.\n"
+        "3. Envie a imagem de prova como anexo neste canal. Nome e ID são identificados automaticamente pela WL."
+    ),
+    "ticket": (
+        "Escolha o assunto. Um canal privado será criado e ficará visível somente para você e a equipe responsável.\n\n"
+        "🛠️ **Suporte:** dúvidas, problemas e solicitações.\n"
+        "🚨 **Denúncia:** reporte jogadores ou integrantes da equipe. Envie provas dentro do ticket.\n"
+        "📌 **Outros:** demais assuntos que não se encaixam nas opções anteriores."
+    ),
+}
+
+
+def appearance_description(kind: str) -> str:
+    if kind not in APPEARANCE_PANEL_LABELS:
+        raise ValueError("Painel inválido para configuração de aparência.")
+    return panel_setting(f"{kind}_panel_description", APPEARANCE_PANEL_DEFAULT_DESCRIPTIONS[kind])
+
+
+class AppearancePanelSelectV2(ComponentsV2LayoutView):
+    """Primeira etapa: o administrador escolhe WL, Farm ou Tickets. Hierarquia não é oferecida."""
+    def __init__(self, guild: discord.Guild, owner_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.owner_id = owner_id
+        buttons = [
+            ("WL", "📋", "wl"),
+            ("Farme", "🌾", "farm"),
+            ("Tickets", "🎫", "ticket"),
+        ]
+        back = discord.ui.Button(label="Voltar", emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id="fac:appearance:back")
+        back.callback = self._back
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(
+                "# 🎨 APARÊNCIA DOS PAINÉIS\n"
+                "Selecione qual painel deseja personalizar. Você poderá alterar somente as cores dos botões, "
+                "a descrição e o banner grande. **A hierarquia não possui painel visual e não aparece aqui.**"
+            ),
+            discord.ui.Separator(),
+            discord.ui.ActionRow(*[
+                discord.ui.Button(label=label, emoji=emoji, style=discord.ButtonStyle.primary, custom_id=f"fac:appearance:choose:{kind}")
+                for label, emoji, kind in buttons
+            ]),
+            discord.ui.ActionRow(back),
+        ))
+        # Reaplica os callbacks depois que os componentes foram anexados ao Container.
+        for child in self.children:
+            if isinstance(child, discord.ui.Container):
+                for action_row in child.children:
+                    if isinstance(action_row, discord.ui.ActionRow):
+                        for button in action_row.children:
+                            custom_id = getattr(button, "custom_id", "") or ""
+                            if custom_id.startswith("fac:appearance:choose:"):
+                                kind = custom_id.rsplit(":", 1)[-1]
+                                button.callback = self._open_editor(kind)
+                            elif custom_id == "fac:appearance:back":
+                                button.callback = self._back
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem abriu esta configuração pode alterá-la."))
+            return False
+        return await deny_unless_config_access(interaction)
+
+    def _open_editor(self, kind: str):
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(
+                view=AppearanceEditorV2(self.guild, self.owner_id, kind),
+                content=None, embeds=[], attachments=[],
+            )
+        return callback
+
+    async def _back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            view=ConfigPanelV2(include_banner=False), content=None, embeds=[], attachments=[]
+        )
+
+
+class AppearanceButtonStyleSelect(discord.ui.Select):
+    def __init__(self, parent_view: "AppearanceEditorV2", slot: str | None, row: int):
+        self.parent_view = parent_view
+        self.slot = slot
+        current = panel_button_style_value(parent_view.kind, slot)
+        label = (
+            TICKET_TYPES[slot]["label"] if parent_view.kind == "ticket" and slot else
+            ("Fazer WL" if parent_view.kind == "wl" else "Registrar Farme")
+        )
+        options = [
+            discord.SelectOption(
+                label=PANEL_BUTTON_STYLE_LABELS[name],
+                value=name, description=f"Usar botão {PANEL_BUTTON_STYLE_LABELS[name].lower()} padrão do Discord.",
+                default=(name == current),
+            )
+            for name in ("primary", "secondary", "success", "danger")
+        ]
+        super().__init__(
+            placeholder=f"Cor do botão: {label}", min_values=1, max_values=1,
+            options=options, row=row,
+            custom_id=f"fac:appearance:style:{parent_view.kind}:{slot or 'main'}",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        parent = self.parent_view
+        if parent.owner_id != interaction.user.id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem abriu esta configuração pode alterá-la."))
+            return
+        if not await deny_unless_config_access(interaction):
+            return
+        value = normalize_panel_button_style(self.values[0])
+        key = appearance_style_setting_key(parent.kind, self.slot)
+        save_config_value(key, value)
+        label = PANEL_BUTTON_STYLE_LABELS[value]
+        action = TICKET_TYPES[self.slot]["label"] if parent.kind == "ticket" and self.slot else "botão do painel"
+        await interaction.response.edit_message(
+            view=AppearanceEditorV2(
+                parent.guild, parent.owner_id, parent.kind,
+                success_message=f"✅ Cor de **{action}** salva: **{label}**. Clique em Atualizar painel para aplicar no canal público.",
+            ),
+            content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+
+class AppearanceEditorV2(ComponentsV2LayoutView):
+    """Editor permitido: cores dos botões, descrição e banner grande."""
+    def __init__(self, guild: discord.Guild, owner_id: int, kind: str, success_message: str = ""):
+        if kind not in APPEARANCE_PANEL_LABELS:
+            raise ValueError("Painel inválido para configuração de aparência.")
+        super().__init__(timeout=900)
+        self.guild = guild
+        self.owner_id = owner_id
+        self.kind = kind
+        banner = panel_setting(f"{kind}_panel_banner_url", "").strip()
+        banner_status = "Configurado" if banner and valid_asset_url(banner) else "Não configurado"
+        lines = [
+            f"# 🎨 APARÊNCIA · {APPEARANCE_PANEL_LABELS[kind].upper()}",
+            "Altere somente as opções visuais deste painel. O título, cargos, canais e funcionamento não serão modificados.",
+            f"**Descrição atual:** {len(appearance_description(kind))} caracteres",
+            f"**Banner grande:** {banner_status}",
+        ]
+        if success_message:
+            lines.extend(["", success_message])
+        components = [discord.ui.TextDisplay("\n\n".join(lines)), discord.ui.Separator()]
+        style_rows = []
+        if kind == "ticket":
+            style_rows = [
+                discord.ui.ActionRow(AppearanceButtonStyleSelect(self, "support", 0)),
+                discord.ui.ActionRow(AppearanceButtonStyleSelect(self, "denuncia", 1)),
+                discord.ui.ActionRow(AppearanceButtonStyleSelect(self, "outros", 2)),
+            ]
+        else:
+            style_rows = [discord.ui.ActionRow(AppearanceButtonStyleSelect(self, None, 0))]
+        components.extend(style_rows)
+        action_row = discord.ui.ActionRow(
+            discord.ui.Button(label="Editar descrição", emoji="📝", style=discord.ButtonStyle.secondary, custom_id=f"fac:appearance:description:{kind}"),
+            discord.ui.Button(label="Alterar banner", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id=f"fac:appearance:banner:{kind}"),
+            discord.ui.Button(label="Atualizar painel", emoji="🚀", style=discord.ButtonStyle.success, custom_id=f"fac:appearance:publish:{kind}"),
+            discord.ui.Button(label="Voltar", emoji="⬅️", style=discord.ButtonStyle.secondary, custom_id=f"fac:appearance:return:{kind}"),
+        )
+        components.append(action_row)
+        self.add_item(discord.ui.Container(*components))
+        for child in self.children:
+            if isinstance(child, discord.ui.Container):
+                for row in child.children:
+                    if isinstance(row, discord.ui.ActionRow):
+                        for button in row.children:
+                            custom_id = getattr(button, "custom_id", "") or ""
+                            if custom_id.startswith("fac:appearance:description:"):
+                                button.callback = self._edit_description
+                            elif custom_id.startswith("fac:appearance:banner:"):
+                                button.callback = self._edit_banner
+                            elif custom_id.startswith("fac:appearance:publish:"):
+                                button.callback = self._publish
+                            elif custom_id.startswith("fac:appearance:return:"):
+                                button.callback = self._back
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Somente quem abriu esta configuração pode alterá-la."))
+            return False
+        return await deny_unless_config_access(interaction)
+
+    async def _edit_description(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AppearanceDescriptionModal(self.kind, self.owner_id))
+
+    async def _edit_banner(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AppearanceBannerModal(self.kind, self.owner_id))
+
+    async def _publish(self, interaction: discord.Interaction):
+        if self.kind in {"wl", "farm"}:
+            await publish_configured_panel(interaction, self.kind)
+            return
+        if not interaction.guild:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Use esta configuração dentro do servidor."))
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ok, result = await publish_ticket_panel(interaction.guild)
+        await interaction.followup.send(None, ephemeral=True, view=v2_view(None, None, result))
+
+    async def _back(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            view=AppearancePanelSelectV2(self.guild, self.owner_id),
+            content=None, embeds=[], attachments=(interaction.message.attachments if interaction.message else []),
+        )
+
+
+class AppearanceDescriptionModal(ComponentsV2Modal, title="Editar descrição do painel"):
+    description_input = TextInput(
+        label="Descrição que aparecerá no painel", style=discord.TextStyle.paragraph,
+        max_length=2500, required=True,
+    )
+
+    def __init__(self, kind: str, owner_id: int):
+        super().__init__(timeout=300)
+        self.kind = kind
+        self.owner_id = owner_id
+        _set_modal_defaults(self, [(self.description_input, appearance_description(kind))])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esta edição pertence a quem abriu o painel de aparência no servidor."))
+            return
+        if not await deny_unless_config_access(interaction):
+            return
+        save_config_value(f"{self.kind}_panel_description", self.description_input.value.strip())
+        await interaction.response.send_message(
+            view=AppearanceEditorV2(interaction.guild, self.owner_id, self.kind, "✅ Descrição salva. Clique em Atualizar painel para aplicar no canal público."),
+            ephemeral=True,
+        )
+
+
+class AppearanceBannerModal(ComponentsV2Modal, title="Alterar banner grande"):
+    banner_url = TextInput(
+        label="URL pública HTTPS do banner (vazio remove)", max_length=500,
+        required=False, placeholder="https://.../banner.png",
+    )
+
+    def __init__(self, kind: str, owner_id: int):
+        super().__init__(timeout=300)
+        self.kind = kind
+        self.owner_id = owner_id
+        _set_modal_defaults(self, [(self.banner_url, panel_setting(f"{kind}_panel_banner_url", ""))])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild or interaction.user.id != self.owner_id:
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "Esta edição pertence a quem abriu o painel de aparência no servidor."))
+            return
+        if not await deny_unless_config_access(interaction):
+            return
+        banner = self.banner_url.value.strip()
+        if not valid_asset_url(banner):
+            await interaction.response.send_message(None, ephemeral=True, view=v2_view(None, None, "O banner precisa usar uma URL pública HTTPS. Deixe vazio somente para remover o banner."))
+            return
+        save_config_value(f"{self.kind}_panel_banner_url", banner)
+        await interaction.response.send_message(
+            view=AppearanceEditorV2(interaction.guild, self.owner_id, self.kind, "✅ Banner salvo. Clique em Atualizar painel para aplicar no canal público."),
+            ephemeral=True,
+        )
 
 
 # ---------------- MÓDULO DE TICKETS (NATIVO / COMPONENTS V2) ----------------
@@ -5146,21 +5477,25 @@ class TicketPanelView(ComponentsV2View):
     """Painel público persistente para abrir os três tipos de atendimento."""
     def __init__(self):
         super().__init__(timeout=None)
-        self.set_text(
-            f"# 🎫 CENTRAL DE ATENDIMENTO · {FACTION_NAME}\n"
+        description = panel_setting(
+            "ticket_panel_description",
             "Escolha o assunto. Um canal privado será criado e ficará visível somente para você e a equipe responsável.\n\n"
             "🛠️ **Suporte:** dúvidas, problemas e solicitações.\n"
             "🚨 **Denúncia:** reporte jogadores ou integrantes da equipe. Envie provas dentro do ticket.\n"
-            "📌 **Outros:** demais assuntos que não se encaixam nas opções anteriores."
-        )
+            "📌 **Outros:** demais assuntos que não se encaixam nas opções anteriores.",
+        ).strip()
+        self.set_text(f"# 🎫 CENTRAL DE ATENDIMENTO · {FACTION_NAME}\n\n{description}"[:4000])
+        banner_url = panel_setting("ticket_panel_banner_url", "").strip()
+        if banner_url and valid_asset_url(banner_url):
+            self.add_item(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_url, description="Banner do painel de tickets")))
         buttons = [
-            ("support", "Suporte", "🛠️", discord.ButtonStyle.primary),
-            ("denuncia", "Denúncia", "🚨", discord.ButtonStyle.danger),
-            ("outros", "Outros", "📌", discord.ButtonStyle.secondary),
+            ("support", "Suporte", "🛠️"),
+            ("denuncia", "Denúncia", "🚨"),
+            ("outros", "Outros", "📌"),
         ]
-        for ticket_type, label, emoji, style in buttons:
+        for ticket_type, label, emoji in buttons:
             button = discord.ui.Button(
-                label=label, emoji=emoji, style=style,
+                label=label, emoji=emoji, style=panel_button_style("ticket", ticket_type),
                 custom_id=f"fac:ticket:open:{ticket_type}", row=0,
             )
             button.callback = self._open_callback(ticket_type)

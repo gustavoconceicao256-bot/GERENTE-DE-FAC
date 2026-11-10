@@ -19,6 +19,7 @@ A dependência `discord.py` precisa ser `2.7.1` ou superior para suportar Compon
 - Perfis, membros, ranking, metas, slots, advertências, PD, blacklist e registros administrativos.
 - Logs em canais configuráveis e armazenamento em SQLite.
 - Paginação para todos os seletores de cargos, canais de texto e categorias: até 25 opções por página, com setas Anterior/Próxima e preservação da seleção.
+- Aparência centralizada em `/config → Aparência dos painéis`: escolha WL, Farme ou Tickets e personalize cores dos botões, descrição e banner grande sem alterar a lógica do módulo.
 - Tratamento de erros nas interações e backoff de login para erros HTTP/429; o cliente HTTP do `discord.py` também aplica o controle de rate limit do Discord.
 
 ## Requisitos
@@ -79,6 +80,9 @@ O painel é privado e restrito à liderança, desenvolvedores autorizados e admi
 - **Hierarquia:** siga o assistente de quatro etapas descrito abaixo.
 - **Farm:** configure canal público, canal privado da liderança, cargo aprovador e canal de histórico.
 - **Publicação:** publique os painéis depois de validar os campos obrigatórios.
+- **Aparência dos painéis:** selecione WL, Farme ou Tickets. Altere a cor dos botões, a descrição e o banner grande; em Tickets, Suporte, Denúncia e Outros têm cores independentes. A hierarquia não aparece porque não é um painel de botões.
+
+  As cores de botões disponíveis são Azul, Cinza, Verde e Vermelho, que correspondem aos quatro estilos nativos do Discord. A plataforma não permite HEX/RGB personalizado em botões comuns. Depois de salvar, clique em **Atualizar painel** para aplicar a alteração na mensagem publicada. Para o banner, cole uma URL pública HTTPS; um link de imagem enviado pelo Discord pode ser usado.
 
 ### Assistente da hierarquia
 
@@ -103,7 +107,7 @@ O registro depende do cadastro ativo da WL. A imagem, os dados do item e a decis
 
 O painel `/config` agora possui o módulo **Tickets**, com configuração guiada para **Suporte**, **Denúncia** e **Outros assuntos**. Configure o canal do painel, canal privado de logs, categoria e cargo de atendimento para cada tipo; depois clique em **Publicar painel**. Os seletores de canal, categoria e cargo também possuem paginação por setas.
 
-Inclui canais privados, modais, assumir/liberar, fechar/reabrir, transcripts HTML, cópia administrativa nos logs e cópia privada para o autor. Consulte [docs/SISTEMA-DE-TICKETS.md](docs/SISTEMA-DE-TICKETS.md) para o passo a passo e permissões. Para o comportamento dos seletores paginados, consulte [docs/PAGINACAO-SELETORES.md](docs/PAGINACAO-SELETORES.md).
+Inclui canais privados, modais, assumir/liberar, fechar/reabrir, transcripts HTML, cópia administrativa nos logs e cópia privada para o autor. Consulte [docs/SISTEMA-DE-TICKETS.md](docs/SISTEMA-DE-TICKETS.md) para o passo a passo e permissões. Para o comportamento dos seletores paginados, consulte [docs/PAGINACAO-SELETORES.md](docs/PAGINACAO-SELETORES.md). Para personalizar os painéis, consulte [docs/APARENCIA-PAINEIS.md](docs/APARENCIA-PAINEIS.md).
 
 O código do Open Ticket original fornecido está preservado em `vendor/open-ticket-reference/` como referência; o módulo em execução é nativo em Python e não inicia um segundo bot Node.js.
 

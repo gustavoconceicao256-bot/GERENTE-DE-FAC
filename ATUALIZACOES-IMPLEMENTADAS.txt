@@ -38,3 +38,18 @@ TESTES AUTOMATIZADOS
 
 LIMITAÇÃO DE VALIDAÇÃO
 - Os testes automatizados não substituem um teste conectado ao Discord. A publicação, permissões, DMs e interações reais precisam ser validadas em um servidor de teste com o bot instalado.
+
+
+APARÊNCIA CENTRALIZADA DOS PAINÉIS
+- Adicionado botão “Aparência dos painéis” no /config.
+- O fluxo pede primeiro o painel: WL, Farme ou Tickets; hierarquia não é oferecida.
+- O editor permite somente cores dos botões, descrição e banner grande.
+- WL e Farme oferecem cor para o botão principal.
+- Tickets permite configurar separadamente Suporte, Denúncia e Outros.
+- Cores disponíveis: azul, cinza, verde e vermelho (estilos nativos do Discord; sem HEX em botões comuns).
+- A aparência é salva no SQLite; “Atualizar painel” edita a publicação existente quando identificável.
+- A publicação inicial de WL/Farme passa a armazenar IDs e procurar mensagens antigas do bot para evitar duplicação na primeira atualização.
+- Descrição/banner de Tickets passaram a ser configuráveis.
+- O editor de aparência antigo da WL foi removido; o setup inicial de Farm segue para canais/equipe, mantendo a aparência no menu central.
+- Banner grande usa URL HTTPS; miniatura pequena não faz parte do editor.
+- Adicionados testes automatizados específicos da aparência dos painéis.
